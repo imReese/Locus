@@ -3,7 +3,8 @@
 ## Status
 
 This is the proposed contract for engine integrations. It defines ownership and
-behavior, not a stable Rust API. No SGLang, vLLM, TensorRT-LLM, or other adapter
+behavior, not a stable Rust API. A deterministic fake validates the import and
+execution lifecycle; no SGLang, vLLM, TensorRT-LLM, or other production adapter
 is implemented yet.
 
 ## Purpose

@@ -1,0 +1,21 @@
+[package]
+name = "locus-planner"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+async-trait.workspace = true
+locus-core = { path = "../locus-core" }
+locus-engine = { path = "../locus-engine" }
+locus-state = { path = "../locus-state" }
+thiserror.workspace = true
+
+[dev-dependencies]
+futures.workspace = true
+tokio.workspace = true

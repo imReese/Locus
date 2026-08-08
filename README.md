@@ -20,9 +20,10 @@ in front of inference engines. Locus is inference-native, not merely another
 API gateway or reverse proxy.
 
 > [!IMPORTANT]
-> Locus is in its design phase. This repository currently defines the
-> intended architecture and contracts; it does not yet contain a production
-> implementation.
+> Locus is in its initial architecture bootstrap. The repository contains
+> engine-neutral domain contracts, deterministic fakes, and a tested
+> planner-to-executor vertical slice. It does not yet contain a production
+> server or engine adapter, tokenizer pipeline, or state-system integration.
 
 ## Why Locus?
 
@@ -125,6 +126,32 @@ state integration disabled.
 - [ADR 0003: Rust as the primary language](docs/adr/0003-rust-primary-language.md)
 - [ADR 0004: Project name Locus](docs/adr/0004-project-name-locus.md)
 
+## Implementation
+
+The initial Rust 2024 workspace keeps the architecture boundaries small and
+explicit:
+
+- `locus-core`: canonical requests, execution facts, identities, reusable-state
+  contracts, and operation context;
+- `locus-semantics`: model-profile and semantic-provider boundaries;
+- `locus-engine`: engine adapter contract, registry, and deterministic fake;
+- `locus-state`: state-provider contract, null provider, and deterministic fake;
+- `locus-planner`: cost-based path selection and the side-effecting
+  `PlanExecutor`.
+
+The bootstrap intentionally has no HTTP server and no real SGLang, vLLM,
+TensorRT-LLM, or NexusKV integration. Its purpose is to validate ownership,
+compatibility filtering, generation fencing, import cleanup, fallback, and
+compute-plus-state path selection before framework integration.
+
+Run the local checks with:
+
+```bash
+cargo fmt --all -- --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all
+```
+
 ## Implementation direction
 
 The intended implementation stack is Rust 2024 with Tokio. Initial protocol
@@ -133,10 +160,9 @@ expected to use Tonic and Protobuf. Hugging Face Tokenizers and a
 Jinja-compatible renderer such as MiniJinja are the initial semantic building
 blocks.
 
-These are implementation choices behind stable Locus interfaces, not
-types that define the core architecture. The current design is intentionally
-ahead of implementation; wire formats and Rust APIs remain subject to
-validation and change.
+These are implementation choices behind stable Locus interfaces, not types
+that define the core architecture. Wire formats and Rust APIs remain subject
+to validation and change as the bootstrap advances.
 
 ## Scope
 
@@ -148,7 +174,7 @@ Locus is not:
 - a guarantee that every engine can emulate every requested feature; or
 - a generic reverse proxy that is unaware of inference semantics.
 
-See the design documents for the proposed component boundaries and incremental
+See the design documents for the component boundaries and incremental
 implementation path.
 
 ## License

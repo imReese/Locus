@@ -2,9 +2,9 @@
 
 ## Status
 
-This document defines the intended model-semantic layer. It is design-only;
-there is no implemented semantic registry, tokenizer pipeline, or parser API in
-the repository yet.
+This document defines the intended model-semantic layer. The Rust bootstrap
+contains its core traits and identity types, but no semantic registry, tokenizer
+pipeline, template renderer, or output parser implementation yet.
 
 ## Purpose
 

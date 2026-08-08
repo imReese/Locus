@@ -2,9 +2,10 @@
 
 ## Status
 
-This document defines the initial target architecture. It is a design contract,
-not a description of an existing implementation. Interfaces and wire schemas
-shown here are conceptual and will be refined through implementation.
+This document defines the target architecture. An initial Rust workspace now
+implements the core domain types, deterministic fakes, a cost-based planner,
+and a `PlanExecutor` vertical slice. Production integrations and wire schemas
+remain conceptual and will be refined through implementation.
 
 ## Thesis
 

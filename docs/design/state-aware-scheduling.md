@@ -2,9 +2,11 @@
 
 ## Status
 
-This document defines the target planner and state-provider abstractions. It is
-not an implemented scheduler or NexusKV integration. Cost terms, trait methods,
-and schemas require measurement and prototyping before they become stable APIs.
+This document defines the target planner and state-provider abstractions. The
+Rust bootstrap contains a deterministic cost-based planner, fake providers, and
+the state-import execution handshake. It is not a production scheduler or
+NexusKV integration; cost calibration and APIs still require measurement and
+prototyping before they become stable.
 
 ## Principle
 
