@@ -7,8 +7,11 @@ the core domain types, `ModelRegistry`, `InferenceService`, target discovery,
 semantic-event processing, a cost-based planner, and `PlanExecutor`. Edge
 crates implement OpenAI Responses/Chat, SGLang/vLLM completion adapters, and an
 optional NexusKV bridge. These integrations are mock-conformance-tested; live
-GPU serving, physical state transfer, production admission, and calibrated
-costs remain unverified.
+GPU serving and physical state transfer remain unverified. A deployable server,
+production Hugging Face tokenizer/template profiles, global ingress limits,
+bearer authentication, dependency-aware readiness, structured tracing, and
+official OpenAI SDK E2E are implemented. Per-tenant admission and calibrated
+costs remain future work.
 
 ## Thesis
 
@@ -398,9 +401,14 @@ The following stages are implemented and tested:
    tests;
 5. SGLang and vLLM OpenAI-compatible completion adapters in a separate edge
    crate;
-6. an optional NexusKV bridge through the complete state import handshake.
+6. an optional NexusKV bridge through the complete state import handshake;
+7. a deployable configured server with exact Hugging Face tokenizer/template
+   profiles, authentication, ingress limits, readiness, request IDs, and
+   tracing; and
+8. official OpenAI SDK E2E plus opt-in live-engine conformance tooling.
 
-The next production stages are exact tokenizer/template/parser profiles,
-admission and authentication, calibrated cost models, observability, live
-runtime tests, a deployed NexusKV bridge, and topology/preload/replication
+The next production stages are model-specific reasoning/tool parsers,
+multimodal normalization, per-tenant admission and fairness, calibrated cost
+models, telemetry export, repeated live-runtime qualification, a deployed
+NexusKV bridge, physical state transfer, and topology/preload/replication
 policies. Engine-neutral boundary tests remain mandatory as integrations grow.

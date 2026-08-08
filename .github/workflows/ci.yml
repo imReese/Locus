@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    name: Rust and static conformance
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned Rust toolchain
+        run: rustup show active-toolchain
+      - name: Run repository checks
+        run: bash scripts/ci.sh
+
+  openai-sdk-e2e:
+    name: Official OpenAI SDK E2E
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: rust
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned Rust toolchain
+        run: rustup show active-toolchain
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: scripts/openai-sdk-e2e-requirements.txt
+      - name: Install official OpenAI Python SDK
+        run: python -m pip install -r scripts/openai-sdk-e2e-requirements.txt
+      - name: Build SDK fixture
+        run: cargo build -p locus-server --example sdk_fixture
+      - name: Run SDK transport conformance
+        shell: bash
+        run: |
+          target/debug/examples/sdk_fixture > /tmp/locus-sdk-fixture.log 2>&1 &
+          fixture_pid=$!
+          cleanup() {
+            status=$?
+            if [ "$status" -ne 0 ]; then
+              cat /tmp/locus-sdk-fixture.log
+            fi
+            kill "$fixture_pid" 2>/dev/null || true
+            exit "$status"
+          }
+          trap cleanup EXIT
+          for _ in $(seq 1 100); do
+            if curl --fail --silent http://127.0.0.1:18080/healthz >/dev/null; then
+              break
+            fi
+            sleep 0.1
+          done
+          curl --fail --silent http://127.0.0.1:18080/readyz >/dev/null
+          python scripts/openai_sdk_e2e.py --fixture-counts

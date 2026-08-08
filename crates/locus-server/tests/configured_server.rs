@@ -1,0 +1,234 @@
+use std::sync::{Arc, Mutex};
+
+use ahash::AHashMap;
+use axum::body::Body;
+use axum::extract::State;
+use axum::http::{Request, Response, StatusCode, header};
+use axum::routing::{get, post};
+use axum::{Json, Router};
+use http_body_util::BodyExt;
+use locus_server::{build_server, load_config};
+use serde_json::{Value, json};
+use tempfile::tempdir;
+use tokenizers::Tokenizer;
+use tokenizers::models::wordlevel::WordLevel;
+use tokenizers::pre_tokenizers::whitespace::WhitespaceSplit;
+use tower::ServiceExt;
+
+#[derive(Clone, Default)]
+struct EngineCapture {
+    completions: Arc<Mutex<Vec<Value>>>,
+}
+
+async fn engine_health() -> &'static str {
+    "ok"
+}
+
+async fn engine_completion(
+    State(capture): State<EngineCapture>,
+    Json(body): Json<Value>,
+) -> Response<Body> {
+    capture
+        .completions
+        .lock()
+        .expect("completion capture")
+        .push(body);
+    Response::builder()
+        .header(header::CONTENT_TYPE, "text/event-stream")
+        .body(Body::from(concat!(
+            "data: {\"choices\":[{\"index\":0,\"text\":\"configured\",\"finish_reason\":\"stop\"}]}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":1}}\n\n",
+            "data: [DONE]\n\n"
+        )))
+        .expect("engine SSE response")
+}
+
+async fn spawn_engine() -> (String, EngineCapture) {
+    let capture = EngineCapture::default();
+    let app = Router::new()
+        .route("/health", get(engine_health))
+        .route("/v1/completions", post(engine_completion))
+        .with_state(capture.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind mock engine");
+    let address = listener.local_addr().expect("engine address");
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("serve mock engine");
+    });
+    (format!("http://{address}"), capture)
+}
+
+fn write_config() -> (tempfile::TempDir, std::path::PathBuf) {
+    let directory = tempdir().expect("temp directory");
+    let tokenizer_path = directory.path().join("tokenizer.json");
+    let template_path = directory.path().join("chat_template.jinja");
+    let config_path = directory.path().join("locus.json");
+    let model = WordLevel::builder()
+        .vocab(AHashMap::from_iter([
+            ("<unk>".to_owned(), 0),
+            ("user".to_owned(), 1),
+            ("hello".to_owned(), 2),
+            ("assistant".to_owned(), 3),
+        ]))
+        .unk_token("<unk>".to_owned())
+        .build()
+        .expect("word-level model");
+    let mut tokenizer = Tokenizer::new(model);
+    tokenizer.with_pre_tokenizer(Some(WhitespaceSplit));
+    tokenizer
+        .save(&tokenizer_path, false)
+        .expect("save tokenizer");
+    std::fs::write(
+        &template_path,
+        "{% for message in messages %}{{ message.role }} {{ message.content }} {% endfor %}assistant",
+    )
+    .expect("write template");
+    std::fs::write(
+        &config_path,
+        json!({
+            "listen": "127.0.0.1:0",
+            "models": [{
+                "aliases": ["fixture"],
+                "model_revision": "fixture-v1",
+                "tokenizer_json": "tokenizer.json",
+                "tokenizer_revision": "tokenizer-v1",
+                "chat_template": "chat_template.jinja",
+                "template_revision": "template-v1"
+            }],
+            "engines": [{
+                "id": "sglang-0",
+                "kind": "sglang",
+                "base_url": "http://127.0.0.1:9",
+                "served_model": "fixture",
+                "model": "fixture",
+                "runtime_version": "test",
+                "target_id": "sglang-0/fixture"
+            }]
+        })
+        .to_string(),
+    )
+    .expect("write config");
+    (directory, config_path)
+}
+
+#[tokio::test]
+async fn relative_profile_paths_build_a_server_with_request_ids() {
+    let (directory, config_path) = write_config();
+    let config = load_config(&config_path).expect("load config");
+    let server = build_server(config, directory.path()).expect("build server");
+    let health = server
+        .app
+        .clone()
+        .oneshot(
+            Request::get("/healthz")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("health response");
+    assert_eq!(health.status(), StatusCode::OK);
+    assert!(
+        health
+            .headers()
+            .get("x-request-id")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.starts_with("locus-http-"))
+    );
+    let models = server
+        .app
+        .clone()
+        .oneshot(
+            Request::get("/v1/models")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("models response");
+    assert_eq!(models.status(), StatusCode::OK);
+    let body: Value = serde_json::from_slice(
+        &models
+            .into_body()
+            .collect()
+            .await
+            .expect("models body")
+            .to_bytes(),
+    )
+    .expect("models JSON");
+    assert_eq!(body["data"][0]["id"], "fixture");
+
+    let readiness = server
+        .app
+        .oneshot(
+            Request::get("/readyz")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("readiness response");
+    assert_eq!(readiness.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test]
+async fn configured_huggingface_profile_reaches_remote_engine_as_token_ids() {
+    let (engine_url, capture) = spawn_engine().await;
+    let (directory, config_path) = write_config();
+    let mut config = load_config(&config_path).expect("load config");
+    config.engines[0].base_url = engine_url;
+    let server = build_server(config, directory.path()).expect("build server");
+    let readiness = server
+        .app
+        .clone()
+        .oneshot(
+            Request::get("/readyz")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("readiness response");
+    assert_eq!(readiness.status(), StatusCode::OK);
+    let response = server
+        .app
+        .oneshot(
+            Request::post("/v1/responses")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({"model": "fixture", "input": "hello"}).to_string(),
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value = serde_json::from_slice(
+        &response
+            .into_body()
+            .collect()
+            .await
+            .expect("response body")
+            .to_bytes(),
+    )
+    .expect("response JSON");
+    assert_eq!(body["output"][0]["content"][0]["text"], "configured");
+    let completions = capture.completions.lock().expect("completion capture");
+    assert_eq!(completions.len(), 1);
+    assert_eq!(completions[0]["prompt"], json!([1, 2, 3]));
+    assert_eq!(completions[0]["model"], "fixture");
+    assert!(
+        completions[0]["rid"]
+            .as_str()
+            .is_some_and(|request_id| request_id.starts_with("resp_"))
+    );
+}
+
+#[test]
+fn engine_must_reference_a_configured_model_alias() {
+    let (directory, config_path) = write_config();
+    let mut config = load_config(&config_path).expect("load config");
+    config.engines[0].model = "missing".to_owned();
+    let error = match build_server(config, directory.path()) {
+        Ok(_) => panic!("unknown model alias must fail"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("unknown model alias missing"));
+}

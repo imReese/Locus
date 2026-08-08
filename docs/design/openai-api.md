@@ -4,15 +4,18 @@
 
 `locus-openai` implements an Axum router over the protocol-neutral
 `InferenceService`. The implementation is covered by in-process HTTP and SSE
-conformance tests. It is a library router, not yet a deployable server binary,
-and has not been tested against a live OpenAI SDK release in this repository.
+conformance tests and is assembled by the deployable `locus-server` binary.
+GitHub CI runs official OpenAI Python SDK 2.53.0 against a real local HTTP
+fixture, covering Responses and Chat Completions JSON/SSE, structured output,
+OpenAI-shaped errors, authentication, and stream-close cancellation.
 
 ## Routes
 
 - `POST /v1/responses`: non-streaming JSON and SSE streaming
 - `POST /v1/chat/completions`: non-streaming JSON and SSE streaming
 - `GET /v1/models`: registered public model aliases
-- `GET /healthz`: process-level readiness response
+- `GET /healthz`: process liveness; intentionally does not probe dependencies
+- `GET /readyz`: registered-model coverage and live engine health snapshots
 
 Responses is the primary interface. Chat Completions is a compatibility layer:
 both translate into `SemanticRequest`, call the same `InferenceService`, and
@@ -34,6 +37,12 @@ OpenAI-shaped error envelope rather than ignored. Model lookup failures,
 invalid requests, unavailable placement, cancellation, deadlines, and internal
 failures map to stable error categories.
 
+`locus-server` can require a bearer token for every `/v1/*` route while leaving
+the probe routes unauthenticated for an orchestrator. Token comparison is
+constant-time after a length check. Configurable request-body and concurrent-
+request limits bound ingress work. These are global deployment limits, not a
+tenant quota or fairness scheduler.
+
 ## Streaming ownership
 
 Responses SSE emits lifecycle events including `response.created`, output item
@@ -44,10 +53,10 @@ propagates cancellation to the selected `EngineAdapter`.
 
 ## Not implemented
 
-Authentication, rate limits, persistence and `previous_response_id`, image or
-audio inputs, hosted tools, logprobs, multiple choices, and full OpenAI API
-surface parity are outside the current subset. The serde DTOs use strict field
-checking so these gaps fail explicitly.
+Per-tenant rate limits, persistence and `previous_response_id`, image or audio
+inputs, hosted tools, logprobs, multiple choices, and full OpenAI API surface
+parity are outside the current subset. The serde DTOs use strict field checking
+so these gaps fail explicitly.
 
 Function calling and reasoning require an engine adapter that advertises typed
 tool and reasoning events. The current SGLang/vLLM pretokenized completion

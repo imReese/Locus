@@ -1,0 +1,46 @@
+{
+  "listen": "0.0.0.0:8000",
+  "api": {
+    "bearer_token_env": "LOCUS_API_KEY",
+    "max_request_bytes": 2097152,
+    "max_concurrent_requests": 128
+  },
+  "models": [
+    {
+      "aliases": ["my-model"],
+      "model_revision": "replace-with-immutable-model-revision",
+      "execution_profile": "default",
+      "tokenizer_json": "/models/my-model/tokenizer.json",
+      "tokenizer_revision": "replace-with-tokenizer-revision",
+      "chat_template": "/models/my-model/chat_template.jinja",
+      "template_revision": "replace-with-template-revision",
+      "template_context": {
+        "bos_token": "<s>",
+        "eos_token": "</s>"
+      }
+    }
+  ],
+  "engines": [
+    {
+      "id": "sglang-0",
+      "kind": "sglang",
+      "base_url": "http://127.0.0.1:30000",
+      "served_model": "my-model",
+      "model": "my-model",
+      "runtime_version": "replace-with-sglang-version",
+      "topology": "node-0/gpu-0",
+      "hardware": "cuda",
+      "target_id": "sglang-0/my-model",
+      "tensor_parallel": 1,
+      "pipeline_parallel": 1,
+      "expert_parallel": 1
+    }
+  ],
+  "state": {
+    "kind": "disabled"
+  },
+  "observability": {
+    "json": true,
+    "filter": "locus=info,tower_http=info"
+  }
+}

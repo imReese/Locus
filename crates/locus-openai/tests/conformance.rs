@@ -1,5 +1,6 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
@@ -11,7 +12,7 @@ use locus_core::{
     RuntimeIdentity, SemanticComponentIdentity, SemanticIdentity,
 };
 use locus_engine::{EngineRegistry, FakeEngineAdapter, FakeEngineOutput, FakeToolCall};
-use locus_openai::router;
+use locus_openai::{ApiConfig, router, router_with_config};
 use locus_runtime::{DefaultInferenceService, InferenceService};
 use locus_semantics::{
     BasicModelSemantics, ByteDecoder, ByteTokenizer, ModelProfile, ModelRegistry,
@@ -57,7 +58,7 @@ fn identities() -> (ModelExecutionIdentity, SemanticIdentity) {
     )
 }
 
-fn app(output: FakeEngineOutput) -> (axum::Router, Arc<FakeEngineAdapter>) {
+fn service(output: FakeEngineOutput) -> (Arc<dyn InferenceService>, Arc<FakeEngineAdapter>) {
     let (model, semantics_identity) = identities();
     let models = ModelRegistry::new();
     models
@@ -124,6 +125,11 @@ fn app(output: FakeEngineOutput) -> (axum::Router, Arc<FakeEngineAdapter>) {
     let state: Arc<dyn StateProvider> = Arc::new(NullStateProvider::default());
     let service: Arc<dyn InferenceService> =
         Arc::new(DefaultInferenceService::new(models, engines, state));
+    (service, adapter)
+}
+
+fn app(output: FakeEngineOutput) -> (axum::Router, Arc<FakeEngineAdapter>) {
+    let (service, adapter) = service(output);
     (router(service), adapter)
 }
 
@@ -183,6 +189,147 @@ async fn health_models_and_non_streaming_response_are_openai_shaped() {
     assert_eq!(response["output"][0]["type"], "message");
     assert_eq!(response["output"][0]["content"][0]["text"], "hello");
     assert_eq!(adapter.call_counts().execute, 1);
+}
+
+#[tokio::test]
+async fn readiness_observes_registered_model_and_live_target() {
+    let (app, _) = app(FakeEngineOutput::default());
+    let (status, readiness) = json_response(app, "GET", "/readyz", json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(readiness["status"], "ready");
+    assert_eq!(readiness["model_profiles"], 1);
+    assert_eq!(readiness["ready_targets"], 1);
+    assert_eq!(readiness["observed_targets"], 1);
+}
+
+#[tokio::test]
+async fn bearer_auth_protects_api_routes_but_not_probes() {
+    let (service, _) = service(FakeEngineOutput::default());
+    let app = router_with_config(
+        service,
+        ApiConfig {
+            bearer_token: Some("test-secret".to_owned()),
+            ..ApiConfig::default()
+        },
+    )
+    .expect("configured router");
+    let health = app
+        .clone()
+        .oneshot(
+            Request::get("/healthz")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("health response");
+    assert_eq!(health.status(), StatusCode::OK);
+
+    let unauthorized = app
+        .clone()
+        .oneshot(
+            Request::get("/v1/models")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("unauthorized response");
+    assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(unauthorized.headers()[header::WWW_AUTHENTICATE], "Bearer");
+    let error: Value = serde_json::from_slice(
+        &unauthorized
+            .into_body()
+            .collect()
+            .await
+            .expect("error body")
+            .to_bytes(),
+    )
+    .expect("error JSON");
+    assert_eq!(error["error"]["code"], "invalid_api_key");
+
+    let authorized = app
+        .oneshot(
+            Request::get("/v1/models")
+                .header(header::AUTHORIZATION, "Bearer test-secret")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("authorized response");
+    assert_eq!(authorized.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn configured_body_limit_rejects_oversized_requests() {
+    let (service, _) = service(FakeEngineOutput::default());
+    let app = router_with_config(
+        service,
+        ApiConfig {
+            max_request_bytes: 32,
+            ..ApiConfig::default()
+        },
+    )
+    .expect("configured router");
+    let response = app
+        .oneshot(
+            Request::post("/v1/responses")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({"model": "locus-test", "input": "this body is deliberately too large"})
+                        .to_string(),
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+#[tokio::test]
+async fn concurrency_permit_is_held_until_stream_body_is_dropped() {
+    let (service, _) = service(FakeEngineOutput::default());
+    let app = router_with_config(
+        service,
+        ApiConfig {
+            max_concurrent_requests: 1,
+            ..ApiConfig::default()
+        },
+    )
+    .expect("configured router");
+    let first = app
+        .clone()
+        .oneshot(
+            Request::post("/v1/responses")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({"model": "locus-test", "input": "hold", "stream": true}).to_string(),
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("first response");
+    let blocked = tokio::time::timeout(
+        Duration::from_millis(20),
+        app.clone().oneshot(
+            Request::get("/v1/models")
+                .body(Body::empty())
+                .expect("request"),
+        ),
+    )
+    .await;
+    assert!(blocked.is_err(), "second request must wait for the stream");
+    drop(first);
+    let admitted = tokio::time::timeout(
+        Duration::from_secs(1),
+        app.oneshot(
+            Request::get("/v1/models")
+                .body(Body::empty())
+                .expect("request"),
+        ),
+    )
+    .await
+    .expect("second request should be admitted")
+    .expect("models response");
+    assert_eq!(admitted.status(), StatusCode::OK);
 }
 
 #[tokio::test]

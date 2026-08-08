@@ -5,10 +5,12 @@
 This document defines the model-semantic layer. The Rust implementation now
 contains `ModelRegistry`, `SemanticRequest`, `ModelSemantics`, an output-pipeline
 factory, typed `SemanticEvent`s, function-call aggregation, reasoning events,
-and JSON structured-output validation. `ByteTokenizer`, `ByteDecoder`, and
-`SimpleTemplateRenderer` are deterministic reference components, not production
-model semantics. Multimodal normalization and model-specific parsers remain
-future work.
+and JSON structured-output validation. `locus-semantics-hf` now loads an exact
+Hugging Face `tokenizer.json`, renders a pinned chat template with bounded
+MiniJinja, decodes through the same tokenizer, and derives tokenizer/template
+identities from SHA-256 content digests. `ByteTokenizer`, `ByteDecoder`, and
+`SimpleTemplateRenderer` remain deterministic reference components. Multimodal
+normalization and model-specific reasoning/tool parsers remain future work.
 
 ## Purpose
 
@@ -140,8 +142,12 @@ source or private deployment data.
 ## Chat templates
 
 Templates consume a typed context rather than an unrestricted process object.
-Initial rendering is expected to use MiniJinja or an equivalent
-Jinja-compatible Rust implementation behind `TemplateRenderer`.
+The production Hugging Face profile uses MiniJinja behind `TemplateRenderer`.
+It supplies conversation messages, an explicit `add_generation_prompt`, an
+empty tool list, and deployment-configured special-token values. Configuration
+cannot replace reserved fields. File, network, environment, clock, and
+arbitrary code access are unavailable during rendering, and rendered output is
+bounded by `max_rendered_bytes`.
 
 A template declares:
 
@@ -152,9 +158,10 @@ A template declares:
 - renderer and language compatibility version;
 - a content digest used in the semantic fingerprint.
 
-Rendering is deterministic for a pinned context. File, network, environment,
-clock, and arbitrary code access are disabled. Resource and output limits
-protect the control plane from expensive or adversarial templates.
+Rendering is deterministic for a pinned context. The profile is validated at
+startup, and the template source digest participates in the input-semantic and
+umbrella fingerprints. Templates that depend on runtime-native tool context or
+unsupported helpers fail rather than silently changing prompt semantics.
 
 Template output is not always one flat string. The intermediate
 `RenderedPrompt` preserves segments and placeholder bindings so that

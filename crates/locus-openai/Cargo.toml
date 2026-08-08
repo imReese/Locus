@@ -15,6 +15,7 @@ locus-runtime = { path = "../locus-runtime" }
 locus-semantics = { path = "../locus-semantics" }
 serde.workspace = true
 serde_json.workspace = true
+subtle.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 

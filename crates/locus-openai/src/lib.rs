@@ -8,8 +8,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::Json;
 use axum::Router;
-use axum::extract::{FromRef, State, rejection::JsonRejection};
-use axum::http::StatusCode;
+use axum::body::Body;
+use axum::extract::{DefaultBodyLimit, FromRef, Request, State, rejection::JsonRejection};
+use axum::http::{HeaderValue, StatusCode, header};
+use axum::middleware::{Next, from_fn_with_state};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -23,6 +25,39 @@ use locus_semantics::{
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
+use subtle::ConstantTimeEq;
+use thiserror::Error;
+use tokio::sync::Semaphore;
+
+const DEFAULT_MAX_REQUEST_BYTES: usize = 2 * 1024 * 1024;
+const DEFAULT_MAX_CONCURRENT_REQUESTS: usize = 128;
+
+#[derive(Clone)]
+pub struct ApiConfig {
+    pub bearer_token: Option<String>,
+    pub max_request_bytes: usize,
+    pub max_concurrent_requests: usize,
+}
+
+impl Default for ApiConfig {
+    fn default() -> Self {
+        Self {
+            bearer_token: None,
+            max_request_bytes: DEFAULT_MAX_REQUEST_BYTES,
+            max_concurrent_requests: DEFAULT_MAX_CONCURRENT_REQUESTS,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct AuthState {
+    bearer_token: Arc<str>,
+}
+
+#[derive(Clone)]
+struct AdmissionState {
+    semaphore: Arc<Semaphore>,
+}
 
 #[derive(Clone)]
 struct ApiState {
@@ -37,20 +72,143 @@ impl FromRef<ApiState> for Arc<dyn InferenceService> {
 }
 
 pub fn router(service: Arc<dyn InferenceService>) -> Router {
+    router_with_config(service, ApiConfig::default()).expect("default API config must be valid")
+}
+
+pub fn router_with_config(
+    service: Arc<dyn InferenceService>,
+    config: ApiConfig,
+) -> Result<Router, ApiConfigError> {
+    if config.max_request_bytes == 0 {
+        return Err(ApiConfigError::ZeroRequestBodyLimit);
+    }
+    if config.max_concurrent_requests == 0 {
+        return Err(ApiConfigError::ZeroConcurrencyLimit);
+    }
+    if config
+        .bearer_token
+        .as_ref()
+        .is_some_and(|token| token.is_empty())
+    {
+        return Err(ApiConfigError::EmptyBearerToken);
+    }
     let state = ApiState {
         service,
         next_request: Arc::new(AtomicU64::new(1)),
     };
-    Router::new()
-        .route("/healthz", get(health))
+    let mut api = Router::new()
         .route("/v1/models", get(models))
         .route("/v1/responses", post(responses))
-        .route("/v1/chat/completions", post(chat_completions))
-        .with_state(state)
+        .route("/v1/chat/completions", post(chat_completions));
+    if let Some(bearer_token) = config.bearer_token {
+        api = api.layer(from_fn_with_state(
+            AuthState {
+                bearer_token: bearer_token.into(),
+            },
+            authenticate,
+        ));
+    }
+    api = api
+        .layer(DefaultBodyLimit::max(config.max_request_bytes))
+        .layer(from_fn_with_state(
+            AdmissionState {
+                semaphore: Arc::new(Semaphore::new(config.max_concurrent_requests)),
+            },
+            limit_concurrency,
+        ));
+    Ok(Router::new()
+        .route("/healthz", get(health))
+        .route("/readyz", get(readiness))
+        .merge(api)
+        .with_state(state))
 }
 
 async fn health() -> Json<Value> {
     Json(json!({"status": "ok"}))
+}
+
+async fn readiness(State(service): State<Arc<dyn InferenceService>>) -> Response {
+    match service.readiness().await {
+        Ok(report) => Json(json!({
+            "status": "ready",
+            "model_profiles": report.model_profiles,
+            "ready_targets": report.ready_targets,
+            "observed_targets": report.observed_targets,
+        }))
+        .into_response(),
+        Err(error) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"status": "not_ready", "error": error.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+async fn authenticate(State(auth): State<AuthState>, request: Request, next: Next) -> Response {
+    let candidate = request
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "));
+    let authorized = candidate.is_some_and(|candidate| {
+        candidate.len() == auth.bearer_token.len()
+            && bool::from(candidate.as_bytes().ct_eq(auth.bearer_token.as_bytes()))
+    });
+    if authorized {
+        return next.run(request).await;
+    }
+    let mut response = ApiError::new(
+        StatusCode::UNAUTHORIZED,
+        "missing or invalid bearer token",
+        "authentication_error",
+        None,
+        Some("invalid_api_key"),
+    )
+    .into_response();
+    response
+        .headers_mut()
+        .insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
+    response
+}
+
+async fn limit_concurrency(
+    State(admission): State<AdmissionState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let permit = match admission.semaphore.acquire_owned().await {
+        Ok(permit) => permit,
+        Err(_) => {
+            return ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "request admission is unavailable",
+                "server_error",
+                None,
+                Some("admission_unavailable"),
+            )
+            .into_response();
+        }
+    };
+    let response = next.run(request).await;
+    let (parts, body) = response.into_parts();
+    let stream = async_stream::stream! {
+        let _permit = permit;
+        let mut data = body.into_data_stream();
+        while let Some(chunk) = data.next().await {
+            yield chunk;
+        }
+    };
+    Response::from_parts(parts, Body::from_stream(stream))
+}
+
+#[derive(Debug, Error)]
+pub enum ApiConfigError {
+    #[error("API bearer token must not be empty")]
+    EmptyBearerToken,
+    #[error("API request body limit must be greater than zero")]
+    ZeroRequestBodyLimit,
+    #[error("API concurrency limit must be greater than zero")]
+    ZeroConcurrencyLimit,
 }
 
 async fn models(State(service): State<Arc<dyn InferenceService>>) -> Response {
@@ -324,7 +482,7 @@ async fn responses(
 ) -> Response {
     let Json(request) = match payload {
         Ok(payload) => payload,
-        Err(error) => return ApiError::invalid_json(error.body_text()).into_response(),
+        Err(error) => return api_error_from_json_rejection(&error).into_response(),
     };
     let stream_requested = request.stream;
     let model = request.model.clone();
@@ -797,7 +955,7 @@ async fn chat_completions(
 ) -> Response {
     let Json(request) = match payload {
         Ok(payload) => payload,
-        Err(error) => return ApiError::invalid_json(error.body_text()).into_response(),
+        Err(error) => return api_error_from_json_rejection(&error).into_response(),
     };
     let stream_requested = request.stream;
     let model = request.model.clone();
@@ -1058,5 +1216,19 @@ fn api_error_from_inference(error: &InferenceError) -> ApiError {
             None,
             Some("internal_error"),
         ),
+    }
+}
+
+fn api_error_from_json_rejection(error: &JsonRejection) -> ApiError {
+    if error.status() == StatusCode::PAYLOAD_TOO_LARGE {
+        ApiError::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            error.body_text(),
+            "invalid_request_error",
+            None,
+            Some("request_too_large"),
+        )
+    } else {
+        ApiError::invalid_json(error.body_text())
     }
 }

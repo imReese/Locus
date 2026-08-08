@@ -1,0 +1,39 @@
+[package]
+name = "locus-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+axum.workspace = true
+locus-core = { path = "../locus-core" }
+locus-engine = { path = "../locus-engine" }
+locus-engine-openai = { path = "../locus-engine-openai" }
+locus-openai = { path = "../locus-openai" }
+locus-runtime = { path = "../locus-runtime" }
+locus-semantics = { path = "../locus-semantics" }
+locus-semantics-hf = { path = "../locus-semantics-hf" }
+locus-state = { path = "../locus-state" }
+locus-state-nexuskv = { path = "../locus-state-nexuskv" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tower-http.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+ahash = "0.8.12"
+async-stream.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+http-body-util.workspace = true
+tempfile = "3.23.0"
+tower.workspace = true
+tokenizers.workspace = true
+
+[lints]
+workspace = true

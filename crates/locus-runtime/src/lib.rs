@@ -109,6 +109,15 @@ pub trait InferenceService: Send + Sync {
     ) -> Result<SemanticEventStream, InferenceError>;
 
     fn models(&self) -> Result<Vec<ModelProfile>, InferenceError>;
+
+    async fn readiness(&self) -> Result<ReadinessReport, InferenceError>;
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReadinessReport {
+    pub model_profiles: usize,
+    pub ready_targets: usize,
+    pub observed_targets: usize,
 }
 
 pub struct DefaultInferenceService {
@@ -294,6 +303,67 @@ impl InferenceService for DefaultInferenceService {
 
     fn models(&self) -> Result<Vec<ModelProfile>, InferenceError> {
         self.models.profiles().map_err(Into::into)
+    }
+
+    async fn readiness(&self) -> Result<ReadinessReport, InferenceError> {
+        let profiles = self.models.profiles()?;
+        if profiles.is_empty() {
+            return Err(InferenceError::Discovery(
+                "no model profiles are registered".to_owned(),
+            ));
+        }
+        let context = OperationContext::new(RequestId::new("locus-readiness"));
+        let mut ready_models = BTreeSet::new();
+        let mut observed_targets = 0_usize;
+        let mut ready_targets = 0_usize;
+        let mut failures = Vec::new();
+        for adapter in self.engines.adapters()? {
+            let targets = match adapter.execution_targets(&context).await {
+                Ok(targets) => targets,
+                Err(error) => {
+                    failures.push(error.to_string());
+                    continue;
+                }
+            };
+            for target in targets {
+                observed_targets += 1;
+                match adapter.snapshot(&target, &context).await {
+                    Ok(snapshot) if snapshot.ready => {
+                        ready_targets += 1;
+                        ready_models.insert(target.model);
+                    }
+                    Ok(_) => failures.push(format!("target {} is not ready", target.id)),
+                    Err(error) => failures.push(error.to_string()),
+                }
+            }
+        }
+        let missing = profiles
+            .iter()
+            .filter(|profile| !ready_models.contains(&profile.model))
+            .map(|profile| {
+                profile
+                    .public_aliases
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| profile.model.model_revision.clone())
+            })
+            .collect::<Vec<_>>();
+        if !missing.is_empty() {
+            let evidence = if failures.is_empty() {
+                "no matching execution target was observed".to_owned()
+            } else {
+                failures.join("; ")
+            };
+            return Err(InferenceError::Discovery(format!(
+                "models without a ready target: {}; {evidence}",
+                missing.join(", ")
+            )));
+        }
+        Ok(ReadinessReport {
+            model_profiles: profiles.len(),
+            ready_targets,
+            observed_targets,
+        })
     }
 }
 

@@ -20,11 +20,12 @@ in front of inference engines. Locus is inference-native, not merely another
 API gateway or reverse proxy.
 
 > [!IMPORTANT]
-> Locus now contains a tested end-to-end control-plane slice: protocol-neutral
-> model semantics and inference service, OpenAI Responses and Chat Completions
-> HTTP adapters, SGLang/vLLM completion adapters, and an optional NexusKV bridge.
-> The network integrations are conformance-tested against deterministic mock
-> services; no live GPU serving or NexusKV data transfer is claimed yet.
+> Locus now contains a deployable end-to-end control-plane slice: a configured
+> server process, content-addressed Hugging Face tokenizer/chat-template
+> profiles, OpenAI Responses and Chat Completions, SGLang/vLLM completion
+> adapters, and an optional NexusKV bridge. CI validates the official OpenAI
+> Python SDK against a real local HTTP server. Live GPU serving and NexusKV
+> physical transfer remain opt-in validations and are not claimed by CI.
 
 ## Why Locus?
 
@@ -128,6 +129,8 @@ state integration disabled.
 - [State-aware scheduling](docs/design/state-aware-scheduling.md)
 - [OpenAI-compatible API](docs/design/openai-api.md)
 - [NexusKV bridge](docs/design/nexuskv-bridge.md)
+- [Serving and configuration](docs/operations/serving.md)
+- [Validation and evidence levels](docs/validation/serving.md)
 
 ## Implementation
 
@@ -137,6 +140,9 @@ The Rust 2024 workspace keeps the architecture boundaries small and explicit:
   contracts, and operation context;
 - `locus-semantics`: model registry, normalization, typed semantic events,
   tool-call aggregation, reasoning, and structured-output validation;
+- `locus-semantics-hf`: production tokenizer.json loading, bounded MiniJinja
+  chat-template rendering, detokenization, and content-derived semantic
+  fingerprints;
 - `locus-engine`: engine adapter contract, registry, and deterministic fake;
 - `locus-state`: state-provider contract, null provider, and deterministic fake;
 - `locus-planner`: cost-based path selection and the side-effecting
@@ -148,25 +154,38 @@ The Rust 2024 workspace keeps the architecture boundaries small and explicit:
 - `locus-engine-openai`: network adapters for SGLang and vLLM completion
   endpoints;
 - `locus-state-nexuskv`: optional, versioned HTTP bridge from NexusKV match and
-  materialization results into the generic `StateProvider` handshake.
+  materialization results into the generic `StateProvider` handshake;
+- `locus-server`: JSON configuration, dependency assembly, SGLang/vLLM and
+  optional NexusKV registration, bearer authentication, request limits,
+  dependency-aware readiness, request IDs, tracing, and graceful shutdown.
 
-The byte tokenizer and simple template renderer are deterministic reference
-components for conformance tests, not production model profiles.
+The byte tokenizer and simple template renderer remain deterministic reference
+components for unit and SDK fixture tests. Deployments use
+`locus-semantics-hf` with pinned tokenizer and template artifacts.
 
-Run the local checks with:
+Run the same checks used by GitHub CI with:
 
 ```bash
-cargo fmt --all -- --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test --workspace
+bash scripts/ci.sh
 ```
+
+Start a configured deployment with:
+
+```bash
+LOCUS_API_KEY=replace-me cargo run -p locus-server -- examples/locus-server.json
+```
+
+The example contains placeholder artifact revisions and paths; replace them
+before use. See [Serving and configuration](docs/operations/serving.md).
 
 ## Implementation direction
 
-The implementation uses Rust 2024, Tokio, Axum, and Reqwest. Core contracts do
-not depend on those frameworks. A future native southbound protocol may use
-Tonic and Protobuf. Production model profiles should use the exact model
-tokenizer, template, and parsers instead of the reference byte-level components.
+The implementation uses Rust 2024, Tokio, Axum, Reqwest, Hugging Face
+Tokenizers, and MiniJinja. Core contracts do not depend on those frameworks. A
+future native southbound protocol may use Tonic and Protobuf. Production model
+profiles use exact local tokenizer and chat-template artifacts; model-specific
+reasoning/tool parsers are still required before those semantics can be
+advertised by the current SGLang/vLLM adapters.
 
 These are implementation choices behind stable Locus interfaces, not types
 that define the core architecture. Wire formats and Rust APIs remain pre-1.0.
@@ -175,16 +194,23 @@ that define the core architecture. Wire formats and Rust APIs remain pre-1.0.
 
 - OpenAI Responses/Chat and adapter streaming are exercised through in-process
   HTTP/SSE conformance tests.
+- Official `openai` Python SDK 2.53.0 E2E covers Responses and Chat JSON/SSE,
+  structured output, errors, authentication, and client-disconnect cancellation
+  against a real local Locus HTTP fixture in GitHub CI.
 - SGLang and vLLM requests send canonical token IDs to `/v1/completions`; tests
   cover request IDs, structured-output mapping, usage, finish events, and the
-  SGLang abort path. No live runtime or GPU test is included.
+  SGLang abort path. `scripts/live_engine_conformance.py` can exercise an
+  explicitly configured live runtime, but no live runtime or GPU result is
+  checked into or implied by CI.
 - The NexusKV provider requires a separately deployed
   `locus.nexuskv-bridge.v1` service. The current NexusKV repository exposes the
   underlying contract and execution abstractions but not these HTTP endpoints.
   The complete Locus handshake is tested against a bridge double; physical
   transfer remains unverified.
-- Authentication, admission, calibrated costs, telemetry export, multimodal
-  normalization, and a deployable server binary remain future work.
+- Bearer authentication, global body/concurrency limits, readiness, request IDs,
+  and structured tracing are implemented. Per-tenant rate/fairness admission,
+  calibrated costs, telemetry export, multimodal normalization, and production
+  model-specific reasoning/tool parsers remain future work.
 
 ## Scope
 

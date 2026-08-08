@@ -8,7 +8,10 @@ validates import and execution lifecycles. The separate
 OpenAI-compatible `/v1/completions` endpoints without introducing their types
 into `locus-engine`. Mock HTTP/SSE tests cover pretokenized requests, text and
 usage events, finish reasons, structured-output fields, and SGLang aborts. No
-live runtime, GPU, latency, or native state-import validation is claimed.
+live runtime, GPU, latency, or native state-import result is claimed by CI. The
+opt-in `scripts/live_engine_conformance.py` harness checks a configured runtime's
+health, pretokenized completion SSE lifecycle, usage, finish reason, terminal
+sentinel, and cancellation transport, and emits a versioned evidence report.
 These completion adapters advertise structured-output support but not typed
 reasoning or tool-call events; requests requiring those capabilities are
 filtered before planning. A future runtime-native parser adapter may add them.
