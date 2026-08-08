@@ -10,7 +10,7 @@ and schemas require measurement and prototyping before they become stable APIs.
 
 State locality and materialization cost are first-class placement inputs.
 
-InferFront must not first choose an engine using a conventional load balancer
+Locus must not first choose an engine using a conventional load balancer
 and then opportunistically ask whether a cache happens to be present. For each
 eligible target, the planner evaluates the execution path and reusable-state
 options together.
@@ -204,8 +204,8 @@ NexusKV is the intended reference `StateProvider`. It can implement the generic
 contract using its own catalog, state formats, transfer mechanisms, and
 topology knowledge.
 
-The integration lives outside InferFront core and depends on InferFront's
-provider API. InferFront core does not import the NexusKV SDK, use NexusKV
+The integration lives outside Locus core and depends on Locus's
+provider API. Locus core does not import the NexusKV SDK, use NexusKV
 identifiers as domain types, or assume NexusKV deployment. Another provider can
 implement the same contract, and a deployment can run without any provider.
 

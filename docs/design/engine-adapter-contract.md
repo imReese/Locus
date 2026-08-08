@@ -8,7 +8,7 @@ is implemented yet.
 
 ## Purpose
 
-An engine adapter translates between InferFront's canonical engine protocol and
+An engine adapter translates between Locus's canonical engine protocol and
 one execution runtime. It prevents runtime-specific protocols, configuration,
 and error behavior from leaking into model semantics or global planning.
 
@@ -49,7 +49,7 @@ pub trait EngineAdapter: Send + Sync {
 ```
 
 The eventual Rust interface may split discovery, observation, and execution
-into separate traits. All methods operate on InferFront-owned domain types.
+into separate traits. All methods operate on Locus-owned domain types.
 Generated RPC messages and engine SDK types remain inside the adapter crate.
 
 ## Adapter identity
@@ -109,7 +109,7 @@ state may change before execution.
 
 ## Request execution
 
-Before calling an adapter, InferFront has already:
+Before calling an adapter, Locus has already:
 
 1. normalized northbound semantics;
 2. constructed a canonical request;
@@ -146,7 +146,7 @@ adapter validates:
 - reusable input boundary;
 - tenant scope and attachment lifetime.
 
-Binding failure is explicit. InferFront follows the fallback encoded in the
+Binding failure is explicit. Locus follows the fallback encoded in the
 placement plan: cold execution on the same engine, replanning elsewhere, or
 request failure. The adapter does not decide to use a different state artifact
 on its own.
@@ -172,7 +172,7 @@ open-ended set of SGLang or vLLM fields.
 
 ## Error mapping
 
-Adapters preserve enough information for InferFront to distinguish:
+Adapters preserve enough information for Locus to distinguish:
 
 - invalid canonical requests or violated preconditions;
 - capability drift between planning and submission;

@@ -2,7 +2,7 @@
 
 ## Status
 
-This document proposes the semantic southbound contract between InferFront and
+This document proposes the semantic southbound contract between Locus and
 engine adapters. No wire-compatible protocol has been released. Names and
 field shapes are illustrative; behavior and invariants are the design contract.
 
@@ -24,7 +24,7 @@ or provider-specific state-transfer protocols.
 ## Placement in the request path
 
 The canonical protocol begins after northbound validation and model-semantic
-normalization. At this point InferFront has selected a semantic profile,
+normalization. At this point Locus has selected a semantic profile,
 constructed an `InputBundle`, normalized sampling parameters, and determined
 the required engine capabilities.
 
@@ -127,7 +127,7 @@ has the same compatibility rules as a KV cache.
 - log-probability requests;
 - constrained-output or grammar references.
 
-InferFront applies defaults before submission or marks a field as intentionally
+Locus applies defaults before submission or marks a field as intentionally
 engine-defaulted. Adapters do not guess how to translate an unsupported
 parameter. Capability evaluation chooses one of three declared behaviors:
 
@@ -140,7 +140,7 @@ request ineligible for adapters that do not understand that extension.
 
 ### Output contract
 
-`OutputContract` describes what InferFront needs from the engine, including:
+`OutputContract` describes what Locus needs from the engine, including:
 
 - preferred token-delta streaming or an allowed text-delta fallback;
 - log probabilities and their alignment;
@@ -149,7 +149,7 @@ request ineligible for adapters that do not understand that extension.
 - normalized finish information;
 - whether multiple candidates are required.
 
-Token deltas are preferred because InferFront normally owns detokenization and
+Token deltas are preferred because Locus normally owns detokenization and
 incremental semantic parsing. A text-only engine can participate only when it
 advertises text-delta behavior sufficient for the selected semantic profile.
 The capability decision is explicit; core semantics do not silently depend on
@@ -292,7 +292,7 @@ The event stream is bounded. A slow northbound consumer propagates
 backpressure until a configured buffer limit, after which policy chooses
 cancellation or bounded spooling; unbounded buffering is invalid.
 
-Cancellation is deadline-aware and idempotent. InferFront stops semantic
+Cancellation is deadline-aware and idempotent. Locus stops semantic
 parsing, sends `Cancel`, drains or closes the transport according to adapter
 behavior, and releases reservations and state attachments. An adapter must
 declare when cancellation is best-effort rather than confirmed.

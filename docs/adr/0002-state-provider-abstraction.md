@@ -14,11 +14,11 @@ continue from it.
 
 [NexusKV](https://github.com/imReese/NexusKV) is a natural reference system for
 state discovery and movement, but making it a core dependency would tie
-InferFront's architecture and deployment lifecycle to one implementation.
+Locus's architecture and deployment lifecycle to one implementation.
 
 ## Decision
 
-InferFront will define a generic, optional `StateProvider` abstraction.
+Locus will define a generic, optional `StateProvider` abstraction.
 
 A provider reports typed state descriptors, structured reusable boundaries,
 compatibility evidence, locations, and target-specific materialization options.
@@ -40,7 +40,7 @@ attachment that a capable engine adapter can validate and bind.
 
 - State locality and materialization cost are first-class planner inputs.
 - The abstraction covers non-token and checkpointed state.
-- InferFront core can run without NexusKV or any cache service.
+- Locus core can run without NexusKV or any cache service.
 - Providers and engine adapters can evolve independently behind versioned
   contracts.
 - Compatibility and resume boundaries fail closed when evidence is missing.

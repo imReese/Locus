@@ -8,13 +8,15 @@ shown here are conceptual and will be refined through implementation.
 
 ## Thesis
 
-Inference engines should execute model workloads, not repeatedly implement
-application-facing semantics.
+Inference is a placement problem involving both compute and state.
 
-InferFront is an engine-neutral frontend and state-aware traffic control plane
-for LLM inference. It separates application protocols and model semantics from
-runtime-specific execution, then makes global placement decisions using both
-engine capacity and reusable-state information.
+Inference engines should execute model workloads, not repeatedly implement
+application-facing semantics or global placement policy.
+
+Locus is an engine-neutral inference control plane for compute and model-state
+placement. It separates application protocols and model semantics from
+runtime-specific execution, understands execution capabilities and reusable
+state locality, and makes global placement decisions across compute and state.
 
 ## System boundaries
 
@@ -22,7 +24,7 @@ engine capacity and reusable-state information.
 Northbound       API and model semantics
                       |
                       v
-InferFront        protocol adaptation
+Locus            protocol adaptation
                   validation and normalization
                   model semantics
                   admission and policy
@@ -47,11 +49,11 @@ The state plane is separate because state discovery and movement need not be
 implemented by, or share a lifecycle with, an execution engine.
 
 No core type may require an SGLang, vLLM, TensorRT-LLM, NexusKV, Axum, or
-Pingora type. Integrations depend inward on InferFront contracts.
+Pingora type. Integrations depend inward on Locus contracts.
 
 ## Responsibility split
 
-### InferFront owns
+### Locus owns
 
 - northbound protocol parsing and response shaping;
 - request validation and canonicalization;
@@ -77,7 +79,7 @@ Pingora type. Integrations depend inward on InferFront contracts.
 - device-local state representation;
 - model forward execution.
 
-InferFront chooses an eligible target and supplies normalized work. It does not
+Locus chooses an eligible target and supplies normalized work. It does not
 dictate how the target batches or executes that work after admission.
 
 ### State providers own
@@ -285,7 +287,7 @@ provider metadata cross trust boundaries. Implementations should:
 - enforce deadlines and cancellation across downstream operations.
 
 Unusual `trust_remote_code` behavior may eventually run in an isolated Python
-semantic worker. Python code is not embedded in the normal gateway hot path.
+semantic worker. Python code is not embedded in the normal Locus hot path.
 
 ## Initial implementation sequence
 

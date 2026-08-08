@@ -6,13 +6,13 @@
 
 ## Context
 
-InferFront will be a concurrent, streaming service on the production inference
+Locus will be a concurrent, streaming service on the production inference
 path. It must maintain bounded memory, propagate cancellation and backpressure,
 compose multiple protocol clients, and expose stable extension boundaries.
 
 The model ecosystem contains Python-only custom behavior, but embedding Python
-in the gateway would make the interpreter and its global runtime behavior part
-of the normal hot path.
+in the Locus process would make the interpreter and its global runtime behavior
+part of the normal hot path.
 
 ## Decision
 
@@ -26,13 +26,13 @@ The initial direction is:
 - Hugging Face Tokenizers' Rust implementation for compatible tokenizers;
 - MiniJinja or an equivalent Rust renderer for Jinja-compatible templates.
 
-These libraries remain behind InferFront-owned interfaces. Core architecture is
+These libraries remain behind Locus-owned interfaces. Core architecture is
 not coupled to Axum, Tonic, or one renderer.
 
 Python is supported for SDKs, tooling, and an explicit compatibility escape
 hatch. Unusual custom model semantics may eventually run in an isolated Python
 worker with a narrow RPC interface. Python is not required in the normal
-production request path and is not embedded into the gateway process.
+production request path and is not embedded into the Locus process.
 
 ## Consequences
 
@@ -56,12 +56,12 @@ production request path and is not embedded into the gateway process.
 
 ## Rejected alternatives
 
-### Implement the gateway primarily in Python
+### Implement the control plane primarily in Python
 
 This offers ecosystem reach but makes Python a production hot-path requirement
 and weakens the intended isolation of custom remote code.
 
-### Embed Python in a Rust gateway
+### Embed Python in the Rust control plane
 
 Embedding keeps one process but couples safety, resource limits, packaging, and
 failure behavior to the interpreter. An isolated worker provides a clearer

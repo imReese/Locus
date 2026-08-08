@@ -8,20 +8,20 @@
 
 Inference runtimes expose different HTTP APIs, sampling fields, streaming
 events, error behavior, and model-specific helpers. Allowing those differences
-into the core frontend would couple application semantics and global routing to
+into the core control plane would couple application semantics and routing to
 the first supported engine. Adding an engine would then require changes across
 protocol, planning, and model-semantic code.
 
-InferFront also needs richer inputs than a flat token list. Multimodal
+Locus also needs richer inputs than a flat token list. Multimodal
 references, prepared inputs, metadata, and future model forms must cross the
 boundary without being encoded as runtime-specific escape fields.
 
 ## Decision
 
-InferFront will define a canonical, engine-neutral southbound protocol and core
+Locus will define a canonical, engine-neutral southbound protocol and core
 domain model.
 
-Northbound adapters normalize application requests into InferFront-owned types.
+Northbound adapters normalize application requests into Locus-owned types.
 Capability-based `EngineAdapter` integrations translate canonical requests and
 events to a runtime. Core code selects adapters by declared capabilities,
 health, policy, and cost; it does not branch on SGLang, vLLM,
@@ -34,7 +34,7 @@ gated fallbacks.
 
 Execution engines retain continuous batching, engine-local scheduling, GPU
 memory allocation, kernels, parallel execution, and model forward execution.
-InferFront owns semantic normalization and global placement.
+Locus owns semantic normalization and global placement.
 
 ## Consequences
 

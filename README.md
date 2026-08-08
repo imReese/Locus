@@ -1,28 +1,36 @@
-# InferFront
+# Locus
 
-**InferFront is an engine-neutral frontend and state-aware traffic control plane
-for LLM inference.**
+**Locus is an engine-neutral inference control plane for compute and model-state
+placement.**
 
-Inference engines should execute model workloads, not repeatedly implement
-application-facing semantics.
+Locus sits above inference engines such as SGLang, vLLM, TensorRT-LLM, and
+future runtimes. It normalizes model-facing semantics, understands execution
+capabilities and reusable-state locality, and makes global placement decisions
+across compute and state.
 
-Nginx sits in front of web servers; InferFront sits in front of inference
-engines. The analogy describes its placement, not its full role: InferFront is
-inference-native. It understands model semantics, engine capabilities, reusable
-model state, and the cost of placing a request on a particular engine.
+> **Locus decides where inference should happen and where its reusable state
+> should live.**
+
+Inference is a placement problem involving both compute and state. Inference
+engines should execute model workloads, not repeatedly implement
+application-facing semantics or global placement policy.
+
+For intuition, Nginx sits in front of web servers; Locus coordinates workloads
+in front of inference engines. Locus is inference-native, not merely another
+API gateway or reverse proxy.
 
 > [!IMPORTANT]
-> InferFront is in its design phase. This repository currently defines the
+> Locus is in its design phase. This repository currently defines the
 > intended architecture and contracts; it does not yet contain a production
 > implementation.
 
-## Why InferFront?
+## Why Locus?
 
 SGLang, vLLM, TensorRT-LLM, and future runtimes should be able to focus on
 efficient execution. Applications should not have to adopt a different set of
 templates, parsers, request semantics, and traffic policies for each engine.
 
-InferFront separates those concerns into a common layer:
+Locus coordinates those concerns in a common control plane:
 
 - OpenAI-compatible and future northbound protocols
 - request validation and normalization
@@ -35,7 +43,7 @@ InferFront separates those concerns into a common layer:
 
 The core architectural contributions are:
 
-1. a stable, engine-neutral semantic frontend;
+1. a stable, engine-neutral semantic normalization layer;
 2. a canonical engine protocol;
 3. capability-based engine adapters;
 4. a generic, optional state-provider interface; and
@@ -54,9 +62,9 @@ matching token prefix.
             | OpenAI-compatible and future protocols
             v
 +----------------------------------------------------------+
-| InferFront                                               |
-| protocol | model semantics | admission | global planner |
-| routing  | observability   | state-aware placement       |
+| Locus                                                    |
+| protocol | model semantics | admission | global planner  |
+| routing  | observability   | compute + state placement   |
 +----------------------------+-----------------------------+
              |               |
              | canonical     | generic StateProvider
@@ -71,13 +79,13 @@ SGLang adapter     vLLM adapter     future adapters
 SGLang engine      vLLM engine      other engines
 ```
 
-InferFront owns global, cross-engine decisions. Execution engines continue to
+Locus owns global, cross-engine decisions. Execution engines continue to
 own continuous batching, engine-local scheduling, GPU memory and KV-page
 allocation, kernels, speculative decoding execution, CUDA graphs, distributed
 parallelism, and model forward execution.
 
 [NexusKV](https://github.com/imReese/NexusKV) is the intended reference
-integration for reusable model state. It is not a dependency of InferFront
+integration for reusable model state. It is not a dependency of Locus
 core. A deployment may use another `StateProvider` implementation or run with
 state integration disabled.
 
@@ -95,7 +103,7 @@ state integration disabled.
 - **State as a planning dimension:** reuse boundaries, compatibility,
   placement, and materialization cost participate in every eligible placement
   decision.
-- **Clear ownership:** InferFront performs global planning; engines retain
+- **Clear ownership:** Locus performs global planning; engines retain
   control of their local execution loops.
 - **No Python hot-path requirement:** Rust is the primary implementation
   language. Python remains an SDK and compatibility escape hatch.
@@ -110,6 +118,7 @@ state integration disabled.
 - [ADR 0001: Engine-neutral boundary](docs/adr/0001-engine-neutral-boundary.md)
 - [ADR 0002: State-provider abstraction](docs/adr/0002-state-provider-abstraction.md)
 - [ADR 0003: Rust as the primary language](docs/adr/0003-rust-primary-language.md)
+- [ADR 0004: Project name Locus](docs/adr/0004-project-name-locus.md)
 
 ## Implementation direction
 
@@ -119,14 +128,14 @@ expected to use Tonic and Protobuf. Hugging Face Tokenizers and a
 Jinja-compatible renderer such as MiniJinja are the initial semantic building
 blocks.
 
-These are implementation choices behind stable InferFront interfaces, not
+These are implementation choices behind stable Locus interfaces, not
 types that define the core architecture. The current design is intentionally
 ahead of implementation; wire formats and Rust APIs remain subject to
 validation and change.
 
 ## Scope
 
-InferFront is not:
+Locus is not:
 
 - another model execution runtime;
 - a replacement for engine-local schedulers;
@@ -139,4 +148,4 @@ implementation path.
 
 ## License
 
-InferFront is licensed under the [Apache License 2.0](LICENSE).
+Locus is licensed under the [Apache License 2.0](LICENSE).

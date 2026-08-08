@@ -122,7 +122,7 @@ A template declares:
 
 Rendering is deterministic for a pinned context. File, network, environment,
 clock, and arbitrary code access are disabled. Resource and output limits
-protect the gateway from expensive or adversarial templates.
+protect the control plane from expensive or adversarial templates.
 
 Template output is not always one flat string. The intermediate
 `RenderedPrompt` preserves segments and placeholder bindings so that
@@ -248,7 +248,7 @@ Rust. A future compatibility path may run those semantics in an isolated Python
 worker with:
 
 - a narrow, versioned RPC boundary;
-- no in-process Python interpreter in the gateway;
+- no in-process Python interpreter in the Locus process;
 - explicit model-profile opt-in;
 - process, filesystem, network, time, and memory isolation;
 - deterministic inputs and bounded outputs;
