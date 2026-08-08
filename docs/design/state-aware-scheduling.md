@@ -1,0 +1,464 @@
+# State-Aware Scheduling
+
+## Status
+
+This document defines the target planner and state-provider abstractions. It is
+not an implemented scheduler or NexusKV integration. Cost terms, trait methods,
+and schemas require measurement and prototyping before they become stable APIs.
+
+## Principle
+
+State locality and materialization cost are first-class placement inputs.
+
+InferFront must not first choose an engine using a conventional load balancer
+and then opportunistically ask whether a cache happens to be present. For each
+eligible target, the planner evaluates the execution path and reusable-state
+options together.
+
+A conceptual objective is:
+
+```text
+cost = queue_cost
+     + unmatched_prefill_cost
+     + state_materialization_cost
+     + decode_cost
+     + topology_cost
+     + policy_cost
+```
+
+The terms are estimates in a comparable unit, initially expected latency or a
+policy-weighted score. They are not raw values that can be added without
+calibration.
+
+## State is more than a token prefix
+
+Longest-token-prefix matching is insufficient because reusable state may be:
+
+- paged KV cache for a transformer;
+- compressed or latent MLA state;
+- recurrent or KDA checkpoints whose valid restore points are discrete;
+- multimodal preprocessing results or model embeddings;
+- encoder output or cross-attention state;
+- future model-specific state with non-token coordinates.
+
+A match therefore reports a typed artifact, structured input coverage, model
+and semantic compatibility, placement, and the work required to use it. Token
+prefix length may be one input to the estimate for one state kind, never the
+generic interface.
+
+## Core model
+
+### State requirement
+
+`StateRequirement` is derived from the canonical request and target
+capabilities. It describes what could be reused without assuming that it
+exists:
+
+```text
+StateRequirement
+  model_identity
+  semantics_identity
+  input_fingerprint
+  input_structure
+  accepted_state_kinds
+  compatibility_constraints
+  tenant_scope
+  deadline
+```
+
+The input fingerprint may contain token-segment digests, media digests,
+preprocessing identities, or other typed component identities. A provider sees
+only the information authorized by tenant and privacy policy.
+
+### State descriptor
+
+A `StateDescriptor` returned by a provider includes:
+
+- provider-scoped artifact identity and state kind;
+- producer model and semantic identities;
+- execution compatibility attributes such as dtype, quantization, layout,
+  adapter revision, and parallelism;
+- a `ReusableBoundary` describing valid input coverage;
+- present location or locations and topology metadata;
+- size and materialization attributes;
+- freshness, lifetime, ownership, and tenant scope;
+- evidence source and confidence;
+- a provider-private reference kept opaque to core logic.
+
+State kinds use an extensible namespace, not a closed enum whose last value is
+`KvCache`.
+
+### Reusable boundary
+
+`ReusableBoundary` describes exactly which portion of an `InputBundle` has
+valid state and where execution may resume. It may use:
+
+- ordered token positions within a named token segment;
+- completed item or segment identities;
+- a recurrent checkpoint number or logical step;
+- a media item plus preprocessing stage;
+- a provider-defined typed coordinate negotiated by capability.
+
+```text
+ReusableBoundary
+  covered_components: repeated ComponentCoverage
+  resume_coordinate: typed ResumeCoordinate
+  completeness: complete | checkpointed | partial
+  validation_digest
+```
+
+Coverage and resume coordinates are separate. A recurrent artifact can cover a
+long input but allow resumption only from its latest valid checkpoint. A paged
+cache match can identify shared pages while lacking the terminal page required
+for a valid continuation. The provider must report the executable boundary, not
+just the amount of data that appears to match.
+
+### Compatibility
+
+Compatibility is an explicit result:
+
+```text
+CompatibilityResult
+  verdict: compatible | incompatible | unknown
+  checked_constraints
+  evidence
+  required_conversion
+```
+
+Relevant constraints vary by state kind and can include:
+
+- immutable model weights and adapter/LoRA revision;
+- tokenizer and chat-template behavior;
+- input and media-preprocessing identity;
+- state representation version;
+- dtype, quantization, attention layout, and parallel decomposition;
+- positional encoding and sequence-coordinate rules;
+- engine or kernel ABI;
+- tenant and security scope.
+
+Unknown required evidence is incompatible for planning purposes. A conversion
+is represented as a materialization option with cost and target compatibility,
+not as a claim that the original artifact is directly compatible.
+
+## `StateProvider` abstraction
+
+The conceptual asynchronous interface is:
+
+```rust,ignore
+#[async_trait]
+pub trait StateProvider: Send + Sync {
+    fn identity(&self) -> &StateProviderIdentity;
+    fn capabilities(&self) -> &StateProviderCapabilities;
+
+    async fn lookup(
+        &self,
+        requirement: &StateRequirement,
+        context: &OperationContext,
+    ) -> Result<Vec<StateDescriptor>, StateProviderError>;
+
+    async fn estimate(
+        &self,
+        state: &StateDescriptor,
+        target: &ExecutionTarget,
+        context: &OperationContext,
+    ) -> Result<Vec<MaterializationOption>, StateProviderError>;
+
+    async fn materialize(
+        &self,
+        option: &MaterializationOption,
+        context: &OperationContext,
+    ) -> Result<PreparedStateAttachment, StateProviderError>;
+
+    async fn preload(
+        &self,
+        request: PreloadRequest,
+        context: &OperationContext,
+    ) -> Result<StateOperation, StateProviderError>;
+
+    async fn replicate(
+        &self,
+        request: ReplicationRequest,
+        context: &OperationContext,
+    ) -> Result<StateOperation, StateProviderError>;
+}
+```
+
+The eventual API may use streaming results or split read and mutation traits.
+Important contract properties are:
+
+- lookup does not authorize placement or state movement;
+- estimates are target-specific, timestamped, and uncertainty-aware;
+- mutations require explicit planner/orchestrator decisions;
+- materialization returns a short-lived core-owned attachment, not a
+  provider-specific object;
+- cancellation and deadlines apply to every operation;
+- no provider is required.
+
+A `NullStateProvider` returns no matches and rejects mutation operations as
+unsupported. This makes cold, state-unaware operation part of normal contract
+testing.
+
+## NexusKV integration
+
+NexusKV is the intended reference `StateProvider`. It can implement the generic
+contract using its own catalog, state formats, transfer mechanisms, and
+topology knowledge.
+
+The integration lives outside InferFront core and depends on InferFront's
+provider API. InferFront core does not import the NexusKV SDK, use NexusKV
+identifiers as domain types, or assume NexusKV deployment. Another provider can
+implement the same contract, and a deployment can run without any provider.
+
+NexusKV-specific capabilities may use namespaced extensions. Portable
+planner behavior depends only on the generic descriptor, compatibility,
+boundary, location, and cost contracts.
+
+## Planning inputs
+
+For each admitted request, planning begins with:
+
+- immutable normalized request and state requirement;
+- capability-eligible engine targets;
+- fresh engine load snapshots;
+- state descriptors and materialization options;
+- topology graph and transfer observations;
+- request deadline, priority, tenant, and policy constraints;
+- calibrated cost-model parameters and confidence bounds.
+
+Capability and correctness constraints filter candidates before cost
+comparison. A low estimated cost cannot make an incompatible state or engine
+eligible.
+
+## Candidate plans
+
+A candidate plan is a complete feasible path, for example:
+
+- cold combined prefill/decode on engine A;
+- use state already local to engine B, then continue there;
+- transfer a checkpoint from host C to engine A, then continue;
+- recompute unmatched prefill on engine D instead of transferring state;
+- prefill on P, hand off compatible state, and decode on D.
+
+Each candidate records:
+
+- target stage or stages and reservations required;
+- selected state and reusable boundary, if any;
+- materialization or handoff actions;
+- expected cost terms and uncertainty;
+- deadline feasibility;
+- fallback on reservation or state-action failure;
+- an explanation of constraints and trade-offs.
+
+The planner compares complete paths. It does not rank state matches independently
+of the engines on which they can be used.
+
+## Cost terms
+
+### Queue cost
+
+Estimated time until execution can begin, derived from fresh engine snapshots,
+request shape, scheduling class, and recent service rates. Queue depth alone is
+not comparable across engines or request sizes.
+
+### Unmatched prefill cost
+
+Expected compute for the input not covered by the executable reusable boundary.
+It accounts for input structure, model architecture, target throughput, and any
+required reconstruction. It is not simply `unmatched_tokens * constant`.
+
+### State materialization cost
+
+Expected time and resource pressure for lookup completion, transfer,
+conversion, decompression, device installation, or attachment. An already-local
+artifact can still have a nonzero binding cost.
+
+### Decode cost
+
+Expected generation cost using requested output limits, sampling mode, target
+decode throughput, and execution role. It is uncertain because generated
+length is unknown; policy selects an estimator or percentile.
+
+### Topology cost
+
+Penalties for network links, failure domains, data residency, prefill/decode
+handoff, accelerators, and contention not already represented by transfer time.
+Hard topology constraints filter rather than penalize candidates.
+
+### Policy cost
+
+Explicit, auditable preferences such as tenant affinity, fairness debt, energy,
+monetary cost, provider quotas, or stability. Policy cost cannot override a
+correctness or authorization constraint.
+
+## Comparing transfer and recompute
+
+For compatible state and a target, the planner compares at least:
+
+```text
+reuse_path = queue_with_reuse
+           + materialization
+           + unmatched_prefill
+           + decode
+           + topology_and_policy
+
+cold_path  = queue_cold
+           + full_prefill
+           + decode
+           + topology_and_policy
+```
+
+The comparison includes uncertainty and deadline risk. Transfer is not chosen
+merely because a match exists. Recompute can win for small reusable regions,
+slow or congested links, format conversion, short deadlines, or an otherwise
+idle target.
+
+The planner records the chosen and rejected alternatives so observed outcomes
+can recalibrate estimates.
+
+## Cache-aware routing
+
+Cache-aware routing is the special case where reusable state is already located
+on, or cheaply attachable to, a candidate engine. The same general algorithm
+handles it:
+
+1. query compatible state for the normalized request;
+2. obtain executable reuse boundaries, not just hash matches;
+3. estimate paths for each eligible engine and state option;
+4. compare against cold and transfer/recompute alternatives;
+5. reserve and revalidate the selected path.
+
+Affinity is therefore conditional on total expected cost and feasibility, not
+a rule to always route to the longest match.
+
+## Preload, warming, and replication
+
+Preload and replication are planned background actions with budgets. They are
+not implicit side effects of lookup.
+
+Policies may use expected demand, artifact size, topology, eviction pressure,
+and cost avoided to propose actions. Every action has:
+
+- target state and location;
+- tenant and authorization scope;
+- resource budget and priority below foreground work;
+- expiry or invalidation condition;
+- estimated benefit and cost;
+- observable outcome.
+
+Speculative warming must not reserve unbounded memory, amplify a hot artifact
+across every engine, or move tenant state across prohibited boundaries.
+
+## Topology and PD-aware placement
+
+Topology is expressed as data: nodes, execution roles, state locations, links,
+failure domains, and observed transfer properties. Core planning does not rely
+on one deployment's host naming or one engine's disaggregation protocol.
+
+For prefill/decode disaggregation, a candidate plan includes:
+
+- prefill target and its queue/compute cost;
+- state produced or reused at the prefill boundary;
+- compatible handoff method and transfer/materialization cost;
+- decode target and queue/decode cost;
+- failure and fallback behavior across both stages.
+
+A reusable recurrent checkpoint or MLA state can participate if its provider
+and adapters describe a compatible handoff. The planner does not assume a
+conventional KV representation.
+
+## Reservations and races
+
+Lookup and snapshots are observations, not reservations. Between planning and
+execution, an engine can fill, an artifact can expire, or link cost can change.
+
+The orchestrator uses this sequence:
+
+1. select a plan from bounded-fresh inputs;
+2. reserve target capacity where supported;
+3. revalidate state and target generation;
+4. materialize and bind state within a time budget;
+5. submit execution;
+6. apply the encoded fallback or replan on failure.
+
+Plans carry a short validity horizon. Replanning is bounded to avoid livelock.
+State attachments are scoped and expiring so stale handles fail closed.
+
+## Admission control interaction
+
+Admission precedes expensive state movement. It constrains planning with
+priority, tenant budgets, maximum queue/materialization delay, and overload
+policy. A warm state hit does not bypass admission or fairness.
+
+Admission may reserve separate budgets for foreground execution and background
+preload/replication. Provider degradation can trigger a cold-only mode without
+changing tenant authorization.
+
+## Provider failure behavior
+
+State is an optimization unless a request explicitly requires a prepared
+artifact. Failure policy is explicit:
+
+- lookup timeout: consider cold candidates if allowed;
+- estimate unavailable: do not treat the option as zero-cost;
+- compatibility unknown: reject that state candidate;
+- materialization failure: apply the plan's cold/replan/fail fallback;
+- stale attachment: never submit it as compatible;
+- provider-wide outage: open a circuit and plan cold while policy permits.
+
+Fallback decisions still respect the original deadline, residency, capability,
+and admission constraints.
+
+## Observability and calibration
+
+For each decision, record redacted structured data:
+
+- candidate targets and exclusion reasons;
+- state kind, location, compatibility verdict, and reusable boundary;
+- every estimated cost term, confidence, and data freshness;
+- selected actions and fallback;
+- actual queue, materialization, prefill, decode, and transfer timing;
+- whether state was accepted and the boundary actually used;
+- cancellation or failure stage.
+
+Comparing estimates with outcomes supports per-engine, per-model, per-state-kind,
+and per-topology calibration. Planner versions and parameter revisions are part
+of the trace so decisions remain explainable.
+
+Prompts, raw token sequences, media, provider-private handles, and tenant data
+are excluded unless an explicit privacy policy authorizes them.
+
+## Initial planner strategy
+
+The first implementation should favor a transparent, bounded candidate scorer
+over a complex optimizer:
+
+1. filter by hard capability, policy, and compatibility constraints;
+2. generate cold plus a bounded number of best state options per target;
+3. compute calibrated cost and conservative deadline feasibility;
+4. choose the lowest-cost feasible plan with deterministic tie-breaking;
+5. expose a complete decision explanation;
+6. learn calibration parameters from observations without allowing an online
+   learner to bypass hard constraints.
+
+More advanced optimization can replace the scorer behind `Planner` after trace
+data demonstrates a need.
+
+## Validation
+
+The state and planner contract should be tested with fake providers and engines
+before a NexusKV integration is treated as conformant. Tests include:
+
+- equal token prefix with incompatible model or semantic identity;
+- matched pages without a valid terminal checkpoint;
+- recurrent checkpoint with a non-token resume coordinate;
+- multimodal state with changed preprocessing or media digest;
+- local short match versus remote long match;
+- transfer slower than recompute;
+- PD handoff with incompatible layout;
+- missing, stale, or low-confidence cost observations;
+- provider timeout and materialization failure fallbacks;
+- tenant isolation and topology restrictions;
+- engine restart invalidating a prepared attachment;
+- deterministic choice and explanation for equal costs.
+
+Passing these tests validates decision semantics, not production cost accuracy.

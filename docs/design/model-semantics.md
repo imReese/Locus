@@ -1,0 +1,288 @@
+# Model Semantics
+
+## Status
+
+This document defines the intended model-semantic layer. It is design-only;
+there is no implemented semantic registry, tokenizer pipeline, or parser API in
+the repository yet.
+
+## Purpose
+
+Model semantics turn an application request into engine-executable input and
+turn engine output into application-visible meaning. Centralizing these rules
+keeps behavior consistent when a request is placed on a different compatible
+engine.
+
+The layer includes:
+
+- structured request validation and defaulting;
+- chat-template selection and rendering;
+- tokenization and detokenization;
+- multimodal input normalization;
+- sampling-parameter normalization;
+- reasoning and tool-call parsing;
+- stop and finish semantics.
+
+It does not execute model kernels, schedule batches, or decide request
+placement.
+
+## Model profiles
+
+A deployment-controlled `ModelProfile` selects a versioned set of semantic
+components for an immutable model revision. A profile includes:
+
+- public model aliases and immutable artifact identity;
+- tokenizer identity, revision, and configuration;
+- template identity, source, revision, and declared inputs;
+- multimodal normalizer identities and limits;
+- reasoning and tool-call parser configuration;
+- supported northbound features and defaults;
+- engine requirements derived from those semantics;
+- a deterministic `semantics_fingerprint`.
+
+Aliases are mutable operational configuration; fingerprints are not. Reusable
+state compatibility uses the immutable model identity and relevant semantic
+fingerprints, never a user-facing alias alone.
+
+Profiles are loaded, validated, and activated atomically. In-flight requests
+retain the profile revision selected at admission.
+
+## Conceptual interfaces
+
+The interfaces below illustrate separation of responsibility, not a committed
+Rust API:
+
+```rust,ignore
+pub trait TokenizerProvider: Send + Sync {
+    fn identity(&self) -> &TokenizerIdentity;
+    fn encode(&self, input: &str, options: EncodeOptions)
+        -> Result<TokenSequence, SemanticError>;
+    fn decoder(&self, options: DecodeOptions)
+        -> Result<Box<dyn IncrementalDecoder>, SemanticError>;
+}
+
+pub trait TemplateRenderer: Send + Sync {
+    fn identity(&self) -> &TemplateIdentity;
+    fn render(&self, conversation: &Conversation, context: &TemplateContext)
+        -> Result<RenderedPrompt, SemanticError>;
+}
+
+pub trait ModelSemantics: Send + Sync {
+    fn identity(&self) -> &SemanticsIdentity;
+    fn normalize(&self, request: SemanticRequest)
+        -> Result<NormalizedRequest, SemanticError>;
+    fn output_pipeline(&self, contract: &OutputContract)
+        -> Result<OutputPipeline, SemanticError>;
+}
+```
+
+Reasoning and tool parsers are factories that create request-scoped,
+incremental parser state. Multimodal normalizers follow the same narrow-provider
+pattern. A composed `ModelSemantics` service coordinates them but does not hide
+their identities from compatibility checks.
+
+## Input normalization pipeline
+
+The semantic pipeline follows a deterministic order:
+
+1. **Protocol-independent validation.** Check conversation roles, tool schemas,
+   media counts, generation limits, and mutually exclusive options.
+2. **Profile resolution.** Pin the immutable model and semantic profile.
+3. **Template rendering.** Render structured conversation data, tool
+   definitions, and declared template variables.
+4. **Multimodal normalization.** Validate and canonicalize media references,
+   bind them to template placeholders, and produce typed input items.
+5. **Tokenization.** Encode rendered textual segments with the pinned tokenizer
+   and preserve segment identities.
+6. **Sampling normalization.** Resolve aliases and defaults, validate ranges,
+   and express required engine capabilities.
+7. **Input assembly.** Construct an ordered canonical `InputBundle` containing
+   token sequences, media or prepared-input references, relations, and typed
+   metadata.
+8. **Output contract construction.** Select detokenizer and incremental parsers
+   and declare the engine output required to drive them.
+
+Errors point to the stage and offending public field without exposing template
+source or private deployment data.
+
+## Chat templates
+
+Templates consume a typed context rather than an unrestricted process object.
+Initial rendering is expected to use MiniJinja or an equivalent
+Jinja-compatible Rust implementation behind `TemplateRenderer`.
+
+A template declares:
+
+- required conversation and tool fields;
+- supported roles and multimodal placeholders;
+- special-token handling;
+- whether it emits generation markers;
+- renderer and language compatibility version;
+- a content digest used in the semantic fingerprint.
+
+Rendering is deterministic for a pinned context. File, network, environment,
+clock, and arbitrary code access are disabled. Resource and output limits
+protect the gateway from expensive or adversarial templates.
+
+Template output is not always one flat string. The intermediate
+`RenderedPrompt` preserves segments and placeholder bindings so that
+multimodal inputs and reusable state boundaries remain meaningful.
+
+## Tokenization and detokenization
+
+The normal production path uses a Rust tokenizer implementation, initially
+Hugging Face Tokenizers where compatible. Tokenizer identity includes all
+behavior that can change token IDs: vocabulary and merges, normalization,
+pre-tokenization, special tokens, added tokens, and relevant options.
+
+Incremental decoding must handle:
+
+- byte sequences split across token events;
+- replacement or cleanup behavior at token boundaries;
+- stop sequences that cross engine event boundaries;
+- multiple candidates with isolated decoder state;
+- engines that coalesce or fragment token deltas.
+
+Token-delta output is preferred. A text-delta fallback is allowed only when the
+engine advertises sufficient behavior and the selected parsers can operate
+correctly without raw token boundaries. The fallback is a capability decision,
+not a silent change in ownership.
+
+## Multimodal normalization
+
+Multimodal semantics are not reduced to textual placeholder tokens. A
+normalizer produces typed `InputItem`s and relations within `InputBundle`.
+
+For each media input it records, as applicable:
+
+- media kind, content type, and immutable digest;
+- source or access reference after security policy;
+- dimensions, duration, frame selection, or other shape metadata;
+- preprocessing profile and revision;
+- binding to rendered prompt segments;
+- whether a prepared model input may be substituted;
+- capability and context-cost requirements.
+
+Fetching and decoding media occurs through bounded, policy-controlled services.
+Remote URLs are not passed blindly to engines. Reusable vision embeddings or
+other prepared artifacts have their own compatibility and reuse boundaries.
+
+## Sampling normalization
+
+Northbound parameters are converted into canonical sampling semantics before
+placement. The normalizer distinguishes:
+
+- an omitted value;
+- a profile default;
+- an explicitly requested value;
+- an engine-defaulted value allowed by policy.
+
+It also derives capability requirements. An adapter cannot reinterpret a field
+because its engine uses a similar name. Unsupported exact semantics result in
+policy-approved degradation or pre-execution rejection.
+
+## Incremental output pipeline
+
+Canonical engine events flow through request-scoped stages:
+
+```text
+token events -> incremental decoder -> stop handling
+             -> reasoning/tool parser state -> semantic output events
+             -> northbound protocol adapter
+```
+
+Parsers consume an ordered stream and may buffer only bounded partial syntax.
+They emit typed events rather than directly constructing OpenAI response
+objects. This keeps the same semantics usable by future northbound protocols.
+
+The pipeline preserves three distinct views where needed:
+
+- raw canonical engine events for diagnostics and accounting;
+- decoded model text for parsing;
+- application-visible content after semantic classification.
+
+Reasoning content must not leak into answer text or tool arguments because of
+chunk boundaries. Likewise, partial JSON in a tool call is not declared valid
+until parser rules permit it.
+
+## Reasoning parsers
+
+A reasoning parser recognizes model-specific delimiters or structures and
+emits typed reasoning and answer deltas. Its configuration declares:
+
+- recognized syntax and version;
+- whether raw token access is required;
+- bounded buffering behavior;
+- behavior for malformed or unterminated reasoning;
+- interaction with stops, tools, and finish reasons.
+
+Malformed output follows an explicit profile policy: preserve it as ordinary
+content, return a parse error, or report a degraded parse. Silent loss is not
+valid.
+
+## Tool-call parsers
+
+A tool parser transforms model output into typed call identifiers, function
+names, and arguments. It is responsible for streaming fragmentation and model
+syntax, but not for authorizing or executing tools.
+
+The parser distinguishes:
+
+- tentative syntax from committed tool-call structure;
+- partial argument bytes from valid completed arguments;
+- one call from parallel or sequential calls;
+- parser completion from engine finish reason.
+
+Tool definitions are validated before template rendering. Model-emitted tool
+names and arguments remain untrusted application data.
+
+## Python compatibility boundary
+
+Python is not required in the normal production hot path. A Python SDK may
+construct requests or manage deployment configuration without changing this
+rule.
+
+Some models may require unusual custom tokenizer, template, or
+`trust_remote_code` behavior that cannot be safely or promptly represented in
+Rust. A future compatibility path may run those semantics in an isolated Python
+worker with:
+
+- a narrow, versioned RPC boundary;
+- no in-process Python interpreter in the gateway;
+- explicit model-profile opt-in;
+- process, filesystem, network, time, and memory isolation;
+- deterministic inputs and bounded outputs;
+- separate health, admission, and observability.
+
+Using this worker is a declared capability and a performance/security trade-off,
+not a transparent fallback.
+
+## Caching and compatibility
+
+Semantic artifacts may be cached, but each has a typed key:
+
+- rendered prompts depend on template identity and complete typed inputs;
+- token sequences depend on tokenizer identity and encoding options;
+- prepared multimodal inputs depend on preprocessing and model identities;
+- reusable model state additionally depends on execution layout and state kind.
+
+The `semantics_fingerprint` summarizes relevant semantic identity for quick
+comparison. It does not replace structured compatibility evidence when only a
+subset of semantics affects an artifact.
+
+## Validation strategy
+
+Semantic conformance tests should include:
+
+- golden template and tokenization vectors pinned to upstream revisions;
+- special-token, Unicode, and incremental-decoding edge cases;
+- multimodal placeholder and ordering cases;
+- cross-event reasoning and tool syntax fragmentation;
+- malformed and unterminated parser inputs;
+- sampling default and unsupported-feature matrices;
+- deterministic profile fingerprinting;
+- parity tests for any Python compatibility profile;
+- execution of the same normalized request through fake engine adapters.
+
+Golden tests validate declared semantics. They do not establish equivalence for
+uncontrolled remote model code or different tokenizer revisions.
