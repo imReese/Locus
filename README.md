@@ -20,10 +20,11 @@ in front of inference engines. Locus is inference-native, not merely another
 API gateway or reverse proxy.
 
 > [!IMPORTANT]
-> Locus is in its initial architecture bootstrap. The repository contains
-> engine-neutral domain contracts, deterministic fakes, and a tested
-> planner-to-executor vertical slice. It does not yet contain a production
-> server or engine adapter, tokenizer pipeline, or state-system integration.
+> Locus now contains a tested end-to-end control-plane slice: protocol-neutral
+> model semantics and inference service, OpenAI Responses and Chat Completions
+> HTTP adapters, SGLang/vLLM completion adapters, and an optional NexusKV bridge.
+> The network integrations are conformance-tested against deterministic mock
+> services; no live GPU serving or NexusKV data transfer is claimed yet.
 
 ## Why Locus?
 
@@ -125,44 +126,65 @@ state integration disabled.
 - [Engine adapter contract](docs/design/engine-adapter-contract.md)
 - [Model semantics](docs/design/model-semantics.md)
 - [State-aware scheduling](docs/design/state-aware-scheduling.md)
+- [OpenAI-compatible API](docs/design/openai-api.md)
+- [NexusKV bridge](docs/design/nexuskv-bridge.md)
 
 ## Implementation
 
-The initial Rust 2024 workspace keeps the architecture boundaries small and
-explicit:
+The Rust 2024 workspace keeps the architecture boundaries small and explicit:
 
 - `locus-core`: canonical requests, execution facts, identities, reusable-state
   contracts, and operation context;
-- `locus-semantics`: model-profile and semantic-provider boundaries;
+- `locus-semantics`: model registry, normalization, typed semantic events,
+  tool-call aggregation, reasoning, and structured-output validation;
 - `locus-engine`: engine adapter contract, registry, and deterministic fake;
 - `locus-state`: state-provider contract, null provider, and deterministic fake;
 - `locus-planner`: cost-based path selection and the side-effecting
-  `PlanExecutor`.
+  `PlanExecutor`;
+- `locus-runtime`: `InferenceService`, target discovery, state-candidate
+  construction, planning, semantic streaming, and cancellation;
+- `locus-openai`: Responses, Chat Completions, model listing, health, SSE, and
+  OpenAI-shaped errors;
+- `locus-engine-openai`: network adapters for SGLang and vLLM completion
+  endpoints;
+- `locus-state-nexuskv`: optional, versioned HTTP bridge from NexusKV match and
+  materialization results into the generic `StateProvider` handshake.
 
-The bootstrap intentionally has no HTTP server and no real SGLang, vLLM,
-TensorRT-LLM, or NexusKV integration. Its purpose is to validate ownership,
-compatibility filtering, generation fencing, import cleanup, fallback, and
-compute-plus-state path selection before framework integration.
+The byte tokenizer and simple template renderer are deterministic reference
+components for conformance tests, not production model profiles.
 
 Run the local checks with:
 
 ```bash
 cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all
+cargo test --workspace
 ```
 
 ## Implementation direction
 
-The intended implementation stack is Rust 2024 with Tokio. Initial protocol
-adapters may use Axum/Hyper for HTTP and SSE, while the southbound contract is
-expected to use Tonic and Protobuf. Hugging Face Tokenizers and a
-Jinja-compatible renderer such as MiniJinja are the initial semantic building
-blocks.
+The implementation uses Rust 2024, Tokio, Axum, and Reqwest. Core contracts do
+not depend on those frameworks. A future native southbound protocol may use
+Tonic and Protobuf. Production model profiles should use the exact model
+tokenizer, template, and parsers instead of the reference byte-level components.
 
 These are implementation choices behind stable Locus interfaces, not types
-that define the core architecture. Wire formats and Rust APIs remain subject
-to validation and change as the bootstrap advances.
+that define the core architecture. Wire formats and Rust APIs remain pre-1.0.
+
+## Validation boundaries
+
+- OpenAI Responses/Chat and adapter streaming are exercised through in-process
+  HTTP/SSE conformance tests.
+- SGLang and vLLM requests send canonical token IDs to `/v1/completions`; tests
+  cover request IDs, structured-output mapping, usage, finish events, and the
+  SGLang abort path. No live runtime or GPU test is included.
+- The NexusKV provider requires a separately deployed
+  `locus.nexuskv-bridge.v1` service. The current NexusKV repository exposes the
+  underlying contract and execution abstractions but not these HTTP endpoints.
+  The complete Locus handshake is tested against a bridge double; physical
+  transfer remains unverified.
+- Authentication, admission, calibrated costs, telemetry export, multimodal
+  normalization, and a deployable server binary remain future work.
 
 ## Scope
 

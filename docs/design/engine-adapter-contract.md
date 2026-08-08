@@ -2,10 +2,18 @@
 
 ## Status
 
-This is the proposed contract for engine integrations. It defines ownership and
-behavior, not a stable Rust API. A deterministic fake validates the import and
-execution lifecycle; no SGLang, vLLM, TensorRT-LLM, or other production adapter
-is implemented yet.
+This contract is implemented as a pre-1.0 Rust API. A deterministic fake
+validates import and execution lifecycles. The separate
+`locus-engine-openai` crate implements network adapters for SGLang and vLLM
+OpenAI-compatible `/v1/completions` endpoints without introducing their types
+into `locus-engine`. Mock HTTP/SSE tests cover pretokenized requests, text and
+usage events, finish reasons, structured-output fields, and SGLang aborts. No
+live runtime, GPU, latency, or native state-import validation is claimed.
+These completion adapters advertise structured-output support but not typed
+reasoning or tool-call events; requests requiring those capabilities are
+filtered before planning. A future runtime-native parser adapter may add them.
+The vLLM adapter sends `add_special_tokens: false` because `ModelSemantics` has
+already rendered and tokenized the prompt; adapters must not add a second BOS.
 
 ## Purpose
 

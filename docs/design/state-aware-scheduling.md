@@ -2,11 +2,13 @@
 
 ## Status
 
-This document defines the target planner and state-provider abstractions. The
-Rust bootstrap contains a deterministic cost-based planner, fake providers, and
-the state-import execution handshake. It is not a production scheduler or
-NexusKV integration; cost calibration and APIs still require measurement and
-prototyping before they become stable.
+This document defines the planner and state-provider abstractions. The Rust
+workspace contains a deterministic cost-based planner, fake providers, the
+state-import execution handshake, and an optional `locus-state-nexuskv` HTTP
+bridge. The bridge maps versioned NexusKV match data into generic descriptors
+and exercises lookup, estimate, prepare, materialize, commit, and execution in
+tests. It is not a calibrated production scheduler, and physical NexusKV/GPU
+transfer has not been validated.
 
 ## Principle
 
@@ -61,6 +63,7 @@ StateRequirement
   model_identity
   relevant_semantic_requirements
   input_fingerprint
+  canonical_token_ids (when authorized and required by a prefix index)
   input_structure
   accepted_state_kinds
   compatibility_constraints
@@ -246,9 +249,23 @@ objects never enter the adapter API. NexusKV remains one optional provider.
 
 ## NexusKV integration
 
-NexusKV is the intended reference `StateProvider`. It can implement the generic
-contract using its own catalog, state formats, transfer mechanisms, and
-topology knowledge.
+NexusKV is the reference `StateProvider`. The optional
+`locus-state-nexuskv` crate uses a versioned `locus.nexuskv-bridge.v1` HTTP
+contract. Lookup requests carry canonical token IDs plus structured model and
+input-semantic identities. A hit is accepted only when the bridge echoes the
+identities it validated and returns `nexuskv.contract.v1` data; missing or
+mismatched evidence fails closed.
+
+The bridge returns target-specific estimates and performs materialization only
+after `EngineAdapter.prepare_state_import` supplies a generation-scoped sink.
+It returns a receipt that the adapter must commit before execution. The Planner
+still sees only immutable candidates and remains side-effect free.
+
+The current NexusKV repository has the underlying JSON contract, radix lookup,
+and execution/transfer abstractions, but it does not expose the bridge HTTP
+operations. A deployment must supply that bridge service. Locus's tests use a
+protocol double, so they prove contract mapping and ownership, not live
+NexusKV transport or device attachment.
 
 The integration lives outside Locus core and depends on Locus's
 provider API. Locus core does not import the NexusKV SDK, use NexusKV
@@ -531,8 +548,9 @@ data demonstrates a need.
 
 ## Validation
 
-The state and planner contract should be tested with fake providers and engines
-before a NexusKV integration is treated as conformant. Tests include:
+The state and planner contract is tested with fake providers and engines, and
+the NexusKV bridge path is tested with a protocol double. The broader
+conformance matrix includes:
 
 - equal token prefix with incompatible model or semantic identity;
 - matched pages without a valid terminal checkpoint;

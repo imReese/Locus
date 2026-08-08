@@ -2,9 +2,13 @@
 
 ## Status
 
-This document defines the intended model-semantic layer. The Rust bootstrap
-contains its core traits and identity types, but no semantic registry, tokenizer
-pipeline, template renderer, or output parser implementation yet.
+This document defines the model-semantic layer. The Rust implementation now
+contains `ModelRegistry`, `SemanticRequest`, `ModelSemantics`, an output-pipeline
+factory, typed `SemanticEvent`s, function-call aggregation, reasoning events,
+and JSON structured-output validation. `ByteTokenizer`, `ByteDecoder`, and
+`SimpleTemplateRenderer` are deterministic reference components, not production
+model semantics. Multimodal normalization and model-specific parsers remain
+future work.
 
 ## Purpose
 

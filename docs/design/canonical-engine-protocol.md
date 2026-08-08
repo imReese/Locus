@@ -2,9 +2,11 @@
 
 ## Status
 
-This document proposes the semantic southbound contract between Locus and
-engine adapters. No wire-compatible protocol has been released. Names and
-field shapes are illustrative; behavior and invariants are the design contract.
+This document defines the semantic southbound contract between Locus and
+engine adapters. Its Rust domain types and in-process trait are implemented;
+no stable wire-compatible protocol has been released. Names and field shapes
+remain pre-1.0, while the stated ownership and invariants are the design
+contract.
 
 ## Goals
 
@@ -232,7 +234,10 @@ EngineEvent
     Accepted
     TokenDelta
     TextDelta
-    CandidateDelta
+    ReasoningDelta
+    ToolCallStarted
+    ToolCallArgumentsDelta
+    ToolCallCompleted
     UsageUpdate
     Finish
     EngineError

@@ -2,10 +2,13 @@
 
 ## Status
 
-This document defines the target architecture. An initial Rust workspace now
-implements the core domain types, deterministic fakes, a cost-based planner,
-and a `PlanExecutor` vertical slice. Production integrations and wire schemas
-remain conceptual and will be refined through implementation.
+This document defines the target architecture. The Rust workspace implements
+the core domain types, `ModelRegistry`, `InferenceService`, target discovery,
+semantic-event processing, a cost-based planner, and `PlanExecutor`. Edge
+crates implement OpenAI Responses/Chat, SGLang/vLLM completion adapters, and an
+optional NexusKV bridge. These integrations are mock-conformance-tested; live
+GPU serving, physical state transfer, production admission, and calibrated
+costs remain unverified.
 
 ## Thesis
 
@@ -119,7 +122,8 @@ decision or allocate engine-local destination memory.
 
 Protocol adapters translate an external API into an internal semantic request
 and translate normalized output events back to that API. An OpenAI-compatible
-adapter is an initial target, not the definition of the internal model.
+adapter now implements Responses and Chat Completions over the same
+`InferenceService`; it is not the definition of the internal model.
 
 ### Model semantics
 
@@ -280,15 +284,15 @@ types remain at the edges.
 
 ## Request lifecycle
 
-1. A northbound adapter authenticates, parses, and assigns an internal request
-   identity.
+1. A northbound adapter parses and assigns an internal request identity.
+   Authentication remains a deployment concern.
 2. Validation checks protocol shape, deployment policy, and declared model
    support.
 3. The selected `ModelSemantics` profile renders templates, normalizes media,
    tokenizes input, canonicalizes sampling, and declares required output
    semantics.
-4. Admission control returns a rejection or planning constraints such as
-   priority, deadline, and tenant limits.
+4. A future admission controller may add priority, deadline, and tenant
+   constraints. The current service proceeds directly to discovery.
 5. The capability registry filters execution targets that cannot satisfy the
    request.
 6. For eligible requests, the state provider returns reusable-state candidates
@@ -381,18 +385,22 @@ provider metadata cross trust boundaries. Implementations should:
 Unusual `trust_remote_code` behavior may eventually run in an isolated Python
 semantic worker. Python code is not embedded in the normal Locus hot path.
 
-## Initial implementation sequence
+## Implementation progress
 
-This sequence is directional rather than a commitment that features exist:
+The following stages are implemented and tested:
 
-1. define core DTOs, semantic identities, and structured errors;
-2. validate `Planner`, `PlacementPlan`, `PlanExecutor`, `EngineAdapter`, and
-   `StateProvider` boundaries with deterministic fakes;
-3. implement one northbound protocol and a conformance test harness;
-4. implement the canonical remote protocol and one engine adapter;
-5. add capability-aware admission and production calibration;
-6. integrate NexusKV as an optional reference provider;
-7. add topology, preload, and replication policies.
+1. core DTOs, semantic identities, and structured errors;
+2. pure planning and side-effecting execution boundaries with deterministic
+   engines and state providers;
+3. the protocol-neutral `InferenceService`, model registry, target discovery,
+   and semantic-event pipeline;
+4. OpenAI Responses and Chat Completions adapters with HTTP/SSE conformance
+   tests;
+5. SGLang and vLLM OpenAI-compatible completion adapters in a separate edge
+   crate;
+6. an optional NexusKV bridge through the complete state import handshake.
 
-Each stage should keep the engine-neutral boundary testable with fake adapters
-and providers before adding another production integration.
+The next production stages are exact tokenizer/template/parser profiles,
+admission and authentication, calibrated cost models, observability, live
+runtime tests, a deployed NexusKV bridge, and topology/preload/replication
+policies. Engine-neutral boundary tests remain mandatory as integrations grow.
