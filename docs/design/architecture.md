@@ -18,6 +18,18 @@ placement. It separates application protocols and model semantics from
 runtime-specific execution, understands execution capabilities and reusable
 state locality, and makes global placement decisions across compute and state.
 
+## Project name and category
+
+`Locus` means a location or place. It reflects placement as the central
+abstraction while remaining independent of any protocol, engine, state system,
+or topology. The project category may be described as an inference control
+plane or inference orchestrator; **Locus** is the project name.
+
+Names centered on a frontend or gateway were rejected because they frame the
+system around protocol ingress and proxying. That framing is too narrow for
+state placement, transfer, replication, Prefill/Decode scheduling, model
+placement, and heterogeneous-runtime orchestration.
+
 ## System boundaries
 
 ```text
@@ -50,6 +62,27 @@ implemented by, or share a lifecycle with, an execution engine.
 
 No core type may require an SGLang, vLLM, TensorRT-LLM, NexusKV, Axum, or
 Pingora type. Integrations depend inward on Locus contracts.
+
+## Engine-neutral boundary rationale
+
+Inference runtimes expose different APIs, sampling fields, stream events,
+errors, and model-specific helpers. Allowing those types into core would couple
+application semantics and global routing to the first supported engine. The
+canonical protocol instead gives northbound semantics and the planner a stable
+domain model while adapters isolate runtime-specific translation.
+
+This boundary costs translation code, protocol versioning, and conformance
+testing. Namespaced extensions are permitted for runtime-specific features so
+the canonical model does not collapse into a least-common denominator.
+
+The following alternatives were rejected:
+
+- **Use one engine API internally:** other engines would have to emulate that
+  engine's request types and semantics.
+- **Route only at the HTTP layer:** a generic proxy cannot normalize templates,
+  tokens, parser state, capabilities, or reusable model state.
+- **Call every engine directly from core:** version and behavior checks would
+  spread through model semantics and planning.
 
 ## Responsibility split
 
@@ -255,6 +288,33 @@ processes:
 
 A first implementation may host these roles in one Rust process. Stable traits
 and protocol boundaries should allow later separation without forcing it now.
+
+## Primary implementation language
+
+Rust 2024 is the primary implementation language. The control plane is a
+concurrent streaming service that needs bounded memory, backpressure,
+cancellation, and stable typed extension boundaries. The initial direction is
+Tokio, Axum/Hyper for HTTP and SSE, Tonic and Protobuf for remote engine
+contracts, Hugging Face Tokenizers, and a Jinja-compatible Rust renderer such
+as MiniJinja. These libraries remain behind Locus-owned interfaces.
+
+Python remains appropriate for SDKs, tooling, and an explicit compatibility
+escape hatch. Unusual custom model semantics may eventually run in an isolated
+Python worker with a narrow RPC boundary; Python is not required in the normal
+production hot path.
+
+The following alternatives were rejected for the initial implementation:
+
+- **Python as the primary control plane:** this would make Python a production
+  hot-path requirement and weaken isolation of custom model code.
+- **Embed Python in the Rust process:** interpreter safety, packaging, and
+  failure behavior would become part of the control-plane process.
+- **Start with multiple implementation languages:** this would add deployment
+  complexity before the logical boundaries are validated.
+
+Rust ecosystem parity for unusual model semantics is a known cost. Any isolated
+Python path requires explicit profiles, resource isolation, and semantic parity
+tests.
 
 ## Failure model
 

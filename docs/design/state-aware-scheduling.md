@@ -213,6 +213,32 @@ NexusKV-specific capabilities may use namespaced extensions. Portable
 planner behavior depends only on the generic descriptor, compatibility,
 boundary, location, and cost contracts.
 
+## State-provider decision rationale
+
+Reusable state can be KV cache, MLA state, a recurrent/KDA checkpoint, a
+multimodal artifact, encoder output, or a future representation. Its valid
+resume point may not be a token offset, and a matching hash or token prefix does
+not prove that execution can continue. A generic provider contract is therefore
+necessary for typed boundaries, compatibility evidence, locations, and
+target-specific materialization options.
+
+The abstraction adds schema and lifecycle complexity. Provider estimates can
+be stale, state installation crosses provider and engine ownership, and
+extensions must avoid becoming an unstructured escape channel. These costs are
+handled through evidence-bearing descriptors, expiring attachments,
+calibration, reservations, and explicit fallbacks.
+
+The following alternatives were rejected:
+
+- **Depend directly on NexusKV:** this would make one reference integration a
+  core deployment requirement and prevent independent providers.
+- **Add cache affinity after engine routing:** this cannot compare queue,
+  transfer, recompute, decode, topology, and policy costs as complete paths.
+- **Standardize longest-token-prefix lookup:** this cannot represent recurrent
+  checkpoints, multimodal state, incomplete pages, or non-token boundaries.
+- **Let the provider choose the engine:** the provider does not own admission,
+  engine load, decode cost, tenant fairness, or global topology policy.
+
 ## Planning inputs
 
 For each admitted request, planning begins with:
