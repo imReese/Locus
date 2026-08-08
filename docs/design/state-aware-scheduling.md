@@ -282,6 +282,8 @@ The following alternatives were rejected:
   transfer, recompute, decode, topology, and policy costs as complete paths.
 - **Standardize longest-token-prefix lookup:** this cannot represent recurrent
   checkpoints, multimodal state, incomplete pages, or non-token boundaries.
+- **Let the provider allocate runtime destination memory:** this leaks
+  engine-private page and layout ownership into the provider contract.
 - **Let the provider choose the engine:** the provider does not own admission,
   engine load, decode cost, tenant fairness, or global topology policy.
 

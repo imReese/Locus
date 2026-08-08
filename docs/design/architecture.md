@@ -53,6 +53,20 @@ implemented by, or share a lifecycle with, an execution engine.
 No core type may require an SGLang, vLLM, TensorRT-LLM, NexusKV, Axum, or
 Pingora type. Integrations depend inward on Locus contracts.
 
+### Engine-neutral boundary rationale
+
+Using one runtime API as the internal protocol would couple model semantics,
+placement, and errors to that engine. Locus therefore owns canonical request
+and execution-event types, while capability-based adapters translate at the
+edges. This adds translation and conformance-test work, but preserves portable
+semantics and keeps engine-local scheduling under engine control.
+
+The following alternatives were rejected:
+
+- use one engine API as the internal protocol;
+- route only at the northbound HTTP layer;
+- let core call each runtime directly.
+
 ## Responsibility split
 
 ### Locus owns
@@ -322,6 +336,17 @@ behind Locus-owned interfaces.
 
 Python is limited to SDKs, tooling, or an explicitly isolated compatibility
 worker. It is not required in the normal production hot path.
+
+Rust was selected because a concurrent streaming control plane needs bounded
+memory, backpressure, cancellation, and typed extension boundaries. The cost is
+that unusual Python-only model behavior requires explicit isolation and parity
+testing.
+
+The following alternatives were rejected:
+
+- make Python the primary control-plane runtime;
+- embed Python in the Rust process;
+- begin with a polyglot core before validating component boundaries.
 
 ## Failure model
 

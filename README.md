@@ -32,6 +32,10 @@ abstraction without limiting the project to protocol ingress or proxying. The
 project category may be described as an inference control plane or inference
 orchestrator; **Locus** is the project name.
 
+The previous frontend-centered name and gateway-centered alternatives were
+rejected because they overemphasize protocol ingress. No compatibility alias
+is required because no implementation artifact was released under that name.
+
 SGLang, vLLM, TensorRT-LLM, and future runtimes should be able to focus on
 efficient execution. Applications should not have to adopt a different set of
 templates, parsers, request semantics, and traffic policies for each engine.
@@ -121,10 +125,6 @@ state integration disabled.
 - [Engine adapter contract](docs/design/engine-adapter-contract.md)
 - [Model semantics](docs/design/model-semantics.md)
 - [State-aware scheduling](docs/design/state-aware-scheduling.md)
-- [ADR 0001: Engine-neutral boundary](docs/adr/0001-engine-neutral-boundary.md)
-- [ADR 0002: State-provider abstraction](docs/adr/0002-state-provider-abstraction.md)
-- [ADR 0003: Rust as the primary language](docs/adr/0003-rust-primary-language.md)
-- [ADR 0004: Project name Locus](docs/adr/0004-project-name-locus.md)
 
 ## Implementation
 
