@@ -99,6 +99,7 @@ pub struct StateRequirement {
     pub input_semantics: InputSemanticIdentity,
     pub accepted_state_kinds: BTreeSet<StateKind>,
     pub input_fingerprint: String,
+    pub query_token_ids: Option<Vec<u32>>,
     pub tenant_scope: Option<String>,
 }
 

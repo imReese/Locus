@@ -1,0 +1,22 @@
+[package]
+name = "locus-runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+async-stream.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+locus-core = { path = "../locus-core" }
+locus-engine = { path = "../locus-engine" }
+locus-planner = { path = "../locus-planner" }
+locus-semantics = { path = "../locus-semantics" }
+locus-state = { path = "../locus-state" }
+thiserror.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true

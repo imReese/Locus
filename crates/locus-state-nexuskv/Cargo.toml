@@ -1,0 +1,26 @@
+[package]
+name = "locus-state-nexuskv"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+locus-core = { path = "../locus-core" }
+locus-state = { path = "../locus-state" }
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+axum.workspace = true
+futures.workspace = true
+locus-engine = { path = "../locus-engine" }
+locus-runtime = { path = "../locus-runtime" }
+locus-semantics = { path = "../locus-semantics" }
+tokio.workspace = true
+
+[lints]
+workspace = true

@@ -11,4 +11,5 @@ workspace = true
 
 [dependencies]
 locus-core = { path = "../locus-core" }
+serde_json.workspace = true
 thiserror.workspace = true

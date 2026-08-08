@@ -16,7 +16,10 @@ pub struct SamplingParameters {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CapabilityRequirements {
     pub input_kinds: BTreeSet<InputKind>,
-    pub requires_token_deltas: bool,
+    pub requires_incremental_output: bool,
+    pub requires_reasoning_deltas: bool,
+    pub requires_tool_calls: bool,
+    pub requires_structured_output: bool,
 }
 
 impl CapabilityRequirements {
@@ -24,7 +27,10 @@ impl CapabilityRequirements {
     pub fn for_input(input: &InputBundle) -> Self {
         Self {
             input_kinds: input.kinds().collect(),
-            requires_token_deltas: true,
+            requires_incremental_output: true,
+            requires_reasoning_deltas: false,
+            requires_tool_calls: false,
+            requires_structured_output: false,
         }
     }
 }
@@ -43,6 +49,10 @@ pub struct CanonicalRequest {
 pub struct EngineCapabilities {
     pub supported_input_kinds: BTreeSet<InputKind>,
     pub emits_token_deltas: bool,
+    pub emits_text_deltas: bool,
+    pub emits_reasoning_deltas: bool,
+    pub emits_tool_calls: bool,
+    pub supports_structured_output: bool,
     pub supported_state_kinds: BTreeSet<StateKind>,
 }
 
@@ -52,7 +62,12 @@ impl EngineCapabilities {
         requirements
             .input_kinds
             .is_subset(&self.supported_input_kinds)
-            && (!requirements.requires_token_deltas || self.emits_token_deltas)
+            && (!requirements.requires_incremental_output
+                || self.emits_token_deltas
+                || self.emits_text_deltas)
+            && (!requirements.requires_reasoning_deltas || self.emits_reasoning_deltas)
+            && (!requirements.requires_tool_calls || self.emits_tool_calls)
+            && (!requirements.requires_structured_output || self.supports_structured_output)
     }
 }
 
@@ -89,6 +104,33 @@ pub enum EngineEvent {
         request_id: RequestId,
         sequence_number: u64,
         token_ids: Vec<u32>,
+    },
+    TextDelta {
+        request_id: RequestId,
+        sequence_number: u64,
+        text: String,
+    },
+    ReasoningDelta {
+        request_id: RequestId,
+        sequence_number: u64,
+        text: String,
+    },
+    ToolCallStarted {
+        request_id: RequestId,
+        sequence_number: u64,
+        call_id: String,
+        name: String,
+    },
+    ToolCallArgumentsDelta {
+        request_id: RequestId,
+        sequence_number: u64,
+        call_id: String,
+        delta: String,
+    },
+    ToolCallCompleted {
+        request_id: RequestId,
+        sequence_number: u64,
+        call_id: String,
     },
     UsageUpdate {
         request_id: RequestId,

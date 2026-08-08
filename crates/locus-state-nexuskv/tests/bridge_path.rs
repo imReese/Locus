@@ -1,0 +1,310 @@
+use std::collections::BTreeSet;
+use std::sync::{Arc, Mutex};
+
+use axum::Json;
+use axum::Router;
+use axum::extract::State;
+use axum::routing::post;
+use futures::TryStreamExt;
+use locus_core::{
+    EngineCapabilities, EngineInstance, EngineInstanceId, EngineInstanceRef, ExecutionRole,
+    ExecutionTarget, ExecutionTargetId, GenerationSemanticIdentity, InputKind,
+    InputSemanticIdentity, ModelExecutionIdentity, OperationContext, OutputSemanticIdentity,
+    ParallelLayout, RequestId, RuntimeIdentity, SemanticComponentIdentity, SemanticIdentity,
+    StateKind, StateRequirement,
+};
+use locus_engine::{EngineRegistry, FakeEngineAdapter, FakeEngineOutput};
+use locus_runtime::{DefaultInferenceService, InferenceService};
+use locus_semantics::{
+    BasicModelSemantics, ByteDecoder, ByteTokenizer, Conversation, ConversationMessage,
+    ConversationRole, ModelProfile, ModelRegistry, SemanticRequest, SimpleTemplateRenderer,
+};
+use locus_state::{StateError, StateProvider};
+use locus_state_nexuskv::{NexusKvBridgeConfig, NexusKvStateProvider};
+use serde_json::{Value, json};
+
+#[derive(Clone, Default)]
+struct Capture {
+    lookups: Arc<Mutex<Vec<Value>>>,
+    estimates: Arc<Mutex<Vec<Value>>>,
+    materializations: Arc<Mutex<Vec<Value>>>,
+    mismatch_validation: bool,
+}
+
+async fn lookup(State(capture): State<Capture>, Json(body): Json<Value>) -> Json<Value> {
+    capture
+        .lookups
+        .lock()
+        .expect("lookup capture")
+        .push(body.clone());
+    let input_semantics = if capture.mismatch_validation {
+        json!({
+            "tokenizer": {"kind": "wrong", "revision": "v1", "fingerprint": "wrong"},
+            "template": body["locus_input_semantic_identity"]["template"],
+            "multimodal_preprocessing": null
+        })
+    } else {
+        body["locus_input_semantic_identity"].clone()
+    };
+    Json(json!({
+        "schema_version": "locus.nexuskv-bridge.v1",
+        "nexuskv_schema_version": "nexuskv.contract.v1",
+        "match_result": {
+            "classification": "partial",
+            "matched_extent": {"units": 5, "granularity": "token"},
+            "entry": {
+                "identity": {
+                    "key": {"model": "model-v1"},
+                    "entry_id": "nexus-state-1",
+                    "version": {"generation": 7, "lineage": "lineage-a"}
+                },
+                "descriptor": {
+                    "schema_version": "nexuskv.contract.v1",
+                    "descriptor_id": "descriptor-v1",
+                    "semantic_type": "mha_kv",
+                    "granularity": "token"
+                },
+                "location": {"tier": "host_dram", "locator": "shm://nexus-state-1"}
+            },
+            "compatibility": {
+                "reusable": true, "fallback_to_recompute": false, "reason": "prefix match"
+            },
+            "validation": {
+                "model_identity": body["locus_model_identity"],
+                "input_semantic_identity": input_semantics
+            }
+        }
+    }))
+}
+
+async fn estimate(State(capture): State<Capture>, Json(body): Json<Value>) -> Json<Value> {
+    capture
+        .estimates
+        .lock()
+        .expect("estimate capture")
+        .push(body);
+    Json(json!({
+        "schema_version": "locus.nexuskv-bridge.v1",
+        "option_id": "nexus-option-1",
+        "option_handle": "transfer-plan-1",
+        "locality": "local",
+        "topology_path": null,
+        "estimated_transfer_micros": 0
+    }))
+}
+
+async fn materialize(State(capture): State<Capture>, Json(body): Json<Value>) -> Json<Value> {
+    capture
+        .materializations
+        .lock()
+        .expect("materialization capture")
+        .push(body);
+    Json(json!({
+        "schema_version": "locus.nexuskv-bridge.v1",
+        "bytes_transferred": 4096,
+        "receipt": {"namespace": "nexuskv.transfer-receipt.v1", "value": "receipt-1"}
+    }))
+}
+
+async fn bridge(mismatch_validation: bool) -> (String, Capture) {
+    let capture = Capture {
+        mismatch_validation,
+        ..Capture::default()
+    };
+    let app = Router::new()
+        .route("/locus/v1/lookup", post(lookup))
+        .route("/locus/v1/estimate", post(estimate))
+        .route("/locus/v1/materialize", post(materialize))
+        .with_state(capture.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind bridge");
+    let address = listener.local_addr().expect("bridge address");
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("serve bridge");
+    });
+    (format!("http://{address}"), capture)
+}
+
+fn component(kind: &str) -> SemanticComponentIdentity {
+    SemanticComponentIdentity {
+        kind: kind.to_owned(),
+        revision: "v1".to_owned(),
+        fingerprint: format!("{kind}-v1"),
+    }
+}
+
+fn identities() -> (ModelExecutionIdentity, SemanticIdentity) {
+    (
+        ModelExecutionIdentity {
+            model_revision: "model-v1".to_owned(),
+            adapter_revision: None,
+            execution_profile: "default".to_owned(),
+        },
+        SemanticIdentity {
+            input: InputSemanticIdentity {
+                tokenizer: component("tokenizer"),
+                template: component("template"),
+                multimodal_preprocessing: None,
+            },
+            generation: GenerationSemanticIdentity {
+                sampling_normalization: component("sampling"),
+                stop_behavior: component("stop"),
+                constrained_generation: None,
+            },
+            output: OutputSemanticIdentity {
+                detokenizer: component("detokenizer"),
+                reasoning_parser: None,
+                tool_parser: None,
+            },
+            umbrella_fingerprint: None,
+        },
+    )
+}
+
+#[tokio::test]
+async fn nexuskv_bridge_runs_lookup_estimate_and_import_handshake_end_to_end() {
+    let (base_url, capture) = bridge(false).await;
+    let provider: Arc<dyn StateProvider> = Arc::new(
+        NexusKvStateProvider::new(NexusKvBridgeConfig {
+            base_url,
+            api_key: Some("bridge-secret".to_owned()),
+            tenant: "tenant-a".to_owned(),
+            namespace: "default".to_owned(),
+            engine_family: "sglang".to_owned(),
+            semantic_type: "mha_kv".to_owned(),
+        })
+        .expect("provider"),
+    );
+    let (model, semantic_identity) = identities();
+    let models = ModelRegistry::new();
+    models
+        .register(Arc::new(BasicModelSemantics::new(
+            ModelProfile {
+                public_aliases: vec!["nexus-model".to_owned()],
+                model: model.clone(),
+                semantic_identity: semantic_identity.clone(),
+            },
+            Arc::new(ByteTokenizer::new(
+                semantic_identity.input.tokenizer.clone(),
+            )),
+            Arc::new(SimpleTemplateRenderer::new(
+                semantic_identity.input.template.clone(),
+            )),
+            Arc::new(ByteDecoder),
+        )))
+        .expect("register model");
+    let engine_ref = EngineInstanceRef {
+        id: EngineInstanceId::new("engine-1"),
+        generation: 1,
+    };
+    let adapter = Arc::new(
+        FakeEngineAdapter::new(
+            EngineInstance {
+                reference: engine_ref.clone(),
+                runtime: RuntimeIdentity {
+                    kind: "fake-state-aware-engine".to_owned(),
+                    runtime_version: "v1".to_owned(),
+                    adapter_version: "v1".to_owned(),
+                },
+                topology: "local".to_owned(),
+                hardware: "cpu".to_owned(),
+                health_endpoint: None,
+            },
+            ExecutionTarget {
+                id: ExecutionTargetId::new("target-1"),
+                engine: engine_ref,
+                model,
+                role: ExecutionRole::Combined,
+                parallel_layout: ParallelLayout {
+                    tensor_parallel: 1,
+                    pipeline_parallel: 1,
+                    expert_parallel: 1,
+                    layout_revision: "v1".to_owned(),
+                },
+                residency: "node-a".to_owned(),
+                capability_revision: "v1".to_owned(),
+            },
+            EngineCapabilities {
+                supported_input_kinds: BTreeSet::from([InputKind::TokenSequence]),
+                emits_token_deltas: false,
+                emits_text_deltas: true,
+                emits_reasoning_deltas: false,
+                emits_tool_calls: false,
+                supports_structured_output: false,
+                supported_state_kinds: BTreeSet::from([StateKind::new("nexuskv.mha_kv")]),
+            },
+        )
+        .with_output(FakeEngineOutput {
+            token_deltas: Vec::new(),
+            text_deltas: vec!["ok".to_owned()],
+            ..FakeEngineOutput::default()
+        }),
+    );
+    let engines = EngineRegistry::new();
+    engines.register(adapter.clone()).expect("register engine");
+    let service = DefaultInferenceService::new(models, engines, provider);
+    service
+        .infer(
+            SemanticRequest {
+                model: "nexus-model".to_owned(),
+                conversation: Conversation {
+                    messages: vec![ConversationMessage {
+                        role: ConversationRole::User,
+                        content: "use cached prefix".to_owned(),
+                        tool_call_id: None,
+                    }],
+                },
+                ..SemanticRequest::default()
+            },
+            OperationContext::new(RequestId::new("req-nexus")),
+        )
+        .await
+        .expect("start inference")
+        .try_collect::<Vec<_>>()
+        .await
+        .expect("collect inference");
+
+    assert_eq!(adapter.call_counts().prepare, 1);
+    assert_eq!(adapter.call_counts().commit, 1);
+    assert_eq!(adapter.call_counts().execute, 1);
+    assert_eq!(capture.lookups.lock().expect("lookups").len(), 1);
+    assert_eq!(capture.estimates.lock().expect("estimates").len(), 1);
+    let materializations = capture.materializations.lock().expect("materializations");
+    assert_eq!(materializations.len(), 1);
+    assert_eq!(
+        materializations[0]["sink_namespace"],
+        "locus.fake.engine-sink.v1"
+    );
+    assert_eq!(materializations[0]["target_engine_generation"], 1);
+}
+
+#[tokio::test]
+async fn nexuskv_bridge_fails_closed_on_semantic_validation_mismatch() {
+    let (base_url, _) = bridge(true).await;
+    let provider = NexusKvStateProvider::new(NexusKvBridgeConfig {
+        base_url,
+        api_key: None,
+        tenant: "tenant-a".to_owned(),
+        namespace: "default".to_owned(),
+        engine_family: "sglang".to_owned(),
+        semantic_type: "mha_kv".to_owned(),
+    })
+    .expect("provider");
+    let (model, semantic_identity) = identities();
+    let error = provider
+        .lookup(
+            &StateRequirement {
+                model,
+                input_semantics: semantic_identity.input,
+                accepted_state_kinds: BTreeSet::from([StateKind::new("nexuskv.mha_kv")]),
+                input_fingerprint: "input-v1".to_owned(),
+                query_token_ids: Some(vec![1, 2, 3]),
+                tenant_scope: None,
+            },
+            &OperationContext::new(RequestId::new("req-mismatch")),
+        )
+        .await
+        .expect_err("semantic mismatch must fail closed");
+    assert!(matches!(error, StateError::Incompatible(_)));
+}

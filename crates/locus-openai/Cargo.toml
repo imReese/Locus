@@ -1,0 +1,28 @@
+[package]
+name = "locus-openai"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+async-stream.workspace = true
+axum.workspace = true
+futures.workspace = true
+locus-core = { path = "../locus-core" }
+locus-runtime = { path = "../locus-runtime" }
+locus-semantics = { path = "../locus-semantics" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+http-body-util.workspace = true
+locus-engine = { path = "../locus-engine" }
+locus-state = { path = "../locus-state" }
+tower.workspace = true
+
+[lints]
+workspace = true

@@ -94,6 +94,8 @@ pub enum StateError {
     Unsupported(String),
     #[error("state compatibility failed: {0}")]
     Incompatible(String),
+    #[error("state provider protocol failed: {0}")]
+    Protocol(String),
     #[error("state materialization failed: {0}")]
     Materialization(String),
 }

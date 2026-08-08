@@ -1,7 +1,7 @@
 mod fake;
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
 use futures::stream::BoxStream;
@@ -12,7 +12,7 @@ use locus_core::{
 };
 use thiserror::Error;
 
-pub use fake::{FakeEngineAdapter, FakeEngineCallCounts};
+pub use fake::{FakeEngineAdapter, FakeEngineCallCounts, FakeEngineOutput, FakeToolCall};
 
 pub type EngineEventStream = BoxStream<'static, Result<EngineEvent, EngineError>>;
 
@@ -72,9 +72,9 @@ pub trait EngineAdapter: Send + Sync {
     ) -> Result<(), EngineError>;
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct EngineRegistry {
-    adapters: BTreeMap<EngineInstanceId, Arc<dyn EngineAdapter>>,
+    adapters: Arc<RwLock<BTreeMap<EngineInstanceId, Arc<dyn EngineAdapter>>>>,
 }
 
 impl EngineRegistry {
@@ -83,9 +83,22 @@ impl EngineRegistry {
         Self::default()
     }
 
-    pub fn register(&mut self, adapter: Arc<dyn EngineAdapter>) {
+    pub fn register(&self, adapter: Arc<dyn EngineAdapter>) -> Result<(), EngineError> {
         self.adapters
+            .write()
+            .map_err(|_| EngineError::Registry("engine registry lock poisoned".to_owned()))?
             .insert(adapter.instance().reference.id, adapter);
+        Ok(())
+    }
+
+    pub fn adapters(&self) -> Result<Vec<Arc<dyn EngineAdapter>>, EngineError> {
+        Ok(self
+            .adapters
+            .read()
+            .map_err(|_| EngineError::Registry("engine registry lock poisoned".to_owned()))?
+            .values()
+            .cloned()
+            .collect())
     }
 
     pub fn adapter_for(
@@ -93,6 +106,8 @@ impl EngineRegistry {
         target: &ExecutionTarget,
     ) -> Result<Arc<dyn EngineAdapter>, EngineError> {
         self.adapters
+            .read()
+            .map_err(|_| EngineError::Registry("engine registry lock poisoned".to_owned()))?
             .get(&target.engine.id)
             .cloned()
             .ok_or_else(|| EngineError::TargetNotFound(target.id.to_string()))
@@ -105,6 +120,8 @@ pub enum EngineError {
     Context(#[from] ContextError),
     #[error("execution target was not found: {0}")]
     TargetNotFound(String),
+    #[error("engine registry failed: {0}")]
+    Registry(String),
     #[error("engine generation is stale")]
     StaleGeneration,
     #[error("engine capability is unsupported: {0}")]

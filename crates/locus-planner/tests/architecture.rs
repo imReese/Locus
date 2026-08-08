@@ -131,6 +131,10 @@ fn capabilities(input_kind: InputKind, with_state: bool) -> EngineCapabilities {
     EngineCapabilities {
         supported_input_kinds: BTreeSet::from([input_kind]),
         emits_token_deltas: true,
+        emits_text_deltas: false,
+        emits_reasoning_deltas: false,
+        emits_tool_calls: false,
+        supports_structured_output: false,
         supported_state_kinds: if with_state {
             BTreeSet::from([StateKind::new("kv")])
         } else {
@@ -317,9 +321,13 @@ async fn fake_vertical_slice_selects_reuse_and_executor_owns_side_effects() {
     assert_eq!(engine_b.call_counts().prepare, 0);
     assert_eq!(provider.call_counts().materialize, 0);
 
-    let mut registry = EngineRegistry::new();
-    registry.register(engine_a.clone());
-    registry.register(engine_b.clone());
+    let registry = EngineRegistry::new();
+    registry
+        .register(engine_a.clone())
+        .expect("register engine a");
+    registry
+        .register(engine_b.clone())
+        .expect("register engine b");
     let executor = DefaultPlanExecutor::new(registry, provider.clone());
     let events = executor
         .execute(
@@ -652,8 +660,8 @@ async fn materialization_failure_aborts_import_and_uses_encoded_cold_fallback() 
     let plan = CostBasedPlanner.plan(&input).await.expect("plan");
     assert_eq!(plan.fallback, FallbackAction::ColdOnSameTarget);
 
-    let mut registry = EngineRegistry::new();
-    registry.register(engine.clone());
+    let registry = EngineRegistry::new();
+    registry.register(engine.clone()).expect("register engine");
     let executor = DefaultPlanExecutor::new(registry, provider.clone());
     let events = executor
         .execute(
@@ -720,8 +728,8 @@ async fn observed_provider_outage_degrades_to_cold_when_policy_allows() {
 
     let plan = CostBasedPlanner.plan(&input).await.expect("cold plan");
     assert!(matches!(plan.path, ExecutionPath::Cold));
-    let mut registry = EngineRegistry::new();
-    registry.register(engine.clone());
+    let registry = EngineRegistry::new();
+    registry.register(engine.clone()).expect("register engine");
     let executor = DefaultPlanExecutor::new(registry, provider.clone());
     let events = executor
         .execute(

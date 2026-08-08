@@ -25,10 +25,39 @@ pub struct FakeEngineCallCounts {
     pub cancel: usize,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FakeToolCall {
+    pub call_id: String,
+    pub name: String,
+    pub argument_deltas: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FakeEngineOutput {
+    pub token_deltas: Vec<Vec<u32>>,
+    pub text_deltas: Vec<String>,
+    pub reasoning_deltas: Vec<String>,
+    pub tool_calls: Vec<FakeToolCall>,
+    pub finish_reason: EngineFinishReason,
+}
+
+impl Default for FakeEngineOutput {
+    fn default() -> Self {
+        Self {
+            token_deltas: vec![vec![42]],
+            text_deltas: Vec::new(),
+            reasoning_deltas: Vec::new(),
+            tool_calls: Vec::new(),
+            finish_reason: EngineFinishReason::Stop,
+        }
+    }
+}
+
 pub struct FakeEngineAdapter {
     instance_template: EngineInstance,
     target_template: ExecutionTarget,
     capabilities: EngineCapabilities,
+    output: FakeEngineOutput,
     generation: AtomicU64,
     next_import: AtomicU64,
     imports: Mutex<BTreeMap<ImportId, StateImportSpec>>,
@@ -51,6 +80,7 @@ impl FakeEngineAdapter {
             instance_template: instance,
             target_template: target,
             capabilities,
+            output: FakeEngineOutput::default(),
             next_import: AtomicU64::new(1),
             imports: Mutex::new(BTreeMap::new()),
             prepare_calls: AtomicUsize::new(0),
@@ -59,6 +89,12 @@ impl FakeEngineAdapter {
             execute_calls: AtomicUsize::new(0),
             cancel_calls: AtomicUsize::new(0),
         }
+    }
+
+    #[must_use]
+    pub fn with_output(mut self, output: FakeEngineOutput) -> Self {
+        self.output = output;
+        self
     }
 
     #[must_use]
@@ -264,6 +300,19 @@ impl EngineAdapter for FakeEngineAdapter {
         self.execute_calls.fetch_add(1, Ordering::AcqRel);
 
         let request_id = request.id;
+        let output_tokens = self
+            .output
+            .token_deltas
+            .iter()
+            .map(Vec::len)
+            .sum::<usize>()
+            .saturating_add(
+                self.output
+                    .text_deltas
+                    .iter()
+                    .map(|delta| delta.chars().count())
+                    .sum(),
+            ) as u64;
         let usage = Usage {
             input_tokens: request
                 .input
@@ -276,23 +325,65 @@ impl EngineAdapter for FakeEngineAdapter {
                     _ => None,
                 })
                 .sum(),
-            output_tokens: 1,
+            output_tokens,
         };
-        let events = vec![
-            Ok(EngineEvent::Accepted {
+        let mut events = vec![Ok(EngineEvent::Accepted {
+            request_id: request_id.clone(),
+        })];
+        let mut sequence_number = 1;
+        for token_ids in &self.output.token_deltas {
+            events.push(Ok(EngineEvent::TokenDelta {
                 request_id: request_id.clone(),
-            }),
-            Ok(EngineEvent::TokenDelta {
+                sequence_number,
+                token_ids: token_ids.clone(),
+            }));
+            sequence_number += 1;
+        }
+        for text in &self.output.text_deltas {
+            events.push(Ok(EngineEvent::TextDelta {
                 request_id: request_id.clone(),
-                sequence_number: 1,
-                token_ids: vec![42],
-            }),
-            Ok(EngineEvent::Finished {
-                request_id,
-                reason: EngineFinishReason::Stop,
-                usage,
-            }),
-        ];
+                sequence_number,
+                text: text.clone(),
+            }));
+            sequence_number += 1;
+        }
+        for text in &self.output.reasoning_deltas {
+            events.push(Ok(EngineEvent::ReasoningDelta {
+                request_id: request_id.clone(),
+                sequence_number,
+                text: text.clone(),
+            }));
+            sequence_number += 1;
+        }
+        for tool_call in &self.output.tool_calls {
+            events.push(Ok(EngineEvent::ToolCallStarted {
+                request_id: request_id.clone(),
+                sequence_number,
+                call_id: tool_call.call_id.clone(),
+                name: tool_call.name.clone(),
+            }));
+            sequence_number += 1;
+            for delta in &tool_call.argument_deltas {
+                events.push(Ok(EngineEvent::ToolCallArgumentsDelta {
+                    request_id: request_id.clone(),
+                    sequence_number,
+                    call_id: tool_call.call_id.clone(),
+                    delta: delta.clone(),
+                }));
+                sequence_number += 1;
+            }
+            events.push(Ok(EngineEvent::ToolCallCompleted {
+                request_id: request_id.clone(),
+                sequence_number,
+                call_id: tool_call.call_id.clone(),
+            }));
+            sequence_number += 1;
+        }
+        events.push(Ok(EngineEvent::Finished {
+            request_id,
+            reason: self.output.finish_reason.clone(),
+            usage,
+        }));
         Ok(stream::iter(events).boxed())
     }
 

@@ -3,9 +3,13 @@ resolver = "3"
 members = [
     "crates/locus-core",
     "crates/locus-engine",
+    "crates/locus-engine-openai",
+    "crates/locus-openai",
     "crates/locus-planner",
+    "crates/locus-runtime",
     "crates/locus-semantics",
     "crates/locus-state",
+    "crates/locus-state-nexuskv",
 ]
 
 [workspace.package]
@@ -17,9 +21,18 @@ repository = "https://github.com/imReese/Locus"
 
 [workspace.dependencies]
 async-trait = "0.1.89"
+async-stream = "0.3.6"
+axum = "0.8.6"
+bytes = "1.10.1"
+eventsource-stream = "0.2.3"
 futures = "0.3.31"
+http-body-util = "0.1.3"
+reqwest = { version = "0.12.24", default-features = false, features = ["json", "rustls-tls", "stream"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
 thiserror = "2.0.17"
-tokio = { version = "1.48.0", features = ["macros", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1.48.0", features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
+tower = { version = "0.5.2", features = ["util"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
