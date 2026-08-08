@@ -13,7 +13,7 @@ The canonical engine protocol provides:
 - one engine-neutral representation of executable model work;
 - typed, extensible inputs that are not limited to token IDs;
 - explicit request requirements and capability negotiation;
-- normalized streaming, usage, finish, error, and cancellation semantics;
+- normalized streaming, usage, execution-finish, error, and cancellation facts;
 - a clean boundary for runtime-specific engine adapters;
 - optional attachment of prepared reusable state without exposing a particular
   state provider.
@@ -39,8 +39,10 @@ Every request carries:
 
 - a globally unique `request_id` used for idempotency and cancellation;
 - a `model` identity and immutable model-artifact revision;
-- a `semantics_fingerprint` identifying tokenizer, template, normalizer, and
-  relevant parser configuration;
+- a structured `SemanticIdentity` that distinguishes relevant input,
+  generation, and output semantics;
+- an optional umbrella semantic fingerprint for tracing and fast equality,
+  never as a substitute for artifact-specific compatibility evidence;
 - a protocol major/minor version;
 - an optional tenant scope and trace context.
 
@@ -62,9 +64,13 @@ CanonicalRequest
   output: OutputContract
   requirements: CapabilityRequirements
   execution: ExecutionConstraints
-  prepared_state: optional PreparedStateAttachment
   extensions: repeated typed Extension
 ```
+
+The selected `ExecutionTarget` and an optional committed
+`PreparedStateAttachment` belong to the execution submission envelope, not the
+portable request itself. This keeps the same request reusable across planning
+candidates while scoping prepared state to one target generation.
 
 ### `InputBundle`
 
@@ -146,7 +152,7 @@ request ineligible for adapters that do not understand that extension.
 - log probabilities and their alignment;
 - usage granularity;
 - prompt-logprob or hidden-output requests;
-- normalized finish information;
+- terminal execution facts needed by Locus output semantics;
 - whether multiple candidates are required.
 
 Token deltas are preferred because Locus normally owns detokenization and
@@ -173,23 +179,44 @@ engine-local decisions.
 
 ### Prepared state attachment
 
-When the planner selects reusable state, the orchestrator resolves it to a
-short-lived `PreparedStateAttachment`:
+When the planner selects reusable state, `PlanExecutor` coordinates an import
+transaction before execution:
+
+```text
+EngineAdapter.prepare_state_import(StateImportSpec)
+  -> StateImportTarget
+
+StateProvider.materialize(MaterializationOption, StateImportTarget)
+  -> TransferReceipt
+
+EngineAdapter.commit_state_import(StateImportTarget, TransferReceipt)
+  -> PreparedStateAttachment
+```
+
+`StateImportTarget` is an opaque negotiated sink scoped to an execution target
+and engine generation. It expires and can be aborted. The provider can transfer
+to the sink without learning engine-local page allocation or device-layout
+objects; the adapter can commit the result without learning provider-private
+source types.
+
+The final attachment is short-lived:
 
 ```text
 PreparedStateAttachment
   attachment_id: opaque capability-scoped handle
   provider_kind: opaque namespace
-  target_engine: engine instance identity
-  compatibility_proof: verified compatibility fingerprint
+  execution_target: target identity + engine generation
+  compatibility_proof: structured artifact-specific evidence
   reusable_boundary: structured input coverage
   expires_at: timestamp
 ```
 
-The attachment never embeds a NexusKV or engine-specific object in the core
-request. Its handle is meaningful only to an adapter that advertised support
-for the attachment namespace. Absence of an attachment is a normal cold
-request.
+Import handles, receipts, and attachments never embed a NexusKV or
+engine-specific allocation object in core types. Opaque handles are meaningful
+only to peers that negotiated their namespace. Partial imports are aborted on
+cancellation, timeout, transfer failure, stale generation, or commit failure.
+The placement plan determines whether the executor runs cold, replans, or fails
+after an import error. Absence of an attachment is a normal cold request.
 
 ## Canonical output events
 
@@ -220,13 +247,19 @@ Required behavior:
 - `CandidateDelta` carries other negotiated typed outputs.
 - `UsageUpdate` is monotonic and identifies whether values are estimated or
   final.
-- `Finish` is terminal and contains a normalized reason and final usage.
+- `Finish` is terminal and contains an engine execution reason and final usage.
 - `EngineError` is terminal and contains a structured error classification.
 
-Normalized finish reasons initially include `stop`, `length`, `tool_boundary`,
-`content_filter`, `cancelled`, and `error`, with an extensible unknown value.
-The northbound adapter may translate these further. Engine adapters preserve
-the original runtime reason in debug metadata, not in the portable contract.
+`EngineFinishReason` reports execution facts such as `stop`, `length`,
+`cancelled`, `error`, or a namespaced runtime-specific reason. It does not
+contain `tool_call`, `tool_boundary`, reasoning, content-filter, or other
+application interpretations by default. `ModelSemantics` consumes token or
+text facts and derives a separate `SemanticFinishReason` for northbound
+protocols.
+
+An adapter may expose a capability-gated structured runtime event when an
+engine intentionally performs semantic parsing. Locus must knowingly select
+and normalize that capability; it is not the default engine contract.
 
 An engine stream must contain exactly one terminal event. Events received
 after a terminal event are a protocol violation. A transport failure without a
@@ -239,9 +272,14 @@ The initial protocol surface should remain small:
 
 ```text
 Negotiate(protocol_range) -> NegotiatedProtocol
-DescribeEngine() -> EngineCapabilities
-ObserveEngine() -> EngineSnapshot
-Execute(CanonicalRequest) -> stream EngineEvent
+DescribeInstance() -> EngineInstance
+ListExecutionTargets() -> repeated ExecutionTarget
+DescribeCapabilities(target) -> EngineCapabilities
+ObserveTarget(target) -> EngineSnapshot
+PrepareStateImport(target, spec) -> StateImportTarget
+CommitStateImport(target, receipt) -> PreparedStateAttachment
+AbortStateImport(target, import_handle) -> AbortResult
+Execute(target, CanonicalRequest, optional attachment) -> stream EngineEvent
 Cancel(request_id, reason) -> CancelResult
 Probe() -> HealthStatus
 ```
@@ -250,15 +288,23 @@ Remote transports may add a reservation operation if measurements show that
 planning-to-submit races require it. The domain model treats reservation as an
 orchestration concern, not a guarantee that an engine exposes a particular RPC.
 
-State preload, replication, and transfer are `StateProvider` operations.
-An adapter may expose a capability-gated operation to bind a materialized
-attachment to an engine, but the canonical protocol does not become a general
-cache-management API.
+State lookup, preload, replication, and movement are `StateProvider`
+operations. Destination preparation, commit, bind, and abort are
+`EngineAdapter` operations. `PlanExecutor` coordinates them; the canonical
+protocol does not become a general cache-management API.
 
 ## Capabilities
 
-Capabilities are versioned, machine-readable claims. Relevant categories
-include:
+An `EngineInstance` identifies a runtime process, generation, version,
+topology, hardware, and health endpoint. It does not imply that one immutable
+model is permanently loaded.
+
+An `ExecutionTarget` references an instance generation and identifies a model
+revision, optional adapter/LoRA revision, execution role, parallel layout,
+residency, and execution profile. The planner chooses targets, not processes.
+
+Target capabilities are versioned, machine-readable claims. Relevant
+categories include:
 
 - model architectures and immutable revisions;
 - quantization, dtype, and parallel-layout constraints;
@@ -271,8 +317,8 @@ include:
 - cancellation and idempotency behavior;
 - speculative or disaggregated-prefill/decode roles.
 
-Capabilities describe support, not current availability. Dynamic queue depth,
-memory pressure, and health belong in `EngineSnapshot`.
+Capabilities describe target support, not current availability. Dynamic queue
+depth, memory pressure, residency, and health belong in `EngineSnapshot`.
 
 ## Error semantics
 
@@ -282,9 +328,9 @@ common classes defined by the architecture. It must not return arbitrary HTTP
 status codes or engine exception strings as the domain API.
 
 Retryability is contextual. An error marked transient is not permission to
-replay a request after output has been observed. The orchestrator combines the
+replay a request after output has been observed. `PlanExecutor` combines the
 error with acceptance and output progress to enforce the request's idempotency
-policy.
+and bounded-replan policy.
 
 ## Backpressure and cancellation
 
@@ -292,10 +338,10 @@ The event stream is bounded. A slow northbound consumer propagates
 backpressure until a configured buffer limit, after which policy chooses
 cancellation or bounded spooling; unbounded buffering is invalid.
 
-Cancellation is deadline-aware and idempotent. Locus stops semantic
-parsing, sends `Cancel`, drains or closes the transport according to adapter
-behavior, and releases reservations and state attachments. An adapter must
-declare when cancellation is best-effort rather than confirmed.
+Cancellation is deadline-aware and idempotent. Locus stops semantic parsing,
+sends `Cancel`, drains or closes the transport according to adapter behavior,
+aborts partial state imports, and releases reservations and attachments. An
+adapter must declare when cancellation is best-effort rather than confirmed.
 
 ## Compatibility tests
 
@@ -307,8 +353,10 @@ Every adapter should pass a shared conformance suite covering:
 - ordered streaming and exactly one terminal event;
 - token/text delta fragmentation across parser boundaries;
 - cancellation before acceptance and during generation;
-- usage monotonicity and finish-reason mapping;
-- prepared-state compatibility rejection;
+- usage monotonicity and engine-finish mapping;
+- absence of application-semantic finish reasons in default engine events;
+- stale import-target generation and prepared-state compatibility rejection;
+- prepare, materialize, commit, abort, and partial-import cleanup behavior;
 - duplicate request IDs and retry behavior;
 - preservation of unknown optional fields and rejection of unknown required
   features.

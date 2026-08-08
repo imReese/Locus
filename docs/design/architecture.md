@@ -18,18 +18,6 @@ placement. It separates application protocols and model semantics from
 runtime-specific execution, understands execution capabilities and reusable
 state locality, and makes global placement decisions across compute and state.
 
-## Project name and category
-
-`Locus` means a location or place. It reflects placement as the central
-abstraction while remaining independent of any protocol, engine, state system,
-or topology. The project category may be described as an inference control
-plane or inference orchestrator; **Locus** is the project name.
-
-Names centered on a frontend or gateway were rejected because they frame the
-system around protocol ingress and proxying. That framing is too narrow for
-state placement, transfer, replication, Prefill/Decode scheduling, model
-placement, and heterogeneous-runtime orchestration.
-
 ## System boundaries
 
 ```text
@@ -41,6 +29,7 @@ Locus            protocol adaptation
                   model semantics
                   admission and policy
                   global request + state planner
+                  plan execution and orchestration
                   observability
                       |
                       v
@@ -63,27 +52,6 @@ implemented by, or share a lifecycle with, an execution engine.
 No core type may require an SGLang, vLLM, TensorRT-LLM, NexusKV, Axum, or
 Pingora type. Integrations depend inward on Locus contracts.
 
-## Engine-neutral boundary rationale
-
-Inference runtimes expose different APIs, sampling fields, stream events,
-errors, and model-specific helpers. Allowing those types into core would couple
-application semantics and global routing to the first supported engine. The
-canonical protocol instead gives northbound semantics and the planner a stable
-domain model while adapters isolate runtime-specific translation.
-
-This boundary costs translation code, protocol versioning, and conformance
-testing. Namespaced extensions are permitted for runtime-specific features so
-the canonical model does not collapse into a least-common denominator.
-
-The following alternatives were rejected:
-
-- **Use one engine API internally:** other engines would have to emulate that
-  engine's request types and semantics.
-- **Route only at the HTTP layer:** a generic proxy cannot normalize templates,
-  tokens, parser state, capabilities, or reusable model state.
-- **Call every engine directly from core:** version and behavior checks would
-  spread through model semantics and planning.
-
 ## Responsibility split
 
 ### Locus owns
@@ -98,7 +66,8 @@ The following alternatives were rejected:
 - admission control and tenant policy;
 - engine capability discovery;
 - global routing, load balancing, and placement;
-- reusable-state discovery and materialization orchestration;
+- placement-plan execution and bounded replanning;
+- reusable-state discovery and import orchestration;
 - cross-engine observability and stable error semantics.
 
 ### Execution engines own
@@ -125,8 +94,9 @@ dictate how the target batches or executes that work after admission.
 - provider-specific preload, replication, and transfer operations;
 - lifecycle and health of state managed by that provider.
 
-The planner decides whether a provider operation is worthwhile. The provider
-does not make the final request-placement decision.
+The planner decides whether a provider operation is worthwhile. `PlanExecutor`
+coordinates it. The provider does not make the final request-placement
+decision or allocate engine-local destination memory.
 
 ## Logical components
 
@@ -170,10 +140,17 @@ authorization, or admission check has rejected it.
 
 ### Capability registry
 
-Every engine adapter publishes a versioned `EngineCapabilities` document and
-dynamic health/load snapshots. The registry separates relatively stable
-features from rapidly changing capacity signals. Capability predicates decide
-eligibility before candidates are costed.
+Every engine adapter publishes `EngineInstance` records for runtime processes
+and `ExecutionTarget` records for model-bearing execution choices. A target
+references an instance generation and adds immutable model revision, optional
+adapter/LoRA revision, execution role, parallel layout, residency, and
+target-specific capabilities.
+
+The registry separates versioned capabilities from rapidly changing
+`EngineSnapshot` load and health signals. Capability predicates decide target
+eligibility before candidates are costed. A process restart invalidates its old
+generation; model load or unload may change targets without changing the
+identity of the process.
 
 ### Global planner
 
@@ -187,17 +164,41 @@ options together. Its input includes:
 - estimated queue, prefill, materialization, decode, topology, and policy
   costs.
 
-Its output is a `PlacementPlan` containing a target engine, optional state
+Its output is a `PlacementPlan` containing an execution target, optional state
 actions, fallback conditions, and an explanation suitable for observability.
-The output remains a plan until the orchestrator successfully reserves
-capacity and prepares any required state.
+Planning is pure or mostly side-effect-free. It does not reserve capacity,
+mutate state, submit engine work, retry, or manage cleanup.
+
+### Plan executor
+
+`PlanExecutor` is the side-effect boundary between a `PlacementPlan` and an
+execution stream:
+
+```text
+Planner -> PlacementPlan -> PlanExecutor
+                             |-- reserve target
+                             |-- prepare state import
+                             |-- materialize / transfer state
+                             |-- commit or abort state import
+                             |-- submit request
+                             |-- apply fallback or bounded replan
+                             `-- cancel and clean up
+```
+
+**Planner decides. `PlanExecutor` performs side effects.** The executor
+revalidates the target generation and plan preconditions, coordinates engine
+and state-provider transactions, and records actual outcomes. It follows the
+fallback encoded in the plan; it does not silently substitute a different
+placement decision.
 
 ### Engine adapters
 
 `EngineAdapter` instances hide runtime-specific control protocols. They
 discover capabilities, report health and load, accept canonical work, emit
-canonical output events, and support cancellation. Optional operations such as
-state attachment are gated by advertised capabilities.
+canonical output facts, and support cancellation. For reusable state, an
+adapter prepares an engine-generation-scoped import destination, then commits
+or aborts that import after the provider transfers state. Optional operations
+are gated by advertised target capabilities.
 
 See [Engine adapter contract](engine-adapter-contract.md).
 
@@ -233,16 +234,30 @@ regardless of concrete Rust module layout:
 
 | Concept | Purpose |
 | --- | --- |
+| `ModelProfile` | Pin model aliases and versioned semantic components |
+| `SemanticIdentity` | Partition input, generation, and output semantics |
 | `TokenizerProvider` | Encode, decode, and expose tokenizer identity |
 | `TemplateRenderer` | Render typed conversations with a versioned template |
 | `ModelSemantics` | Compose model-specific normalization and parser behavior |
 | `InputBundle` | Carry ordered token, multimodal, metadata, and future inputs |
-| `EngineCapabilities` | Describe support and compatibility limits |
-| `EngineAdapter` | Execute canonical work on one engine integration |
-| `StateProvider` | Discover and materialize reusable model state |
+| `CanonicalRequest` | Carry normalized engine-executable work |
+| `EngineEvent` | Report ordered engine execution facts |
+| `EngineInstance` | Identify one runtime process and restart generation |
+| `ExecutionTarget` | Identify a model-bearing target on an engine instance |
+| `EngineCapabilities` | Describe target support and compatibility limits |
+| `EngineSnapshot` | Report dynamic target health and load observations |
+| `EngineAdapter` | Operate targets and runtime-specific state destinations |
+| `StateRequirement` | Describe reusable state relevant to a request |
+| `StateDescriptor` | Report typed, located state with compatibility evidence |
+| `ReusableBoundary` | Separate covered input from executable resume point |
+| `CompatibilityResult` | Report artifact evidence; unknown fails closed |
+| `MaterializationOption` | Estimate one source-to-target state path |
+| `StateProvider` | Discover state and transfer it to negotiated destinations |
+| `PreparedStateAttachment` | Bind committed state to one target generation |
 | `RoutingPolicy` | Add constraints and policy cost without owning execution |
 | `Planner` | Select request placement and state actions together |
 | `PlacementPlan` | Record target, actions, fallbacks, and rationale |
+| `PlanExecutor` | Perform reservations, imports, submission, and cleanup |
 
 Traits should accept core-owned data transfer objects and return structured
 errors. Transport clients, generated Protobuf structs, and integration SDK
@@ -259,15 +274,22 @@ types remain at the edges.
    semantics.
 4. Admission control returns a rejection or planning constraints such as
    priority, deadline, and tenant limits.
-5. The capability registry filters engines that cannot satisfy the request.
+5. The capability registry filters execution targets that cannot satisfy the
+   request.
 6. For eligible requests, the state provider returns reusable-state candidates
    and materialization estimates. With no provider, this is an empty result.
-7. The planner jointly selects an engine and optional state actions.
-8. The orchestrator reserves the target, materializes or attaches state when
-   planned, and submits a canonical request through the engine adapter.
-9. Canonical engine events flow through detokenization and incremental parsers,
-   then through the northbound response adapter.
-10. Completion, cancellation, or failure releases reservations and records the
+7. The planner chooses an execution target and optional state path without
+   causing side effects.
+8. `PlanExecutor` reserves the target and asks its engine adapter to prepare a
+   generation-scoped state-import destination when reuse is planned.
+9. The state provider transfers the selected source to that destination and
+   returns a receipt. The engine adapter commits the import to a
+   `PreparedStateAttachment`, or aborts partial work on failure.
+10. `PlanExecutor` submits the canonical request and optional committed
+    attachment through the engine adapter.
+11. Engine execution facts flow through detokenization and incremental parsers,
+    which derive semantic events for the northbound adapter.
+12. Completion, cancellation, or failure releases reservations and records the
     actual cost and outcome for future estimates.
 
 Planning must tolerate changes between observation and execution. A plan may
@@ -291,30 +313,14 @@ and protocol boundaries should allow later separation without forcing it now.
 
 ## Primary implementation language
 
-Rust 2024 is the primary implementation language. The control plane is a
-concurrent streaming service that needs bounded memory, backpressure,
-cancellation, and stable typed extension boundaries. The initial direction is
-Tokio, Axum/Hyper for HTTP and SSE, Tonic and Protobuf for remote engine
-contracts, Hugging Face Tokenizers, and a Jinja-compatible Rust renderer such
-as MiniJinja. These libraries remain behind Locus-owned interfaces.
+Rust 2024 is the primary implementation language. The initial direction is
+Tokio, Axum/Hyper for HTTP and SSE, Tonic and Protobuf for remote contracts,
+Hugging Face Tokenizers, and a Jinja-compatible Rust renderer such as
+MiniJinja. Library, transport, generated-code, and Python runtime types remain
+behind Locus-owned interfaces.
 
-Python remains appropriate for SDKs, tooling, and an explicit compatibility
-escape hatch. Unusual custom model semantics may eventually run in an isolated
-Python worker with a narrow RPC boundary; Python is not required in the normal
-production hot path.
-
-The following alternatives were rejected for the initial implementation:
-
-- **Python as the primary control plane:** this would make Python a production
-  hot-path requirement and weaken isolation of custom model code.
-- **Embed Python in the Rust process:** interpreter safety, packaging, and
-  failure behavior would become part of the control-plane process.
-- **Start with multiple implementation languages:** this would add deployment
-  complexity before the logical boundaries are validated.
-
-Rust ecosystem parity for unusual model semantics is a known cost. Any isolated
-Python path requires explicit profiles, resource isolation, and semantic parity
-tests.
+Python is limited to SDKs, tooling, or an explicitly isolated compatibility
+worker. It is not required in the normal production hot path.
 
 ## Failure model
 
@@ -353,13 +359,14 @@ semantic worker. Python code is not embedded in the normal Locus hot path.
 
 This sequence is directional rather than a commitment that features exist:
 
-1. define core DTOs, semantic profiles, and structured errors;
-2. implement one northbound protocol and a conformance test harness;
-3. implement the canonical protocol and one engine adapter;
-4. add capability-aware routing and admission;
-5. add the null provider and generic `StateProvider` contract;
+1. define core DTOs, semantic identities, and structured errors;
+2. validate `Planner`, `PlacementPlan`, `PlanExecutor`, `EngineAdapter`, and
+   `StateProvider` boundaries with deterministic fakes;
+3. implement one northbound protocol and a conformance test harness;
+4. implement the canonical remote protocol and one engine adapter;
+5. add capability-aware admission and production calibration;
 6. integrate NexusKV as an optional reference provider;
-7. add cost calibration, topology, preload, and replication policies.
+7. add topology, preload, and replication policies.
 
 Each stage should keep the engine-neutral boundary testable with fake adapters
 and providers before adding another production integration.

@@ -57,7 +57,7 @@ exists:
 ```text
 StateRequirement
   model_identity
-  semantics_identity
+  relevant_semantic_requirements
   input_fingerprint
   input_structure
   accepted_state_kinds
@@ -75,7 +75,7 @@ only the information authorized by tenant and privacy policy.
 A `StateDescriptor` returned by a provider includes:
 
 - provider-scoped artifact identity and state kind;
-- producer model and semantic identities;
+- producer model identity and artifact-relevant semantic identity;
 - execution compatibility attributes such as dtype, quantization, layout,
   adapter revision, and parallelism;
 - a `ReusableBoundary` describing valid input coverage;
@@ -136,6 +136,13 @@ Relevant constraints vary by state kind and can include:
 - engine or kernel ABI;
 - tenant and security scope.
 
+Compatibility is artifact-specific. KV state typically depends on model
+execution identity, relevant input semantics, state layout, positional
+semantics, and runtime compatibility; it does not normally depend on a
+reasoning parser. A prepared vision artifact depends on model identity, media
+digest, and preprocessing identity. Tool-parser compatibility belongs to an
+output semantic profile rather than a prefill-state check.
+
 Unknown required evidence is incompatible for planning purposes. A conversion
 is represented as a materialization option with cost and target compatibility,
 not as a claim that the original artifact is directly compatible.
@@ -166,8 +173,9 @@ pub trait StateProvider: Send + Sync {
     async fn materialize(
         &self,
         option: &MaterializationOption,
+        target: &StateImportTarget,
         context: &OperationContext,
-    ) -> Result<PreparedStateAttachment, StateProviderError>;
+    ) -> Result<TransferReceipt, StateProviderError>;
 
     async fn preload(
         &self,
@@ -188,15 +196,51 @@ Important contract properties are:
 
 - lookup does not authorize placement or state movement;
 - estimates are target-specific, timestamped, and uncertainty-aware;
-- mutations require explicit planner/orchestrator decisions;
-- materialization returns a short-lived core-owned attachment, not a
-  provider-specific object;
+- mutations require explicit `PlanExecutor` action encoded by a plan;
+- materialization transfers to a negotiated target and returns a receipt; it
+  does not allocate engine-local memory or produce the final attachment;
 - cancellation and deadlines apply to every operation;
 - no provider is required.
 
 A `NullStateProvider` returns no matches and rejects mutation operations as
 unsupported. This makes cold, state-unaware operation part of normal contract
 testing.
+
+## State import handshake
+
+Real runtime state often needs destination pages, device memory, layout, or an
+import handle before transfer begins. Locus therefore uses a coordinated
+transaction rather than `StateProvider.materialize -> PreparedStateAttachment`:
+
+```text
+PlanExecutor
+  |
+  |-- EngineAdapter.prepare_state_import(StateImportSpec)
+  |     -> StateImportTarget
+  |
+  |-- StateProvider.materialize(MaterializationOption, StateImportTarget)
+  |     -> TransferReceipt
+  |
+  |-- EngineAdapter.commit_state_import(StateImportTarget, TransferReceipt)
+  |     -> PreparedStateAttachment
+  |
+  `-- EngineAdapter.execute(..., PreparedStateAttachment)
+```
+
+The provider owns discovery, source identity, and movement. The engine adapter
+owns destination allocation, runtime layout, install, and bind. `PlanExecutor`
+owns ordering, deadlines, cancellation, abort, cleanup, fallback, and bounded
+replanning.
+
+`StateImportTarget` is opaque, namespaced, target-generation scoped, and
+expiring. `TransferReceipt` proves what the provider transferred without
+exposing provider-private objects. `PreparedStateAttachment` is created only
+after the adapter validates and commits the import. A partial import is aborted
+idempotently; stale generations fail closed.
+
+Provider and adapter may negotiate a transport namespace, but engine-private
+allocation objects never enter the provider API and provider-private source
+objects never enter the adapter API. NexusKV remains one optional provider.
 
 ## NexusKV integration
 
@@ -239,12 +283,22 @@ The following alternatives were rejected:
 - **Let the provider choose the engine:** the provider does not own admission,
   engine load, decode cost, tenant fairness, or global topology policy.
 
+## Planner and executor ownership
+
+The planner compares complete feasible paths and returns a `PlacementPlan`.
+It does not call provider mutation methods, allocate destination memory, reserve
+an engine, submit work, retry, or clean up partial imports.
+
+`PlanExecutor` performs those side effects according to the chosen plan. It may
+apply the encoded fallback or request bounded replanning when observations have
+changed. It cannot silently turn a failed path into an unplanned placement.
+
 ## Planning inputs
 
 For each admitted request, planning begins with:
 
 - immutable normalized request and state requirement;
-- capability-eligible engine targets;
+- capability-eligible execution targets;
 - fresh engine load snapshots;
 - state descriptors and materialization options;
 - topology graph and transfer observations;
@@ -397,14 +451,16 @@ conventional KV representation.
 Lookup and snapshots are observations, not reservations. Between planning and
 execution, an engine can fill, an artifact can expire, or link cost can change.
 
-The orchestrator uses this sequence:
+`PlanExecutor` uses this sequence:
 
 1. select a plan from bounded-fresh inputs;
 2. reserve target capacity where supported;
-3. revalidate state and target generation;
-4. materialize and bind state within a time budget;
-5. submit execution;
-6. apply the encoded fallback or replan on failure.
+3. revalidate state, target identity, and engine generation;
+4. ask the engine adapter to prepare an expiring import target;
+5. ask the state provider to materialize into that target;
+6. ask the engine adapter to commit the receipt or abort partial state;
+7. submit execution with the committed attachment;
+8. apply the encoded fallback or bounded replan on failure.
 
 Plans carry a short validity horizon. Replanning is bounded to avoid livelock.
 State attachments are scoped and expiring so stale handles fail closed.
@@ -483,8 +539,10 @@ before a NexusKV integration is treated as conformant. Tests include:
 - PD handoff with incompatible layout;
 - missing, stale, or low-confidence cost observations;
 - provider timeout and materialization failure fallbacks;
+- prepare, transfer, commit, abort, and partial-import cleanup;
 - tenant isolation and topology restrictions;
-- engine restart invalidating a prepared attachment;
+- engine restart invalidating import targets and prepared attachments;
+- planner purity and `PlanExecutor` side-effect ownership;
 - deterministic choice and explanation for equal costs.
 
 Passing these tests validates decision semantics, not production cost accuracy.

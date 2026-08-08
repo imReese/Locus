@@ -120,6 +120,10 @@ state integration disabled.
 - [Engine adapter contract](docs/design/engine-adapter-contract.md)
 - [Model semantics](docs/design/model-semantics.md)
 - [State-aware scheduling](docs/design/state-aware-scheduling.md)
+- [ADR 0001: Engine-neutral boundary](docs/adr/0001-engine-neutral-boundary.md)
+- [ADR 0002: State-provider abstraction](docs/adr/0002-state-provider-abstraction.md)
+- [ADR 0003: Rust as the primary language](docs/adr/0003-rust-primary-language.md)
+- [ADR 0004: Project name Locus](docs/adr/0004-project-name-locus.md)
 
 ## Implementation direction
 

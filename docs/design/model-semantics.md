@@ -38,14 +38,42 @@ components for an immutable model revision. A profile includes:
 - reasoning and tool-call parser configuration;
 - supported northbound features and defaults;
 - engine requirements derived from those semantics;
-- a deterministic `semantics_fingerprint`.
+- a structured `SemanticIdentity` plus an optional umbrella fingerprint.
 
-Aliases are mutable operational configuration; fingerprints are not. Reusable
-state compatibility uses the immutable model identity and relevant semantic
-fingerprints, never a user-facing alias alone.
+Aliases are mutable operational configuration; semantic component identities
+are not. Reusable-state compatibility uses the immutable model identity and
+only the semantic subset relevant to that artifact, never a user-facing alias
+or one umbrella hash alone.
 
 Profiles are loaded, validated, and activated atomically. In-flight requests
 retain the profile revision selected at admission.
+
+## Semantic identity
+
+`SemanticIdentity` separates three dependency groups:
+
+```text
+SemanticIdentity
+  input_semantics
+    tokenizer
+    template
+    multimodal_preprocessing
+
+  generation_semantics
+    sampling_normalization
+    stop_behavior
+    constrained_generation
+
+  output_semantics
+    detokenization
+    reasoning_parser
+    tool_parser
+```
+
+The exact public structs may evolve, but compatibility is always
+artifact-specific. An umbrella fingerprint remains useful for tracing, profile
+equality, and cache fast paths. It never replaces structured evidence about the
+components on which an artifact actually depends.
 
 ## Conceptual interfaces
 
@@ -68,7 +96,7 @@ pub trait TemplateRenderer: Send + Sync {
 }
 
 pub trait ModelSemantics: Send + Sync {
-    fn identity(&self) -> &SemanticsIdentity;
+    fn identity(&self) -> &SemanticIdentity;
     fn normalize(&self, request: SemanticRequest)
         -> Result<NormalizedRequest, SemanticError>;
     fn output_pipeline(&self, contract: &OutputContract)
@@ -191,6 +219,18 @@ token events -> incremental decoder -> stop handling
              -> northbound protocol adapter
 ```
 
+Engines report execution facts. `ModelSemantics` derives application meaning.
+An `EngineFinishReason` contains facts such as stop, length, cancellation,
+error, or a namespaced runtime-specific reason. A separate
+`SemanticFinishReason` may identify a tool call, content filtering, reasoning
+outcome, or another northbound meaning after the output pipeline has observed
+the complete semantic context.
+
+An engine may optionally provide structured semantic events through an
+explicit capability. Locus consumes them only when the model profile and
+adapter declare compatible semantics; adapters do not infer application finish
+reasons by default.
+
 Parsers consume an ordered stream and may buffer only bounded partial syntax.
 They emit typed events rather than directly constructing OpenAI response
 objects. This keeps the same semantics usable by future northbound protocols.
@@ -266,9 +306,18 @@ Semantic artifacts may be cached, but each has a typed key:
 - prepared multimodal inputs depend on preprocessing and model identities;
 - reusable model state additionally depends on execution layout and state kind.
 
-The `semantics_fingerprint` summarizes relevant semantic identity for quick
-comparison. It does not replace structured compatibility evidence when only a
-subset of semantics affects an artifact.
+Examples of artifact-specific compatibility include:
+
+- KV state depends on model execution identity, relevant input semantics,
+  positional behavior, state layout, and runtime compatibility;
+- a reasoning parser does not normally affect prefill-state compatibility;
+- a prepared vision artifact depends on model identity, media digest, and
+  multimodal preprocessing identity;
+- a tool parser depends on the output semantic profile, not the reusable input
+  state.
+
+The umbrella semantic fingerprint summarizes the full profile for quick
+equality. It does not replace these structured checks.
 
 ## Validation strategy
 
