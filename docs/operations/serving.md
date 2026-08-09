@@ -70,23 +70,51 @@ Each model entry pins:
 - an exact local chat-template file and declared template revision;
 - bounded template context such as `bos_token` and `eos_token`;
 - whether a generation marker is requested; and
-- the maximum rendered prompt size.
+- the maximum rendered prompt size;
+- an optional tagged reasoning parser with an immutable revision and delimiters;
+- an optional tagged-JSON tool parser with a revision, delimiters, and bounded
+  per-call buffer.
 
-Locus hashes the tokenizer and template bytes with SHA-256 at startup. Those
-digests become structured semantic-component fingerprints and feed the umbrella
-profile fingerprint. A label such as `main` or `latest` is not accepted as
-compatibility evidence by itself.
+Locus hashes the tokenizer, template, and canonical parser configurations with
+SHA-256 at startup. Those digests become structured semantic-component
+fingerprints and feed the umbrella profile fingerprint. A label such as `main`
+or `latest` is not accepted as compatibility evidence by itself.
 
-For each request the selected `ModelSemantics` renders the conversation once and
-tokenizes that rendered prompt once. The resulting canonical token IDs cross the
-engine boundary. The vLLM adapter explicitly sets `add_special_tokens: false`;
-neither adapter renders or tokenizes the conversation again.
+For each request the selected `ModelSemantics` renders the conversation and
+OpenAI-shaped function definitions once, then tokenizes that rendered prompt
+once. The resulting canonical token IDs cross the engine boundary. The vLLM
+adapter explicitly sets `add_special_tokens: false`; neither adapter renders or
+tokenizes the conversation again.
 
-The current production template context supports text messages and deployment
-values. Runtime-native tool-template context, multimodal bindings, and
-model-specific reasoning/tool parsers are not implemented. Requests requiring
-typed capabilities that an engine adapter does not advertise are rejected by
-planning.
+Example parser configuration:
+
+```json
+{
+  "reasoning_parser": {
+    "kind": "tagged",
+    "revision": "model-think-tags-v1",
+    "start_delimiter": "<think>",
+    "end_delimiter": "</think>"
+  },
+  "tool_parser": {
+    "kind": "tagged_json",
+    "revision": "model-tool-envelope-v1",
+    "start_delimiter": "<tool_call>",
+    "end_delimiter": "</tool_call>",
+    "max_buffered_bytes": 65536
+  }
+}
+```
+
+The selected delimiters and envelope must match the pinned model/template
+dialect. Locus has no heuristic fallback. Stray or incomplete reserved syntax,
+unknown functions, non-object arguments, and over-limit calls fail the request.
+Profiles without a local parser still require compatible typed runtime events
+and are rejected during planning when the adapter cannot provide them.
+
+The current production template context supports text messages, function tool
+schemas, tool choice, and deployment values. Multimodal bindings and additional
+model-specific parser dialects are not implemented.
 
 ## Probes
 

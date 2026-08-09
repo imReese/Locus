@@ -139,8 +139,9 @@ The Rust 2024 workspace keeps the architecture boundaries small and explicit:
 
 - `locus-core`: canonical requests, execution facts, identities, reusable-state
   contracts, and operation context;
-- `locus-semantics`: model registry, normalization, typed semantic events,
-  tool-call aggregation, reasoning, and structured-output validation;
+- `locus-semantics`: model registry, normalization, profile-bound tagged
+  reasoning/tagged-JSON tool parsing, typed semantic events, tool-call
+  aggregation, and structured-output validation;
 - `locus-semantics-hf`: production tokenizer.json loading, bounded MiniJinja
   chat-template rendering, detokenization, and content-derived semantic
   fingerprints;
@@ -184,9 +185,10 @@ before use. See [Serving and configuration](docs/operations/serving.md).
 The implementation uses Rust 2024, Tokio, Axum, Reqwest, Hugging Face
 Tokenizers, and MiniJinja. Core contracts do not depend on those frameworks. A
 future native southbound protocol may use Tonic and Protobuf. Production model
-profiles use exact local tokenizer and chat-template artifacts; model-specific
-reasoning/tool parsers are still required before those semantics can be
-advertised by the current SGLang/vLLM adapters.
+profiles use exact local tokenizer and chat-template artifacts. They may also
+pin strict tagged-reasoning and tagged-JSON tool-call parsers by revision,
+delimiters, and content-derived fingerprint. Other model output dialects require
+an additional explicit parser kind rather than an implicit best-effort fallback.
 
 These are implementation choices behind stable Locus interfaces, not types
 that define the core architecture. Wire formats and Rust APIs remain pre-1.0.
@@ -196,11 +198,14 @@ that define the core architecture. Wire formats and Rust APIs remain pre-1.0.
 - OpenAI Responses/Chat and adapter streaming are exercised through in-process
   HTTP/SSE conformance tests.
 - Official `openai` Python SDK 2.53.0 E2E covers Responses and Chat JSON/SSE,
-  structured output, errors, authentication, and client-disconnect cancellation
-  against a real local Locus HTTP fixture in GitHub CI.
+  profile-parsed reasoning/tool calls, structured output, errors,
+  authentication, and client-disconnect cancellation against a real local
+  Locus HTTP fixture in GitHub CI.
 - SGLang and vLLM requests send canonical token IDs to `/v1/completions`; tests
-  cover request IDs, structured-output mapping, usage, finish events, and the
-  SGLang abort path. `scripts/live_engine_conformance.py` can exercise an
+  cover request IDs, profile-parser-gated tool prompt transport,
+  structured-output mapping, usage, finish events, and the SGLang abort path. A
+  configured-server test fragments tagged reasoning and sequential tool calls
+  across mock SGLang SSE chunks. `scripts/live_engine_conformance.py` can exercise an
   explicitly configured live runtime, but no live runtime or GPU result is
   checked into or implied by CI.
 - The NexusKV provider requires a separately deployed
@@ -211,7 +216,7 @@ that define the core architecture. Wire formats and Rust APIs remain pre-1.0.
 - Bearer authentication, global body/concurrency limits, readiness, request IDs,
   and structured tracing are implemented. Per-tenant rate/fairness admission,
   calibrated costs, telemetry export, multimodal normalization, and production
-  model-specific reasoning/tool parsers remain future work.
+  qualification or additional model-specific parser dialects remain future work.
 
 ## Scope
 

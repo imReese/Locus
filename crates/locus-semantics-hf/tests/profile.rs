@@ -1,9 +1,17 @@
 use std::collections::BTreeMap;
 
 use ahash::AHashMap;
-use locus_core::{InputItemValue, ModelExecutionIdentity, RequestId};
-use locus_semantics::{Conversation, ConversationMessage, ConversationRole, SemanticRequest};
-use locus_semantics_hf::{HuggingFaceProfileSpec, load_huggingface_semantics};
+use locus_core::{
+    EngineEvent, EngineFinishReason, InputItemValue, ModelExecutionIdentity, RequestId, Usage,
+};
+use locus_semantics::{
+    Conversation, ConversationMessage, ConversationRole, ReasoningEffort, SemanticEvent,
+    SemanticFinishReason, SemanticRequest, ToolChoice, ToolDefinition,
+};
+use locus_semantics_hf::{
+    HuggingFaceProfileSpec, TaggedJsonToolParserSpec, TaggedReasoningParserSpec,
+    load_huggingface_semantics,
+};
 use serde_json::json;
 use tempfile::tempdir;
 use tokenizers::Tokenizer;
@@ -20,6 +28,8 @@ fn write_fixture() -> (tempfile::TempDir, HuggingFaceProfileSpec) {
         ("user".to_owned(), 2),
         ("hello".to_owned(), 3),
         ("assistant".to_owned(), 4),
+        ("tool".to_owned(), 5),
+        ("weather".to_owned(), 6),
     ]);
     let model = WordLevel::builder()
         .vocab(vocabulary)
@@ -33,7 +43,7 @@ fn write_fixture() -> (tempfile::TempDir, HuggingFaceProfileSpec) {
         .expect("save tokenizer");
     std::fs::write(
         &template_path,
-        "{{ bos_token }} {% for message in messages %}{{ message.role }} {{ message.content }} {% endfor %}{% if add_generation_prompt %}assistant{% endif %}",
+        "{{ bos_token }} {% for message in messages %}{{ message.role }} {{ message.content }} {% endfor %}{% if tools %}tool {{ tools[0].function.name }} {% endif %}{% if add_generation_prompt %}assistant{% endif %}",
     )
     .expect("write template");
     let mut spec = HuggingFaceProfileSpec::new(
@@ -50,6 +60,20 @@ fn write_fixture() -> (tempfile::TempDir, HuggingFaceProfileSpec) {
     spec.template_revision = "fixture-template-v1".to_owned();
     spec.template_context = BTreeMap::from([("bos_token".to_owned(), json!("<bos>"))]);
     (directory, spec)
+}
+
+fn tool() -> ToolDefinition {
+    ToolDefinition {
+        name: "weather".to_owned(),
+        description: Some("Get the weather".to_owned()),
+        parameters_schema: json!({
+            "type": "object",
+            "properties": {"city": {"type": "string"}},
+            "required": ["city"]
+        })
+        .to_string(),
+        strict: true,
+    }
 }
 
 #[test]
@@ -101,6 +125,175 @@ fn production_profile_renders_and_tokenizes_once_with_content_identities() {
             .template
             .fingerprint
             .starts_with("sha256:")
+    );
+}
+
+#[test]
+fn profile_bound_parsers_render_tools_and_emit_typed_events_from_fragmented_text() {
+    let (_directory, mut spec) = write_fixture();
+    spec.reasoning_parser = Some(TaggedReasoningParserSpec {
+        revision: "think-tags-v1".to_owned(),
+        start_delimiter: "<think>".to_owned(),
+        end_delimiter: "</think>".to_owned(),
+    });
+    spec.tool_parser = Some(TaggedJsonToolParserSpec {
+        revision: "tool-envelope-v1".to_owned(),
+        start_delimiter: "<tool_call>".to_owned(),
+        end_delimiter: "</tool_call>".to_owned(),
+        max_buffered_bytes: 4096,
+    });
+    let semantics = load_huggingface_semantics(spec).expect("load parser profile");
+    let normalized = semantics
+        .normalize(
+            &SemanticRequest {
+                model: "fixture".to_owned(),
+                conversation: Conversation {
+                    messages: vec![ConversationMessage {
+                        role: ConversationRole::User,
+                        content: "hello".to_owned(),
+                        tool_call_id: None,
+                    }],
+                },
+                tools: vec![tool()],
+                tool_choice: ToolChoice::Required,
+                reasoning_effort: Some(ReasoningEffort::High),
+                ..SemanticRequest::default()
+            },
+            RequestId::new("request-parser"),
+        )
+        .expect("normalize parser request");
+    let tokens = normalized
+        .canonical
+        .input
+        .items
+        .iter()
+        .find_map(|item| match &item.value {
+            InputItemValue::TokenSequence(tokens) => Some(tokens.token_ids.as_slice()),
+            _ => None,
+        })
+        .expect("token sequence");
+    assert_eq!(tokens, &[1, 2, 3, 5, 6, 4]);
+    assert!(
+        normalized
+            .canonical
+            .semantic_identity
+            .output
+            .reasoning_parser
+            .is_some()
+    );
+    assert!(
+        normalized
+            .canonical
+            .semantic_identity
+            .output
+            .tool_parser
+            .is_some()
+    );
+    assert!(!normalized.canonical.requirements.requires_reasoning_deltas);
+    assert!(!normalized.canonical.requirements.requires_tool_calls);
+
+    let mut pipeline = semantics
+        .output_pipeline(&normalized.output_contract)
+        .expect("output pipeline");
+    let request_id = RequestId::new("request-parser");
+    let mut events = Vec::new();
+    for (sequence_number, text) in [
+        "<thi",
+        "nk>checked",
+        " constraints</think><tool_",
+        "call>{\"name\":\"weather\",\"arguments\":{\"city\":\"Beijing\"}}",
+        "</tool_call>",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        events.extend(
+            pipeline
+                .process(EngineEvent::TextDelta {
+                    request_id: request_id.clone(),
+                    sequence_number: sequence_number as u64,
+                    text: text.to_owned(),
+                })
+                .expect("parse text delta"),
+        );
+    }
+    events.extend(
+        pipeline
+            .process(EngineEvent::Finished {
+                request_id,
+                reason: EngineFinishReason::Stop,
+                usage: Usage::default(),
+            })
+            .expect("finish parsed output"),
+    );
+
+    let reasoning = events
+        .iter()
+        .filter_map(|event| match event {
+            SemanticEvent::ReasoningDelta { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<String>();
+    assert_eq!(reasoning, "checked constraints");
+    assert!(!events.iter().any(
+        |event| matches!(event, SemanticEvent::TextDelta { text, .. } if text.contains("think") || text.contains("tool_call"))
+    ));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        SemanticEvent::ToolCallStarted { call_id, name, .. }
+            if call_id == "call_request-parser_0" && name == "weather"
+    )));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        SemanticEvent::ToolCallCompleted { arguments, .. }
+            if arguments == "{\"city\":\"Beijing\"}"
+    )));
+    assert!(matches!(
+        events.last(),
+        Some(SemanticEvent::Finished {
+            reason: SemanticFinishReason::ToolCall,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn parser_configuration_changes_output_and_umbrella_fingerprints() {
+    let (_directory, mut first) = write_fixture();
+    first.reasoning_parser = Some(TaggedReasoningParserSpec {
+        revision: "think-tags-v1".to_owned(),
+        start_delimiter: "<think>".to_owned(),
+        end_delimiter: "</think>".to_owned(),
+    });
+    let mut second = first.clone();
+    second
+        .reasoning_parser
+        .as_mut()
+        .expect("reasoning parser")
+        .end_delimiter = "</reasoning>".to_owned();
+    let first = load_huggingface_semantics(first).expect("first profile");
+    let second = load_huggingface_semantics(second).expect("second profile");
+    assert_ne!(
+        first
+            .profile()
+            .semantic_identity
+            .output
+            .reasoning_parser
+            .as_ref()
+            .expect("first parser identity")
+            .fingerprint,
+        second
+            .profile()
+            .semantic_identity
+            .output
+            .reasoning_parser
+            .as_ref()
+            .expect("second parser identity")
+            .fingerprint
+    );
+    assert_ne!(
+        first.profile().semantic_identity.umbrella_fingerprint,
+        second.profile().semantic_identity.umbrella_fingerprint
     );
 }
 

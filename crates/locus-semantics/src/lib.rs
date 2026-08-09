@@ -8,6 +8,13 @@ use locus_core::{
 };
 use thiserror::Error;
 
+mod output_parser;
+
+use output_parser::{
+    ReasoningSegment, TaggedJsonToolParserState, TaggedReasoningParserState, ToolSegment,
+};
+pub use output_parser::{TaggedJsonToolParserDefinition, TaggedReasoningParserDefinition};
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ModelProfile {
     pub public_aliases: Vec<String>,
@@ -136,7 +143,7 @@ pub trait TokenDecoder: Send + Sync {
 pub trait TemplateRenderer: Send + Sync {
     fn identity(&self) -> &SemanticComponentIdentity;
 
-    fn render(&self, conversation: &Conversation) -> Result<String, SemanticError>;
+    fn render(&self, request: &SemanticRequest) -> Result<String, SemanticError>;
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -278,6 +285,8 @@ pub struct BasicModelSemantics {
     tokenizer: Arc<dyn TokenizerProvider>,
     template: Arc<dyn TemplateRenderer>,
     decoder: Arc<dyn TokenDecoder>,
+    reasoning_parser: Option<TaggedReasoningParserDefinition>,
+    tool_parser: Option<TaggedJsonToolParserDefinition>,
 }
 
 impl BasicModelSemantics {
@@ -293,8 +302,51 @@ impl BasicModelSemantics {
             tokenizer,
             template,
             decoder,
+            reasoning_parser: None,
+            tool_parser: None,
         }
     }
+
+    pub fn with_output_parsers(
+        mut self,
+        reasoning_parser: Option<TaggedReasoningParserDefinition>,
+        tool_parser: Option<TaggedJsonToolParserDefinition>,
+    ) -> Result<Self, SemanticError> {
+        validate_parser_identity(
+            "reasoning",
+            self.profile
+                .semantic_identity
+                .output
+                .reasoning_parser
+                .as_ref(),
+            reasoning_parser
+                .as_ref()
+                .map(TaggedReasoningParserDefinition::identity),
+        )?;
+        validate_parser_identity(
+            "tool",
+            self.profile.semantic_identity.output.tool_parser.as_ref(),
+            tool_parser
+                .as_ref()
+                .map(TaggedJsonToolParserDefinition::identity),
+        )?;
+        self.reasoning_parser = reasoning_parser;
+        self.tool_parser = tool_parser;
+        Ok(self)
+    }
+}
+
+fn validate_parser_identity(
+    kind: &str,
+    profile: Option<&SemanticComponentIdentity>,
+    parser: Option<&SemanticComponentIdentity>,
+) -> Result<(), SemanticError> {
+    if profile != parser {
+        return Err(SemanticError::InvalidInput(format!(
+            "{kind} parser definition does not match the model profile identity"
+        )));
+    }
+    Ok(())
 }
 
 impl ModelSemantics for BasicModelSemantics {
@@ -313,7 +365,7 @@ impl ModelSemantics for BasicModelSemantics {
             ));
         }
         validate_tool_contract(request)?;
-        let rendered = self.template.render(&request.conversation)?;
+        let rendered = self.template.render(request)?;
         let tokens = self.tokenizer.encode(&rendered)?;
         let mut input = InputBundle {
             items: vec![InputItem {
@@ -330,8 +382,9 @@ impl ModelSemantics for BasicModelSemantics {
             reasoning_effort: request.reasoning_effort,
         };
         let mut requirements = CapabilityRequirements::for_input(&input);
-        requirements.requires_reasoning_deltas = request.reasoning_effort.is_some();
-        requirements.requires_tool_calls = !request.tools.is_empty();
+        requirements.requires_reasoning_deltas =
+            request.reasoning_effort.is_some() && self.reasoning_parser.is_none();
+        requirements.requires_tool_calls = !request.tools.is_empty() && self.tool_parser.is_none();
         requirements.requires_structured_output =
             !matches!(request.response_format, ResponseFormat::Text);
         Ok(NormalizedSemanticRequest {
@@ -357,6 +410,15 @@ impl ModelSemantics for BasicModelSemantics {
             text: String::new(),
             tool_arguments: BTreeMap::new(),
             saw_tool_call: false,
+            reasoning_parser: self
+                .reasoning_parser
+                .as_ref()
+                .map(TaggedReasoningParserDefinition::state),
+            tool_parser: self
+                .tool_parser
+                .as_ref()
+                .map(TaggedJsonToolParserDefinition::state),
+            next_tool_index: 0,
         }))
     }
 }
@@ -430,10 +492,24 @@ fn contract_annotations(request: &SemanticRequest) -> Result<Vec<TypedMetadata>,
 fn validate_tool_contract(request: &SemanticRequest) -> Result<(), SemanticError> {
     let mut names = std::collections::BTreeSet::new();
     for tool in &request.tools {
-        if tool.name.is_empty() {
+        if tool.name.trim().is_empty() {
             return Err(SemanticError::InvalidInput(
                 "tool name must not be empty".to_owned(),
             ));
+        }
+        let schema = serde_json::from_str::<serde_json::Value>(&tool.parameters_schema).map_err(
+            |error| {
+                SemanticError::InvalidInput(format!(
+                    "invalid parameters schema for tool {}: {error}",
+                    tool.name
+                ))
+            },
+        )?;
+        if !schema.is_object() {
+            return Err(SemanticError::InvalidInput(format!(
+                "parameters schema for tool {} must be a JSON object",
+                tool.name
+            )));
         }
         if !names.insert(tool.name.as_str()) {
             return Err(SemanticError::InvalidInput(format!(
@@ -461,6 +537,9 @@ struct BasicOutputPipeline {
     text: String,
     tool_arguments: BTreeMap<String, String>,
     saw_tool_call: bool,
+    reasoning_parser: Option<TaggedReasoningParserState>,
+    tool_parser: Option<TaggedJsonToolParserState>,
+    next_tool_index: usize,
 }
 
 impl SemanticOutputPipeline for BasicOutputPipeline {
@@ -473,76 +552,47 @@ impl SemanticOutputPipeline for BasicOutputPipeline {
                 ..
             } => {
                 let text = self.decoder.decode(&token_ids)?;
-                self.text.push_str(&text);
-                vec![SemanticEvent::TextDelta { request_id, text }]
+                self.process_text_delta(request_id, text)?
             }
             EngineEvent::TextDelta {
                 request_id, text, ..
-            } => {
-                self.text.push_str(&text);
-                vec![SemanticEvent::TextDelta { request_id, text }]
-            }
+            } => self.process_text_delta(request_id, text)?,
             EngineEvent::ReasoningDelta {
                 request_id, text, ..
-            } => vec![SemanticEvent::ReasoningDelta { request_id, text }],
+            } => {
+                if self.reasoning_parser.is_some() {
+                    return Err(SemanticError::Processing(
+                        "engine emitted native reasoning while a profile parser is selected"
+                            .to_owned(),
+                    ));
+                }
+                vec![SemanticEvent::ReasoningDelta { request_id, text }]
+            }
             EngineEvent::ToolCallStarted {
                 request_id,
                 call_id,
                 name,
                 ..
             } => {
-                if matches!(self.contract.tool_choice, ToolChoice::None)
-                    || !self.contract.tools.iter().any(|tool| tool.name == name)
-                {
-                    return Err(SemanticError::Processing(format!(
-                        "engine emitted an unrequested tool call: {name}"
-                    )));
+                if self.tool_parser.is_some() {
+                    return Err(SemanticError::Processing(
+                        "engine emitted a native tool call while a profile parser is selected"
+                            .to_owned(),
+                    ));
                 }
-                self.saw_tool_call = true;
-                self.tool_arguments.insert(call_id.clone(), String::new());
-                vec![SemanticEvent::ToolCallStarted {
-                    request_id,
-                    call_id,
-                    name,
-                }]
+                vec![self.start_tool_call(request_id, call_id, name)?]
             }
             EngineEvent::ToolCallArgumentsDelta {
                 request_id,
                 call_id,
                 delta,
                 ..
-            } => {
-                self.tool_arguments
-                    .entry(call_id.clone())
-                    .or_default()
-                    .push_str(&delta);
-                vec![SemanticEvent::ToolCallArgumentsDelta {
-                    request_id,
-                    call_id,
-                    delta,
-                }]
-            }
+            } => vec![self.append_tool_arguments(request_id, call_id, delta)?],
             EngineEvent::ToolCallCompleted {
                 request_id,
                 call_id,
                 ..
-            } => {
-                let arguments = self.tool_arguments.remove(&call_id).ok_or_else(|| {
-                    SemanticError::Processing(format!(
-                        "tool call completed before it was started: {call_id}"
-                    ))
-                })?;
-                serde_json::from_str::<serde_json::Value>(&arguments).map_err(|error| {
-                    SemanticError::Processing(format!(
-                        "tool call {call_id} produced invalid JSON arguments: {error}"
-                    ))
-                })?;
-                vec![SemanticEvent::ToolCallCompleted {
-                    request_id,
-                    call_id,
-                    arguments,
-                }]
-            }
+            } => vec![self.complete_tool_call(request_id, call_id)?],
             EngineEvent::UsageUpdate {
                 request_id,
                 usage,
@@ -557,17 +607,30 @@ impl SemanticOutputPipeline for BasicOutputPipeline {
                 reason,
                 usage,
             } => {
+                let mut events = self.finish_parsers(&request_id)?;
                 self.validate_completed_output()?;
-                let reason = if self.saw_tool_call && reason == EngineFinishReason::Stop {
+                let runtime_reported_tool_call = matches!(
+                    &reason,
+                    EngineFinishReason::RuntimeSpecific { value, .. } if value == "tool_calls"
+                );
+                if runtime_reported_tool_call && !self.saw_tool_call {
+                    return Err(SemanticError::Processing(
+                        "engine reported tool_calls without a completed tool call".to_owned(),
+                    ));
+                }
+                let reason = if self.saw_tool_call
+                    && (reason == EngineFinishReason::Stop || runtime_reported_tool_call)
+                {
                     SemanticFinishReason::ToolCall
                 } else {
                     interpret_finish(reason)
                 };
-                vec![SemanticEvent::Finished {
+                events.push(SemanticEvent::Finished {
                     request_id,
                     reason,
                     usage,
-                }]
+                });
+                events
             }
         };
         Ok(semantic)
@@ -575,6 +638,188 @@ impl SemanticOutputPipeline for BasicOutputPipeline {
 }
 
 impl BasicOutputPipeline {
+    fn process_text_delta(
+        &mut self,
+        request_id: RequestId,
+        text: String,
+    ) -> Result<Vec<SemanticEvent>, SemanticError> {
+        let segments = if let Some(parser) = self.reasoning_parser.as_mut() {
+            parser.push(&text)?
+        } else {
+            vec![ReasoningSegment::Text(text)]
+        };
+        self.process_reasoning_segments(&request_id, segments)
+    }
+
+    fn process_reasoning_segments(
+        &mut self,
+        request_id: &RequestId,
+        segments: Vec<ReasoningSegment>,
+    ) -> Result<Vec<SemanticEvent>, SemanticError> {
+        let mut events = Vec::new();
+        for segment in segments {
+            match segment {
+                ReasoningSegment::Reasoning(text) => {
+                    events.push(SemanticEvent::ReasoningDelta {
+                        request_id: request_id.clone(),
+                        text,
+                    });
+                }
+                ReasoningSegment::Text(text) => {
+                    events.extend(self.process_visible_text(request_id, &text)?);
+                }
+            }
+        }
+        Ok(events)
+    }
+
+    fn process_visible_text(
+        &mut self,
+        request_id: &RequestId,
+        text: &str,
+    ) -> Result<Vec<SemanticEvent>, SemanticError> {
+        let segments = if let Some(parser) = self.tool_parser.as_mut() {
+            parser.push(text)?
+        } else {
+            vec![ToolSegment::Text(text.to_owned())]
+        };
+        let mut events = Vec::new();
+        for segment in segments {
+            match segment {
+                ToolSegment::Text(text) => {
+                    self.text.push_str(&text);
+                    events.push(SemanticEvent::TextDelta {
+                        request_id: request_id.clone(),
+                        text,
+                    });
+                }
+                ToolSegment::Call { name, arguments } => {
+                    let call_id = format!("call_{}_{}", request_id.as_str(), self.next_tool_index);
+                    self.next_tool_index += 1;
+                    events.push(self.start_tool_call(request_id.clone(), call_id.clone(), name)?);
+                    events.push(self.append_tool_arguments(
+                        request_id.clone(),
+                        call_id.clone(),
+                        arguments,
+                    )?);
+                    events.push(self.complete_tool_call(request_id.clone(), call_id)?);
+                }
+            }
+        }
+        Ok(events)
+    }
+
+    fn start_tool_call(
+        &mut self,
+        request_id: RequestId,
+        call_id: String,
+        name: String,
+    ) -> Result<SemanticEvent, SemanticError> {
+        let requested = self.contract.tools.iter().any(|tool| tool.name == name);
+        let selected = match &self.contract.tool_choice {
+            ToolChoice::None => false,
+            ToolChoice::Function(selected) => selected == &name,
+            ToolChoice::Auto | ToolChoice::Required => requested,
+        };
+        if !requested || !selected {
+            return Err(SemanticError::Processing(format!(
+                "engine emitted an unrequested tool call: {name}"
+            )));
+        }
+        if self.tool_arguments.contains_key(&call_id) {
+            return Err(SemanticError::Processing(format!(
+                "engine emitted duplicate tool call id: {call_id}"
+            )));
+        }
+        self.saw_tool_call = true;
+        self.tool_arguments.insert(call_id.clone(), String::new());
+        Ok(SemanticEvent::ToolCallStarted {
+            request_id,
+            call_id,
+            name,
+        })
+    }
+
+    fn append_tool_arguments(
+        &mut self,
+        request_id: RequestId,
+        call_id: String,
+        delta: String,
+    ) -> Result<SemanticEvent, SemanticError> {
+        let arguments = self.tool_arguments.get_mut(&call_id).ok_or_else(|| {
+            SemanticError::Processing(format!(
+                "tool arguments arrived before the call was started: {call_id}"
+            ))
+        })?;
+        arguments.push_str(&delta);
+        Ok(SemanticEvent::ToolCallArgumentsDelta {
+            request_id,
+            call_id,
+            delta,
+        })
+    }
+
+    fn complete_tool_call(
+        &mut self,
+        request_id: RequestId,
+        call_id: String,
+    ) -> Result<SemanticEvent, SemanticError> {
+        let arguments = self.tool_arguments.remove(&call_id).ok_or_else(|| {
+            SemanticError::Processing(format!(
+                "tool call completed before it was started: {call_id}"
+            ))
+        })?;
+        let value = serde_json::from_str::<serde_json::Value>(&arguments).map_err(|error| {
+            SemanticError::Processing(format!(
+                "tool call {call_id} produced invalid JSON arguments: {error}"
+            ))
+        })?;
+        if !value.is_object() {
+            return Err(SemanticError::Processing(format!(
+                "tool call {call_id} arguments must be a JSON object"
+            )));
+        }
+        Ok(SemanticEvent::ToolCallCompleted {
+            request_id,
+            call_id,
+            arguments,
+        })
+    }
+
+    fn finish_parsers(
+        &mut self,
+        request_id: &RequestId,
+    ) -> Result<Vec<SemanticEvent>, SemanticError> {
+        let reasoning = if let Some(parser) = self.reasoning_parser.as_mut() {
+            parser.finish()?
+        } else {
+            Vec::new()
+        };
+        let mut events = self.process_reasoning_segments(request_id, reasoning)?;
+        let tools = if let Some(parser) = self.tool_parser.as_mut() {
+            parser.finish()?
+        } else {
+            Vec::new()
+        };
+        for segment in tools {
+            match segment {
+                ToolSegment::Text(text) => {
+                    self.text.push_str(&text);
+                    events.push(SemanticEvent::TextDelta {
+                        request_id: request_id.clone(),
+                        text,
+                    });
+                }
+                ToolSegment::Call { .. } => {
+                    return Err(SemanticError::Processing(
+                        "tool parser committed a call after finalization".to_owned(),
+                    ));
+                }
+            }
+        }
+        Ok(events)
+    }
+
     fn validate_completed_output(&self) -> Result<(), SemanticError> {
         if matches!(
             self.contract.response_format,
@@ -592,6 +837,15 @@ impl BasicOutputPipeline {
         if !self.tool_arguments.is_empty() {
             return Err(SemanticError::Processing(
                 "engine finished with incomplete tool calls".to_owned(),
+            ));
+        }
+        if matches!(
+            self.contract.tool_choice,
+            ToolChoice::Required | ToolChoice::Function(_)
+        ) && !self.saw_tool_call
+        {
+            return Err(SemanticError::Processing(
+                "engine finished without the required tool call".to_owned(),
             ));
         }
         Ok(())
@@ -675,9 +929,9 @@ impl TemplateRenderer for SimpleTemplateRenderer {
         &self.identity
     }
 
-    fn render(&self, conversation: &Conversation) -> Result<String, SemanticError> {
+    fn render(&self, request: &SemanticRequest) -> Result<String, SemanticError> {
         let mut rendered = String::new();
-        for message in &conversation.messages {
+        for message in &request.conversation.messages {
             if message.content.is_empty() {
                 return Err(SemanticError::InvalidInput(format!(
                     "{} message content must not be empty",
@@ -727,6 +981,9 @@ mod tests {
             text: String::new(),
             tool_arguments: BTreeMap::new(),
             saw_tool_call: false,
+            reasoning_parser: None,
+            tool_parser: None,
+            next_tool_index: 0,
         };
         let id = RequestId::new("req-1");
         pipeline
@@ -778,6 +1035,9 @@ mod tests {
             text: String::new(),
             tool_arguments: BTreeMap::new(),
             saw_tool_call: false,
+            reasoning_parser: None,
+            tool_parser: None,
+            next_tool_index: 0,
         };
         let id = RequestId::new("req-2");
         pipeline

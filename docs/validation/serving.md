@@ -38,6 +38,9 @@ The automated SDK suite covers:
 - Responses SSE lifecycle and text deltas;
 - Chat Completions non-streaming JSON;
 - Chat Completions SSE chunks and terminal completion;
+- Responses typed reasoning and function-call items produced by profile parsers;
+- Chat SSE reasoning content, indexed tool deltas, arguments, and `tool_calls`
+  finish reason produced by the same parser fixture;
 - JSON Schema structured-output request and JSON result;
 - an unknown-model error parsed as `openai.NotFoundError`;
 - bearer authentication on the fixture; and
@@ -99,8 +102,10 @@ deployment secrets or private endpoint details with a result.
 ## Current boundary
 
 The official SDK fixture passed locally with `openai` 2.53.0 and is enforced by
-GitHub CI. SGLang and vLLM adapter behavior is covered by deterministic mock
-HTTP/SSE tests. The cross-process NexusKV protocol path is also automated with
-protocol-only, zero-byte transfer evidence. No live GPU engine, native engine
-state import, or physical NexusKV transfer was available in this workspace, so
+GitHub CI, including profile-parsed reasoning and tool calls. SGLang and vLLM
+adapter behavior is covered by deterministic mock HTTP/SSE tests; configured
+parser behavior uses a mock SGLang endpoint, not a live model. The cross-process
+NexusKV protocol path is also automated with protocol-only, zero-byte transfer
+evidence. No live GPU engine, native engine state import, physical NexusKV
+transfer, or real-model parser conformance was available in this workspace, so
 those evidence levels remain unverified rather than failed.

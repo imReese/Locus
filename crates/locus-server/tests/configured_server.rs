@@ -7,7 +7,7 @@ use axum::http::{Request, Response, StatusCode, header};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use http_body_util::BodyExt;
-use locus_server::{build_server, load_config};
+use locus_server::{ToolParserSettings, build_server, load_config};
 use serde_json::{Value, json};
 use tempfile::tempdir;
 use tokenizers::Tokenizer;
@@ -43,6 +43,38 @@ async fn engine_completion(
         .expect("engine SSE response")
 }
 
+async fn parser_engine_completion(
+    State(capture): State<EngineCapture>,
+    Json(body): Json<Value>,
+) -> Response<Body> {
+    capture
+        .completions
+        .lock()
+        .expect("completion capture")
+        .push(body);
+    Response::builder()
+        .header(header::CONTENT_TYPE, "text/event-stream")
+        .body(Body::from(concat!(
+            "data: {\"choices\":[{\"index\":0,\"text\":\"<thi\",\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"text\":\"nk>checked</think><tool_\",\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"text\":\"call>{\\\"name\\\":\\\"weather\\\",\\\"arguments\\\":{\\\"city\\\":\\\"Beijing\\\"}}</tool_call><tool_call>{\\\"name\\\":\\\"clock\\\",\\\"arguments\\\":{\\\"timezone\\\":\\\"UTC+8\\\"}}\",\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"text\":\"</tool_call>\",\"finish_reason\":\"stop\"}]}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":12}}\n\n",
+            "data: [DONE]\n\n"
+        )))
+        .expect("parser engine SSE response")
+}
+
+async fn malformed_parser_engine_completion() -> Response<Body> {
+    Response::builder()
+        .header(header::CONTENT_TYPE, "text/event-stream")
+        .body(Body::from(concat!(
+            "data: {\"choices\":[{\"index\":0,\"text\":\"<think>private chain\",\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n"
+        )))
+        .expect("malformed parser SSE response")
+}
+
 async fn spawn_engine() -> (String, EngineCapture) {
     let capture = EngineCapture::default();
     let app = Router::new()
@@ -59,6 +91,40 @@ async fn spawn_engine() -> (String, EngineCapture) {
     (format!("http://{address}"), capture)
 }
 
+async fn spawn_parser_engine() -> (String, EngineCapture) {
+    let capture = EngineCapture::default();
+    let app = Router::new()
+        .route("/health", get(engine_health))
+        .route("/v1/completions", post(parser_engine_completion))
+        .with_state(capture.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind parser engine");
+    let address = listener.local_addr().expect("parser engine address");
+    tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("serve parser engine");
+    });
+    (format!("http://{address}"), capture)
+}
+
+async fn spawn_malformed_parser_engine() -> String {
+    let app = Router::new()
+        .route("/health", get(engine_health))
+        .route("/v1/completions", post(malformed_parser_engine_completion));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind malformed parser engine");
+    let address = listener.local_addr().expect("malformed parser address");
+    tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("serve malformed parser engine");
+    });
+    format!("http://{address}")
+}
+
 fn write_config() -> (tempfile::TempDir, std::path::PathBuf) {
     let directory = tempdir().expect("temp directory");
     let tokenizer_path = directory.path().join("tokenizer.json");
@@ -70,6 +136,8 @@ fn write_config() -> (tempfile::TempDir, std::path::PathBuf) {
             ("user".to_owned(), 1),
             ("hello".to_owned(), 2),
             ("assistant".to_owned(), 3),
+            ("tool".to_owned(), 4),
+            ("weather".to_owned(), 5),
         ]))
         .unk_token("<unk>".to_owned())
         .build()
@@ -81,7 +149,7 @@ fn write_config() -> (tempfile::TempDir, std::path::PathBuf) {
         .expect("save tokenizer");
     std::fs::write(
         &template_path,
-        "{% for message in messages %}{{ message.role }} {{ message.content }} {% endfor %}assistant",
+        "{% for message in messages %}{{ message.role }} {{ message.content }} {% endfor %}{% if tools %}tool {{ tools[0].function.name }} {% endif %}assistant",
     )
     .expect("write template");
     std::fs::write(
@@ -94,7 +162,20 @@ fn write_config() -> (tempfile::TempDir, std::path::PathBuf) {
                 "tokenizer_json": "tokenizer.json",
                 "tokenizer_revision": "tokenizer-v1",
                 "chat_template": "chat_template.jinja",
-                "template_revision": "template-v1"
+                "template_revision": "template-v1",
+                "reasoning_parser": {
+                    "kind": "tagged",
+                    "revision": "think-tags-v1",
+                    "start_delimiter": "<think>",
+                    "end_delimiter": "</think>"
+                },
+                "tool_parser": {
+                    "kind": "tagged_json",
+                    "revision": "tool-envelope-v1",
+                    "start_delimiter": "<tool_call>",
+                    "end_delimiter": "</tool_call>",
+                    "max_buffered_bytes": 4096
+                }
             }],
             "engines": [{
                 "id": "sglang-0",
@@ -110,6 +191,137 @@ fn write_config() -> (tempfile::TempDir, std::path::PathBuf) {
     )
     .expect("write config");
     (directory, config_path)
+}
+
+#[tokio::test]
+async fn configured_profile_parses_reasoning_and_tools_from_remote_completion_text() {
+    let (engine_url, capture) = spawn_parser_engine().await;
+    let (directory, config_path) = write_config();
+    let mut config = load_config(&config_path).expect("load config");
+    config.engines[0].base_url = engine_url;
+    let server = build_server(config, directory.path()).expect("build server");
+    let response = server
+        .app
+        .oneshot(
+            Request::post("/v1/chat/completions")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "fixture",
+                        "messages": [{"role": "user", "content": "hello"}],
+                        "reasoning_effort": "high",
+                        "tools": [
+                            {
+                                "type": "function",
+                                "function": {
+                                    "name": "weather",
+                                    "description": "Get weather",
+                                    "parameters": {
+                                        "type": "object",
+                                        "properties": {"city": {"type": "string"}},
+                                        "required": ["city"]
+                                    },
+                                    "strict": true
+                                }
+                            },
+                            {
+                                "type": "function",
+                                "function": {
+                                    "name": "clock",
+                                    "parameters": {
+                                        "type": "object",
+                                        "properties": {"timezone": {"type": "string"}},
+                                        "required": ["timezone"]
+                                    }
+                                }
+                            }
+                        ],
+                        "tool_choice": "required"
+                    })
+                    .to_string(),
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value = serde_json::from_slice(
+        &response
+            .into_body()
+            .collect()
+            .await
+            .expect("response body")
+            .to_bytes(),
+    )
+    .expect("response JSON");
+    assert_eq!(
+        body["choices"][0]["message"]["reasoning_content"],
+        "checked"
+    );
+    assert_eq!(body["choices"][0]["finish_reason"], "tool_calls");
+    assert_eq!(
+        body["choices"][0]["message"]["tool_calls"][0]["function"]["name"],
+        "weather"
+    );
+    assert_eq!(
+        body["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"],
+        "{\"city\":\"Beijing\"}"
+    );
+    assert_eq!(body["choices"][0]["message"]["tool_calls"][0]["index"], 0);
+    assert_eq!(body["choices"][0]["message"]["tool_calls"][1]["index"], 1);
+    assert_eq!(
+        body["choices"][0]["message"]["tool_calls"][1]["function"]["name"],
+        "clock"
+    );
+    assert_eq!(
+        body["choices"][0]["message"]["tool_calls"][1]["function"]["arguments"],
+        "{\"timezone\":\"UTC+8\"}"
+    );
+    let completions = capture.completions.lock().expect("completion capture");
+    assert_eq!(completions[0]["prompt"], json!([1, 2, 4, 5, 3]));
+}
+
+#[tokio::test]
+async fn malformed_parser_output_fails_closed_without_returning_buffered_content() {
+    let engine_url = spawn_malformed_parser_engine().await;
+    let (directory, config_path) = write_config();
+    let mut config = load_config(&config_path).expect("load config");
+    config.engines[0].base_url = engine_url;
+    let server = build_server(config, directory.path()).expect("build server");
+    let response = server
+        .app
+        .oneshot(
+            Request::post("/v1/chat/completions")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "fixture",
+                        "messages": [{"role": "user", "content": "hello"}],
+                        "reasoning_effort": "high"
+                    })
+                    .to_string(),
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let body: Value = serde_json::from_slice(
+        &response
+            .into_body()
+            .collect()
+            .await
+            .expect("response body")
+            .to_bytes(),
+    )
+    .expect("error JSON");
+    assert_eq!(body["error"]["code"], "internal_error");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("unterminated reasoning"))
+    );
+    assert!(!body.to_string().contains("private chain"));
 }
 
 #[tokio::test]
@@ -231,4 +443,21 @@ fn engine_must_reference_a_configured_model_alias() {
         Err(error) => error,
     };
     assert!(error.to_string().contains("unknown model alias missing"));
+}
+
+#[test]
+fn invalid_profile_parser_configuration_fails_startup() {
+    let (directory, config_path) = write_config();
+    let mut config = load_config(&config_path).expect("load config");
+    config.models[0].tool_parser = Some(ToolParserSettings::TaggedJson {
+        revision: "tool-envelope-v1".to_owned(),
+        start_delimiter: "<tool_call>".to_owned(),
+        end_delimiter: "</tool_call>".to_owned(),
+        max_buffered_bytes: 0,
+    });
+    let error = match build_server(config, directory.path()) {
+        Ok(_) => panic!("zero parser limit must fail startup"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("must be greater than zero"));
 }

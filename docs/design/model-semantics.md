@@ -8,9 +8,12 @@ factory, typed `SemanticEvent`s, function-call aggregation, reasoning events,
 and JSON structured-output validation. `locus-semantics-hf` now loads an exact
 Hugging Face `tokenizer.json`, renders a pinned chat template with bounded
 MiniJinja, decodes through the same tokenizer, and derives tokenizer/template
-identities from SHA-256 content digests. `ByteTokenizer`, `ByteDecoder`, and
-`SimpleTemplateRenderer` remain deterministic reference components. Multimodal
-normalization and model-specific reasoning/tool parsers remain future work.
+identities from SHA-256 content digests. Production profiles can bind strict
+tagged-reasoning and tagged-JSON tool parsers; parser revisions, delimiters, and
+limits participate in output identities and the umbrella fingerprint.
+`ByteTokenizer`, `ByteDecoder`, and `SimpleTemplateRenderer` remain deterministic
+reference components. Multimodal normalization and additional model output
+dialects remain future work.
 
 ## Purpose
 
@@ -144,10 +147,10 @@ source or private deployment data.
 Templates consume a typed context rather than an unrestricted process object.
 The production Hugging Face profile uses MiniJinja behind `TemplateRenderer`.
 It supplies conversation messages, an explicit `add_generation_prompt`, an
-empty tool list, and deployment-configured special-token values. Configuration
-cannot replace reserved fields. File, network, environment, clock, and
-arbitrary code access are unavailable during rendering, and rendered output is
-bounded by `max_rendered_bytes`.
+OpenAI-shaped function tool list and tool choice, and deployment-configured
+special-token values. Configuration cannot replace reserved fields. File,
+network, environment, clock, and arbitrary code access are unavailable during
+rendering, and rendered output is bounded by `max_rendered_bytes`.
 
 A template declares:
 
@@ -271,6 +274,12 @@ Malformed output follows an explicit profile policy: preserve it as ordinary
 content, return a parse error, or report a degraded parse. Silent loss is not
 valid.
 
+The implemented `tagged` parser selects distinct start and end delimiters from
+the model profile. It holds delimiter prefixes across transport chunks, emits
+reasoning incrementally, rejects stray, repeated, partial, or unterminated
+reserved syntax, and never reclassifies reasoning bytes as answer text. The
+current implementation uses the fail-closed parse-error policy.
+
 ## Tool-call parsers
 
 A tool parser transforms model output into typed call identifiers, function
@@ -286,6 +295,20 @@ The parser distinguishes:
 
 Tool definitions are validated before template rendering. Model-emitted tool
 names and arguments remain untrusted application data.
+
+The implemented `tagged_json` parser accepts one or more sequential envelopes:
+
+```text
+<tool_call>{"name":"weather","arguments":{"city":"Beijing"}}</tool_call>
+```
+
+Delimiters and a maximum buffered call size are profile configuration. A call is
+transactional: Locus buffers tentative syntax, requires an envelope containing
+exactly a non-empty `name` and object-valued `arguments`, then emits start,
+arguments, and completion events together. Unknown tools, a mismatch with an
+explicit function choice, malformed JSON, incomplete calls, duplicate call IDs,
+and inconsistent runtime finish reasons fail closed. Sequential calls receive
+stable request-scoped indices in observation order.
 
 ## Python compatibility boundary
 

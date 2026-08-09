@@ -403,11 +403,11 @@ The following stages are implemented and tested:
    crate;
 6. an optional NexusKV bridge through the complete state import handshake;
 7. a deployable configured server with exact Hugging Face tokenizer/template
-   profiles, authentication, ingress limits, readiness, request IDs, and
-   tracing; and
+   profiles, profile-bound reasoning/tool parsers, authentication, ingress
+   limits, readiness, request IDs, and tracing; and
 8. official OpenAI SDK E2E plus opt-in live-engine conformance tooling.
 
-The next production stages are model-specific reasoning/tool parsers,
+The next production stages are additional model-specific parser dialects,
 multimodal normalization, per-tenant admission and fairness, calibrated cost
 models, telemetry export, repeated live-runtime qualification, a deployed
 NexusKV bridge, physical state transfer, and topology/preload/replication

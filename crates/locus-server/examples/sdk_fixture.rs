@@ -22,7 +22,7 @@ use locus_openai::{ApiConfig, router_with_config};
 use locus_runtime::{DefaultInferenceService, InferenceService};
 use locus_semantics::{
     BasicModelSemantics, ByteDecoder, ByteTokenizer, ModelProfile, ModelRegistry,
-    SimpleTemplateRenderer,
+    SimpleTemplateRenderer, TaggedJsonToolParserDefinition, TaggedReasoningParserDefinition,
 };
 use locus_state::{NullStateProvider, StateProvider};
 use serde_json::json;
@@ -172,6 +172,56 @@ async fn main() {
             Arc::new(ByteDecoder),
         )))
         .expect("register fixture model");
+    let parser_model = ModelExecutionIdentity {
+        model_revision: "sdk-parser-fixture-v1".to_owned(),
+        adapter_revision: None,
+        execution_profile: "default".to_owned(),
+    };
+    let reasoning_parser_identity = component("tagged-reasoning-parser");
+    let tool_parser_identity = component("tagged-json-tool-parser");
+    let parser_semantic_identity = SemanticIdentity {
+        input: semantic_identity.input.clone(),
+        generation: semantic_identity.generation.clone(),
+        output: OutputSemanticIdentity {
+            detokenizer: semantic_identity.output.detokenizer.clone(),
+            reasoning_parser: Some(reasoning_parser_identity.clone()),
+            tool_parser: Some(tool_parser_identity.clone()),
+        },
+        umbrella_fingerprint: Some("sdk-parser-fixture-e2e-v1".to_owned()),
+    };
+    let parser_semantics = BasicModelSemantics::new(
+        ModelProfile {
+            public_aliases: vec!["locus-parser-test".to_owned()],
+            model: parser_model.clone(),
+            semantic_identity: parser_semantic_identity.clone(),
+        },
+        Arc::new(ByteTokenizer::new(
+            parser_semantic_identity.input.tokenizer.clone(),
+        )),
+        Arc::new(SimpleTemplateRenderer::new(
+            parser_semantic_identity.input.template.clone(),
+        )),
+        Arc::new(ByteDecoder),
+    )
+    .with_output_parsers(
+        Some(
+            TaggedReasoningParserDefinition::new(reasoning_parser_identity, "<think>", "</think>")
+                .expect("reasoning parser"),
+        ),
+        Some(
+            TaggedJsonToolParserDefinition::new(
+                tool_parser_identity,
+                "<tool_call>",
+                "</tool_call>",
+                4096,
+            )
+            .expect("tool parser"),
+        ),
+    )
+    .expect("bind parser definitions to fixture profile");
+    models
+        .register(Arc::new(parser_semantics))
+        .expect("register parser fixture model");
     let engine_ref = EngineInstanceRef {
         id: EngineInstanceId::new("sdk-fixture"),
         generation: 1,
@@ -225,6 +275,61 @@ async fn main() {
         delay: Duration::from_millis(40),
     });
     engines.register(adapter).expect("register fixture engine");
+    let parser_engine_ref = EngineInstanceRef {
+        id: EngineInstanceId::new("sdk-parser-fixture"),
+        generation: 1,
+    };
+    let parser_adapter: Arc<dyn EngineAdapter> = Arc::new(
+        FakeEngineAdapter::new(
+            EngineInstance {
+                reference: parser_engine_ref.clone(),
+                runtime: RuntimeIdentity {
+                    kind: "fake".to_owned(),
+                    runtime_version: "parser-e2e-v1".to_owned(),
+                    adapter_version: "parser-e2e-v1".to_owned(),
+                },
+                topology: "local".to_owned(),
+                hardware: "cpu".to_owned(),
+                health_endpoint: None,
+            },
+            ExecutionTarget {
+                id: ExecutionTargetId::new("sdk-parser-fixture/locus-parser-test"),
+                engine: parser_engine_ref,
+                model: parser_model,
+                role: ExecutionRole::Combined,
+                parallel_layout: ParallelLayout {
+                    tensor_parallel: 1,
+                    pipeline_parallel: 1,
+                    expert_parallel: 1,
+                    layout_revision: "parser-e2e-v1".to_owned(),
+                },
+                residency: "resident".to_owned(),
+                capability_revision: "parser-e2e-v1".to_owned(),
+            },
+            EngineCapabilities {
+                supported_input_kinds: BTreeSet::from([InputKind::TokenSequence]),
+                emits_token_deltas: false,
+                emits_text_deltas: true,
+                emits_reasoning_deltas: false,
+                emits_tool_calls: false,
+                supports_structured_output: false,
+                supported_state_kinds: BTreeSet::new(),
+            },
+        )
+        .with_output(FakeEngineOutput {
+            token_deltas: Vec::new(),
+            text_deltas: vec![
+                "<thi".to_owned(),
+                "nk>checked constraints</think><tool_".to_owned(),
+                "call>{\"name\":\"weather\",\"arguments\":{\"city\":\"Beijing\"}}".to_owned(),
+                "</tool_call>".to_owned(),
+            ],
+            ..FakeEngineOutput::default()
+        }),
+    );
+    engines
+        .register(parser_adapter)
+        .expect("register parser fixture engine");
     let state: Arc<dyn StateProvider> = Arc::new(NullStateProvider::default());
     let service: Arc<dyn InferenceService> =
         Arc::new(DefaultInferenceService::new(models, engines, state));

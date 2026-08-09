@@ -17,6 +17,19 @@
       "template_context": {
         "bos_token": "<s>",
         "eos_token": "</s>"
+      },
+      "reasoning_parser": {
+        "kind": "tagged",
+        "revision": "replace-with-reasoning-parser-revision",
+        "start_delimiter": "<think>",
+        "end_delimiter": "</think>"
+      },
+      "tool_parser": {
+        "kind": "tagged_json",
+        "revision": "replace-with-tool-parser-revision",
+        "start_delimiter": "<tool_call>",
+        "end_delimiter": "</tool_call>",
+        "max_buffered_bytes": 65536
       }
     }
   ],

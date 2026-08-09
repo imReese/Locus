@@ -89,14 +89,24 @@ impl RemoteCompletionAdapter {
                 "remote completion supports exactly one token sequence".to_owned(),
             ));
         }
-        if request
+        let has_tools = request
             .input
             .annotations
             .iter()
-            .any(|annotation| annotation.type_url == "locus.tool.v1")
-        {
+            .any(|annotation| annotation.type_url == "locus.tool.v1");
+        if has_tools && request.semantic_identity.output.tool_parser.is_none() {
             return Err(EngineError::Unsupported(
-                "function tools require a runtime-native parser adapter".to_owned(),
+                "function tools require a model-profile tool parser".to_owned(),
+            ));
+        }
+        if request.requirements.requires_tool_calls {
+            return Err(EngineError::Unsupported(
+                "remote completion adapter does not emit native tool-call events".to_owned(),
+            ));
+        }
+        if request.requirements.requires_reasoning_deltas {
+            return Err(EngineError::Unsupported(
+                "remote completion adapter does not emit native reasoning events".to_owned(),
             ));
         }
 

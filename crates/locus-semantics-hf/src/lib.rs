@@ -9,8 +9,9 @@ use locus_core::{
     OutputSemanticIdentity, SemanticComponentIdentity, SemanticIdentity, TokenSequence,
 };
 use locus_semantics::{
-    BasicModelSemantics, Conversation, ModelProfile, ModelSemantics, SemanticError,
-    TemplateRenderer, TokenDecoder, TokenizerProvider,
+    BasicModelSemantics, ModelProfile, ModelSemantics, SemanticError, SemanticRequest,
+    TaggedJsonToolParserDefinition, TaggedReasoningParserDefinition, TemplateRenderer,
+    TokenDecoder, TokenizerProvider, ToolChoice,
 };
 use minijinja::{Environment, Error as TemplateError, ErrorKind, UndefinedBehavior};
 use serde_json::{Value, json};
@@ -31,6 +32,23 @@ pub struct HuggingFaceProfileSpec {
     pub template_context: BTreeMap<String, Value>,
     pub add_generation_prompt: bool,
     pub max_rendered_bytes: usize,
+    pub reasoning_parser: Option<TaggedReasoningParserSpec>,
+    pub tool_parser: Option<TaggedJsonToolParserSpec>,
+}
+
+#[derive(Clone, Debug)]
+pub struct TaggedReasoningParserSpec {
+    pub revision: String,
+    pub start_delimiter: String,
+    pub end_delimiter: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct TaggedJsonToolParserSpec {
+    pub revision: String,
+    pub start_delimiter: String,
+    pub end_delimiter: String,
+    pub max_buffered_bytes: usize,
 }
 
 impl HuggingFaceProfileSpec {
@@ -51,6 +69,8 @@ impl HuggingFaceProfileSpec {
             template_context: BTreeMap::new(),
             add_generation_prompt: true,
             max_rendered_bytes: DEFAULT_MAX_RENDERED_BYTES,
+            reasoning_parser: None,
+            tool_parser: None,
         }
     }
 }
@@ -76,6 +96,8 @@ pub fn load_huggingface_semantics(
         revision: spec.template_revision.clone(),
         fingerprint: template_fingerprint.clone(),
     };
+    let (reasoning_identity, reasoning_parser) = build_reasoning_parser(&spec)?;
+    let (tool_identity, tool_parser) = build_tool_parser(&spec)?;
     let tokenizer = Tokenizer::from_bytes(tokenizer_bytes).map_err(|error| {
         HuggingFaceSemanticsError::InvalidTokenizer(format!(
             "failed to load {}: {error}",
@@ -88,6 +110,8 @@ pub fn load_huggingface_semantics(
         template_identity.clone(),
         &tokenizer_fingerprint,
         &template_fingerprint,
+        reasoning_identity,
+        tool_identity,
     );
     let tokenizer = Arc::new(HuggingFaceTokenizer {
         identity: tokenizer_identity,
@@ -100,7 +124,7 @@ pub fn load_huggingface_semantics(
         add_generation_prompt: spec.add_generation_prompt,
         max_rendered_bytes: spec.max_rendered_bytes,
     });
-    Ok(Arc::new(BasicModelSemantics::new(
+    let semantics = BasicModelSemantics::new(
         ModelProfile {
             public_aliases: spec.public_aliases,
             model: spec.model,
@@ -109,7 +133,96 @@ pub fn load_huggingface_semantics(
         tokenizer.clone(),
         renderer,
         tokenizer,
-    )))
+    )
+    .with_output_parsers(reasoning_parser, tool_parser)
+    .map_err(|error| HuggingFaceSemanticsError::InvalidProfile(error.to_string()))?;
+    Ok(Arc::new(semantics))
+}
+
+fn build_reasoning_parser(
+    spec: &HuggingFaceProfileSpec,
+) -> Result<
+    (
+        Option<SemanticComponentIdentity>,
+        Option<TaggedReasoningParserDefinition>,
+    ),
+    HuggingFaceSemanticsError,
+> {
+    let Some(parser) = &spec.reasoning_parser else {
+        return Ok((None, None));
+    };
+    let identity = parser_identity(
+        "locus-tagged-reasoning-parser",
+        &parser.revision,
+        &[
+            parser.start_delimiter.as_str(),
+            parser.end_delimiter.as_str(),
+        ],
+    )?;
+    let definition = TaggedReasoningParserDefinition::new(
+        identity.clone(),
+        parser.start_delimiter.clone(),
+        parser.end_delimiter.clone(),
+    )
+    .map_err(|error| HuggingFaceSemanticsError::InvalidProfile(error.to_string()))?;
+    Ok((Some(identity), Some(definition)))
+}
+
+fn build_tool_parser(
+    spec: &HuggingFaceProfileSpec,
+) -> Result<
+    (
+        Option<SemanticComponentIdentity>,
+        Option<TaggedJsonToolParserDefinition>,
+    ),
+    HuggingFaceSemanticsError,
+> {
+    let Some(parser) = &spec.tool_parser else {
+        return Ok((None, None));
+    };
+    let max_buffered_bytes = parser.max_buffered_bytes.to_string();
+    let identity = parser_identity(
+        "locus-tagged-json-tool-parser",
+        &parser.revision,
+        &[
+            parser.start_delimiter.as_str(),
+            parser.end_delimiter.as_str(),
+            max_buffered_bytes.as_str(),
+        ],
+    )?;
+    let definition = TaggedJsonToolParserDefinition::new(
+        identity.clone(),
+        parser.start_delimiter.clone(),
+        parser.end_delimiter.clone(),
+        parser.max_buffered_bytes,
+    )
+    .map_err(|error| HuggingFaceSemanticsError::InvalidProfile(error.to_string()))?;
+    Ok((Some(identity), Some(definition)))
+}
+
+fn parser_identity(
+    kind: &str,
+    revision: &str,
+    fields: &[&str],
+) -> Result<SemanticComponentIdentity, HuggingFaceSemanticsError> {
+    if revision.trim().is_empty() {
+        return Err(HuggingFaceSemanticsError::InvalidProfile(format!(
+            "{kind} revision must not be empty"
+        )));
+    }
+    let mut material = String::new();
+    for field in std::iter::once(kind)
+        .chain(std::iter::once(revision))
+        .chain(fields.iter().copied())
+    {
+        write!(&mut material, "{}:", field.len()).expect("writing to String cannot fail");
+        material.push_str(field);
+    }
+    Ok(SemanticComponentIdentity {
+        kind: kind.to_owned(),
+        revision: revision.to_owned(),
+        fingerprint: sha256(material.as_bytes()),
+    })
 }
 
 fn validate_spec(spec: &HuggingFaceProfileSpec) -> Result<(), HuggingFaceSemanticsError> {
@@ -137,7 +250,7 @@ fn validate_spec(spec: &HuggingFaceProfileSpec) -> Result<(), HuggingFaceSemanti
             "max_rendered_bytes must be greater than zero".to_owned(),
         ));
     }
-    for reserved in ["messages", "tools", "add_generation_prompt"] {
+    for reserved in ["messages", "tools", "tool_choice", "add_generation_prompt"] {
         if spec.template_context.contains_key(reserved) {
             return Err(HuggingFaceSemanticsError::InvalidProfile(format!(
                 "template_context cannot replace reserved field {reserved}"
@@ -160,6 +273,8 @@ fn semantic_identity(
     template: SemanticComponentIdentity,
     tokenizer_fingerprint: &str,
     template_fingerprint: &str,
+    reasoning_parser: Option<SemanticComponentIdentity>,
+    tool_parser: Option<SemanticComponentIdentity>,
 ) -> SemanticIdentity {
     let component = |kind: &str, revision: &str| SemanticComponentIdentity {
         kind: kind.to_owned(),
@@ -179,11 +294,20 @@ fn semantic_identity(
         },
         output: OutputSemanticIdentity {
             detokenizer: tokenizer,
-            reasoning_parser: None,
-            tool_parser: None,
+            reasoning_parser: reasoning_parser.clone(),
+            tool_parser: tool_parser.clone(),
         },
         umbrella_fingerprint: Some(sha256(
-            format!("{tokenizer_fingerprint}\n{template_fingerprint}\nlocus-profile-v1").as_bytes(),
+            format!(
+                "{tokenizer_fingerprint}\n{template_fingerprint}\n{}\n{}\nlocus-profile-v2",
+                reasoning_parser
+                    .as_ref()
+                    .map_or("none", |identity| identity.fingerprint.as_str()),
+                tool_parser
+                    .as_ref()
+                    .map_or("none", |identity| identity.fingerprint.as_str())
+            )
+            .as_bytes(),
         )),
     }
 }
@@ -231,12 +355,13 @@ impl TemplateRenderer for HuggingFaceTemplateRenderer {
         &self.identity
     }
 
-    fn render(&self, conversation: &Conversation) -> Result<String, SemanticError> {
+    fn render(&self, request: &SemanticRequest) -> Result<String, SemanticError> {
         let mut context = self.extra_context.clone();
         context.insert(
             "messages".to_owned(),
             Value::Array(
-                conversation
+                request
+                    .conversation
                     .messages
                     .iter()
                     .map(|message| {
@@ -249,7 +374,39 @@ impl TemplateRenderer for HuggingFaceTemplateRenderer {
                     .collect(),
             ),
         );
-        context.insert("tools".to_owned(), Value::Array(Vec::new()));
+        let tools = request
+            .tools
+            .iter()
+            .map(|tool| {
+                let parameters =
+                    serde_json::from_str::<Value>(&tool.parameters_schema).map_err(|error| {
+                        SemanticError::InvalidInput(format!(
+                            "invalid parameters schema for tool {}: {error}",
+                            tool.name
+                        ))
+                    })?;
+                let mut function = serde_json::Map::new();
+                function.insert("name".to_owned(), Value::String(tool.name.clone()));
+                function.insert("parameters".to_owned(), parameters);
+                function.insert("strict".to_owned(), Value::Bool(tool.strict));
+                if let Some(description) = &tool.description {
+                    function.insert("description".to_owned(), Value::String(description.clone()));
+                }
+                Ok(json!({"type": "function", "function": function}))
+            })
+            .collect::<Result<Vec<_>, SemanticError>>()?;
+        context.insert("tools".to_owned(), Value::Array(tools));
+        context.insert(
+            "tool_choice".to_owned(),
+            match &request.tool_choice {
+                ToolChoice::Auto => json!("auto"),
+                ToolChoice::None => json!("none"),
+                ToolChoice::Required => json!("required"),
+                ToolChoice::Function(name) => {
+                    json!({"type": "function", "function": {"name": name}})
+                }
+            },
+        );
         context.insert(
             "add_generation_prompt".to_owned(),
             Value::Bool(self.add_generation_prompt),

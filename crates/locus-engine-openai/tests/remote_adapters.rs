@@ -175,6 +175,24 @@ fn request(id: &str) -> CanonicalRequest {
     }
 }
 
+fn tool_request(id: &str, with_profile_parser: bool) -> CanonicalRequest {
+    let mut request = request(id);
+    request.input.annotations.push(TypedMetadata {
+        type_url: "locus.tool.v1".to_owned(),
+        fields: BTreeMap::from([
+            ("name".to_owned(), "weather".to_owned()),
+            (
+                "parameters".to_owned(),
+                json!({"type": "object"}).to_string(),
+            ),
+        ]),
+    });
+    if with_profile_parser {
+        request.semantic_identity.output.tool_parser = Some(component("tool-parser"));
+    }
+    request
+}
+
 async fn assert_completion(
     adapter: &dyn EngineAdapter,
     expected_request_field: &str,
@@ -219,6 +237,86 @@ async fn assert_completion(
     assert_eq!(body[expected_request_field], "req-remote");
 }
 
+async fn assert_profile_parser_tool_transport(adapter: &dyn EngineAdapter, capture: &Capture) {
+    let target = adapter
+        .execution_targets(&OperationContext::new(RequestId::new("discover-tools")))
+        .await
+        .expect("targets")
+        .remove(0);
+    let capabilities = adapter
+        .capabilities(
+            &target,
+            &OperationContext::new(RequestId::new("capabilities-tools")),
+        )
+        .await
+        .expect("capabilities");
+    assert!(!capabilities.emits_tool_calls);
+    let parser_request = tool_request("req-tools", true);
+    assert!(capabilities.satisfies(&parser_request.requirements));
+    adapter
+        .execute(
+            &target,
+            parser_request,
+            None,
+            OperationContext::new(RequestId::new("req-tools")),
+        )
+        .await
+        .expect("profile parser permits tool transport")
+        .try_collect::<Vec<_>>()
+        .await
+        .expect("collect events");
+    assert_eq!(
+        capture.completions.lock().expect("completion lock").len(),
+        1
+    );
+
+    let error = adapter
+        .execute(
+            &target,
+            tool_request("req-tools-no-parser", false),
+            None,
+            OperationContext::new(RequestId::new("req-tools-no-parser")),
+        )
+        .await
+        .err()
+        .expect("missing profile parser must reject tools");
+    assert!(error.to_string().contains("model-profile tool parser"));
+
+    let mut native_tool_request = tool_request("req-native-tools", true);
+    native_tool_request.requirements.requires_tool_calls = true;
+    let error = adapter
+        .execute(
+            &target,
+            native_tool_request,
+            None,
+            OperationContext::new(RequestId::new("req-native-tools")),
+        )
+        .await
+        .err()
+        .expect("native tool event requirement must be rejected");
+    assert!(error.to_string().contains("does not emit native tool-call"));
+
+    let mut native_reasoning_request = request("req-native-reasoning");
+    native_reasoning_request
+        .semantic_identity
+        .output
+        .reasoning_parser = Some(component("reasoning-parser"));
+    native_reasoning_request
+        .requirements
+        .requires_reasoning_deltas = true;
+    let error = adapter
+        .execute(
+            &target,
+            native_reasoning_request,
+            None,
+            OperationContext::new(RequestId::new("req-native-reasoning")),
+        )
+        .await
+        .err()
+        .expect("native reasoning event requirement must be rejected");
+    assert!(error.to_string().contains("does not emit native reasoning"));
+}
+
 #[tokio::test]
 async fn sglang_adapter_streams_pretokenized_completions_and_aborts_by_rid() {
     let (base_url, capture) = server().await;
@@ -235,6 +333,17 @@ async fn sglang_adapter_streams_pretokenized_completions_and_aborts_by_rid() {
         capture.aborts.lock().expect("abort lock").as_slice(),
         &[json!({"rid": "req-remote", "abort_all": false})]
     );
+}
+
+#[tokio::test]
+async fn sglang_and_vllm_transport_tool_prompts_only_with_a_profile_parser() {
+    let (sglang_url, sglang_capture) = server().await;
+    let sglang = SglangEngineAdapter::new(config(sglang_url, "sglang")).expect("adapter");
+    assert_profile_parser_tool_transport(&sglang, &sglang_capture).await;
+
+    let (vllm_url, vllm_capture) = server().await;
+    let vllm = VllmEngineAdapter::new(config(vllm_url, "vllm")).expect("adapter");
+    assert_profile_parser_tool_transport(&vllm, &vllm_capture).await;
 }
 
 #[tokio::test]

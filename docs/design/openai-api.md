@@ -58,7 +58,8 @@ inputs, hosted tools, logprobs, multiple choices, and full OpenAI API surface
 parity are outside the current subset. The serde DTOs use strict field checking
 so these gaps fail explicitly.
 
-Function calling and reasoning require an engine adapter that advertises typed
-tool and reasoning events. The current SGLang/vLLM pretokenized completion
-adapters do not advertise those capabilities; the API returns no-available-
-target rather than silently treating plain text as typed semantics.
+Function calling and reasoning require either compatible typed engine events or
+an explicitly configured model-profile parser. With a profile parser, planning
+requires incremental text rather than claiming the SGLang/vLLM completion
+adapter emits native typed events. Without either path, the API returns
+no-available-target; plain text is never silently treated as typed semantics.

@@ -31,6 +31,7 @@ def main() -> None:
     parser.add_argument("--base-url", default="http://127.0.0.1:18080/v1")
     parser.add_argument("--api-key", default="locus-test-key")
     parser.add_argument("--model", default="locus-test")
+    parser.add_argument("--parser-model", default="locus-parser-test")
     parser.add_argument(
         "--fixture-counts",
         action="store_true",
@@ -113,6 +114,86 @@ def main() -> None:
     )
     assert json.loads(structured.output_text) == {"answer": "ok"}
 
+    parsed = client.responses.create(
+        model=args.parser_model,
+        input="reason and call the weather tool",
+        reasoning={"effort": "high"},
+        tools=[
+            {
+                "type": "function",
+                "name": "weather",
+                "description": "Get weather for a city",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"],
+                    "additionalProperties": False,
+                },
+                "strict": True,
+            }
+        ],
+        tool_choice="required",
+    )
+    reasoning_items = [item for item in parsed.output if item.type == "reasoning"]
+    assert len(reasoning_items) == 1, parsed.output
+    assert reasoning_items[0].summary[0].text == "checked constraints"
+    function_calls = [item for item in parsed.output if item.type == "function_call"]
+    assert len(function_calls) == 1, parsed.output
+    assert function_calls[0].name == "weather"
+    assert json.loads(function_calls[0].arguments) == {"city": "Beijing"}
+
+    parser_reasoning = ""
+    parser_tool_name = None
+    parser_arguments = ""
+    parser_tool_indices: list[int] = []
+    parser_finish_reason = None
+    parser_chunks = client.chat.completions.create(
+        model=args.parser_model,
+        messages=[{"role": "user", "content": "call the weather tool"}],
+        reasoning_effort="high",
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "weather",
+                    "description": "Get weather for a city",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"city": {"type": "string"}},
+                        "required": ["city"],
+                        "additionalProperties": False,
+                    },
+                    "strict": True,
+                },
+            }
+        ],
+        tool_choice="required",
+        stream=True,
+    )
+    try:
+        for chunk in parser_chunks:
+            if not chunk.choices:
+                continue
+            choice = chunk.choices[0]
+            reasoning_delta = getattr(choice.delta, "reasoning_content", None)
+            if reasoning_delta:
+                parser_reasoning += reasoning_delta
+            for tool_call in choice.delta.tool_calls or []:
+                parser_tool_indices.append(tool_call.index)
+                if tool_call.function and tool_call.function.name:
+                    parser_tool_name = tool_call.function.name
+                if tool_call.function and tool_call.function.arguments:
+                    parser_arguments += tool_call.function.arguments
+            if choice.finish_reason:
+                parser_finish_reason = choice.finish_reason
+    finally:
+        parser_chunks.close()
+    assert parser_reasoning == "checked constraints", parser_reasoning
+    assert parser_tool_name == "weather", parser_tool_name
+    assert json.loads(parser_arguments) == {"city": "Beijing"}, parser_arguments
+    assert parser_tool_indices and set(parser_tool_indices) == {0}, parser_tool_indices
+    assert parser_finish_reason == "tool_calls", parser_finish_reason
+
     try:
         client.responses.create(model="missing-locus-model", input="fail")
     except openai.NotFoundError as error:
@@ -147,8 +228,15 @@ def main() -> None:
                 "sdk": "openai-python",
                 "sdk_version": openai.__version__,
                 "authentication": "invalid_api_key_rejected",
-                "responses": ["json", "sse", "structured_output", "error", "cancel"],
-                "chat_completions": ["json", "sse"],
+                "responses": [
+                    "json",
+                    "sse",
+                    "structured_output",
+                    "reasoning_tool_parser",
+                    "error",
+                    "cancel",
+                ],
+                "chat_completions": ["json", "sse", "reasoning_tool_parser_sse"],
             },
             sort_keys=True,
         )

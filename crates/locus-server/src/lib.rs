@@ -20,7 +20,10 @@ use locus_engine_openai::{RemoteEngineConfig, SglangEngineAdapter, VllmEngineAda
 use locus_openai::{ApiConfig, router_with_config};
 use locus_runtime::{DefaultInferenceService, InferenceService};
 use locus_semantics::ModelRegistry;
-use locus_semantics_hf::{HuggingFaceProfileSpec, load_huggingface_semantics};
+use locus_semantics_hf::{
+    HuggingFaceProfileSpec, TaggedJsonToolParserSpec, TaggedReasoningParserSpec,
+    load_huggingface_semantics,
+};
 use locus_state::{NullStateProvider, StateProvider};
 use locus_state_nexuskv::{NexusKvBridgeConfig, NexusKvStateProvider};
 use serde::Deserialize;
@@ -97,6 +100,66 @@ pub struct ModelSettings {
     pub add_generation_prompt: bool,
     #[serde(default = "default_max_rendered_bytes")]
     pub max_rendered_bytes: usize,
+    #[serde(default)]
+    pub reasoning_parser: Option<ReasoningParserSettings>,
+    #[serde(default)]
+    pub tool_parser: Option<ToolParserSettings>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ReasoningParserSettings {
+    Tagged {
+        revision: String,
+        start_delimiter: String,
+        end_delimiter: String,
+    },
+}
+
+impl ReasoningParserSettings {
+    fn profile_spec(&self) -> TaggedReasoningParserSpec {
+        match self {
+            Self::Tagged {
+                revision,
+                start_delimiter,
+                end_delimiter,
+            } => TaggedReasoningParserSpec {
+                revision: revision.clone(),
+                start_delimiter: start_delimiter.clone(),
+                end_delimiter: end_delimiter.clone(),
+            },
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ToolParserSettings {
+    TaggedJson {
+        revision: String,
+        start_delimiter: String,
+        end_delimiter: String,
+        #[serde(default = "default_max_tool_call_bytes")]
+        max_buffered_bytes: usize,
+    },
+}
+
+impl ToolParserSettings {
+    fn profile_spec(&self) -> TaggedJsonToolParserSpec {
+        match self {
+            Self::TaggedJson {
+                revision,
+                start_delimiter,
+                end_delimiter,
+                max_buffered_bytes,
+            } => TaggedJsonToolParserSpec {
+                revision: revision.clone(),
+                start_delimiter: start_delimiter.clone(),
+                end_delimiter: end_delimiter.clone(),
+                max_buffered_bytes: *max_buffered_bytes,
+            },
+        }
+    }
 }
 
 fn default_execution_profile() -> String {
@@ -109,6 +172,10 @@ const fn default_true() -> bool {
 
 const fn default_max_rendered_bytes() -> usize {
     4 * 1024 * 1024
+}
+
+const fn default_max_tool_call_bytes() -> usize {
+    64 * 1024
 }
 
 #[derive(Clone, Copy, Debug, Deserialize)]
@@ -283,6 +350,14 @@ pub fn build_server(
         spec.template_context.clone_from(&model.template_context);
         spec.add_generation_prompt = model.add_generation_prompt;
         spec.max_rendered_bytes = model.max_rendered_bytes;
+        spec.reasoning_parser = model
+            .reasoning_parser
+            .as_ref()
+            .map(ReasoningParserSettings::profile_spec);
+        spec.tool_parser = model
+            .tool_parser
+            .as_ref()
+            .map(ToolParserSettings::profile_spec);
         models.register(load_huggingface_semantics(spec)?)?;
         for alias in &model.aliases {
             model_by_alias.insert(alias.clone(), execution_identity.clone());

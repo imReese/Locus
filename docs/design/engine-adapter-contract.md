@@ -12,9 +12,11 @@ live runtime, GPU, latency, or native state-import result is claimed by CI. The
 opt-in `scripts/live_engine_conformance.py` harness checks a configured runtime's
 health, pretokenized completion SSE lifecycle, usage, finish reason, terminal
 sentinel, and cancellation transport, and emits a versioned evidence report.
-These completion adapters advertise structured-output support but not typed
-reasoning or tool-call events; requests requiring those capabilities are
-filtered before planning. A future runtime-native parser adapter may add them.
+These completion adapters advertise structured-output and text streaming but
+not native typed reasoning or tool-call events. A model profile may select local
+incremental parsers over that text stream; in that case the canonical request
+does not falsely require native typed engine events. Tool-bearing prompts cross
+the adapter only when the canonical semantic identity contains a tool parser.
 The vLLM adapter sends `add_special_tokens: false` because `ModelSemantics` has
 already rendered and tokenized the prompt; adapters must not add a second BOS.
 
