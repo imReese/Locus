@@ -60,3 +60,23 @@ jobs:
           done
           curl --fail --silent http://127.0.0.1:18080/readyz >/dev/null
           python scripts/openai_sdk_e2e.py --fixture-counts
+
+  nexuskv-bridge-e2e:
+    name: NexusKV cross-process bridge E2E
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: rust
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check out NexusKV bridge implementation
+        uses: actions/checkout@v4
+        with:
+          repository: imReese/NexusKV
+          path: NexusKV
+      - name: Install pinned Rust toolchain
+        run: rustup show active-toolchain
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Run real cross-process bridge conformance
+        run: python scripts/nexuskv_bridge_e2e.py --nexuskv-root "$GITHUB_WORKSPACE/NexusKV"

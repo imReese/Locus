@@ -1,0 +1,179 @@
+{
+  "schema_version": "locus.nexuskv-bridge.fixture.v1",
+  "entries": [
+    {
+      "reuse_key": {
+        "identity": {
+          "tenant": "tenant-a",
+          "namespace": "default",
+          "model": "model-v1",
+          "engine_family": "sglang",
+          "semantic_type": "mha_kv",
+          "tokens": [60, 117, 115, 101, 114, 62, 10, 117, 115, 101, 32, 99, 97, 99, 104, 101, 100, 32, 112, 114, 101, 102, 105, 120, 10, 60, 97, 115, 115, 105, 115, 116, 97, 110, 116, 62, 10],
+          "block_id": null,
+          "page_id": null
+        }
+      },
+      "entry": {
+        "identity": {
+          "key": {
+            "tenant": "tenant-a",
+            "namespace": "default",
+            "model": "model-v1",
+            "engine_family": "sglang",
+            "semantic_type": "mha_kv",
+            "tokens": [60, 117, 115, 101, 114, 62, 10, 117, 115, 101, 32, 99, 97, 99, 104, 101, 100, 32, 112, 114, 101, 102, 105, 120, 10, 60, 97, 115, 115, 105, 115, 116, 97, 110, 116, 62, 10],
+            "block_id": null,
+            "page_id": null
+          },
+          "entry_id": "nexus-state-1",
+          "version": {
+            "generation": 7,
+            "lineage": "lineage-a"
+          }
+        },
+        "descriptor": {
+          "schema_version": "nexuskv.contract.v1",
+          "descriptor_id": "sglang-mha-token",
+          "engine_family": "sglang",
+          "semantic_type": "mha_kv",
+          "granularity": "token",
+          "tensor_specs": [
+            {
+              "name": "k_cache",
+              "role": "key",
+              "dtype": "float16",
+              "shape": ["layers", "tokens", "heads", "head_dim"]
+            },
+            {
+              "name": "v_cache",
+              "role": "value",
+              "dtype": "float16",
+              "shape": ["layers", "tokens", "heads", "head_dim"]
+            }
+          ],
+          "quantization": {
+            "scheme": "none",
+            "bits": 16,
+            "group_size": 0
+          },
+          "layout": {
+            "layout": "contiguous",
+            "page_tokens": 1,
+            "block_tokens": 1,
+            "packed": false
+          },
+          "compatibility_flags": ["exact_reuse"],
+          "transfer_paths": [
+            {
+              "backend": "baseline_transport",
+              "capabilities": ["host_to_store", "store_to_host"]
+            }
+          ],
+          "materialization": {
+            "capabilities": ["full", "fallback_recompute"],
+            "tier_kinds": ["host_dram", "remote_shared"],
+            "device_classes": [],
+            "buffer_kinds": []
+          },
+          "layout_metadata": {
+            "engine_layout": "token_major"
+          }
+        },
+        "location": {
+          "tier": "host_dram",
+          "locator": "node://node-a/state/nexus-state-1"
+        },
+        "policy_hint": {
+          "reusable": true,
+          "admission_hint": "locus_conformance",
+          "eviction_hint": "retain"
+        }
+      },
+      "validation": {
+        "model_identity": {
+          "model_revision": "model-v1",
+          "adapter_revision": null,
+          "execution_profile": "default"
+        },
+        "input_semantic_identity": {
+          "tokenizer": {
+            "kind": "tokenizer",
+            "revision": "v1",
+            "fingerprint": "tokenizer-v1"
+          },
+          "template": {
+            "kind": "template",
+            "revision": "v1",
+            "fingerprint": "template-v1"
+          },
+          "multimodal_preprocessing": null
+        },
+        "input_fingerprint": "locus-input-fnv1a64-v1:f6755988a8038602"
+      }
+    }
+  ],
+  "requests": {
+    "lookup": {
+      "schema_version": "locus.nexuskv-bridge.v1",
+      "nexuskv_schema_version": "nexuskv.contract.v1",
+      "identity": {
+        "tenant": "tenant-a",
+        "namespace": "default",
+        "model": "model-v1",
+        "engine_family": "sglang",
+        "semantic_type": "mha_kv",
+        "tokens": [60, 117, 115, 101, 114, 62, 10, 117, 115, 101, 32, 99, 97, 99, 104, 101, 100, 32, 112, 114, 101, 102, 105, 120, 10, 60, 97, 115, 115, 105, 115, 116, 97, 110, 116, 62, 10]
+      },
+      "locus_model_identity": {
+        "model_revision": "model-v1",
+        "adapter_revision": null,
+        "execution_profile": "default"
+      },
+      "locus_input_semantic_identity": {
+        "tokenizer": {
+          "kind": "tokenizer",
+          "revision": "v1",
+          "fingerprint": "tokenizer-v1"
+        },
+        "template": {
+          "kind": "template",
+          "revision": "v1",
+          "fingerprint": "template-v1"
+        },
+        "multimodal_preprocessing": null
+      },
+      "input_fingerprint": "locus-input-fnv1a64-v1:f6755988a8038602"
+    },
+    "estimate": {
+      "schema_version": "locus.nexuskv-bridge.v1",
+      "source_state": "nexus-state-1",
+      "source_handle": "$lookup.match_result.validation.source_handle",
+      "source_locator": "node://node-a/state/nexus-state-1",
+      "source_tier": "host_dram",
+      "target_id": "target-1",
+      "target_engine_id": "engine-1",
+      "target_engine_generation": 1,
+      "target_residency": "node-a"
+    },
+    "materialize": {
+      "schema_version": "locus.nexuskv-bridge.v1",
+      "option_id": "$estimate.option_id",
+      "option_handle": "$estimate.option_handle",
+      "import_id": "import-1",
+      "target_id": "target-1",
+      "target_engine_id": "engine-1",
+      "target_engine_generation": 1,
+      "sink_namespace": "locus.fake.engine-sink.v1",
+      "sink_value": "sink-1"
+    }
+  },
+  "expectations": {
+    "matched_state": "nexus-state-1",
+    "locality": "local",
+    "receipt_namespace": "nexuskv.protocol-transfer-receipt.v1",
+    "bytes_transferred": 0,
+    "evidence_level": "protocol",
+    "physical_transfer_verified": false
+  }
+}

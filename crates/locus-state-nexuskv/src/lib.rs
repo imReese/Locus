@@ -36,6 +36,8 @@ pub struct NexusKvStateProvider {
 
 #[derive(Clone)]
 struct NexusStateRecord {
+    source_state: String,
+    source_handle: String,
     source_locator: String,
     source_tier: String,
 }
@@ -125,6 +127,10 @@ impl StateProvider for NexusKvStateProvider {
         let tokens = requirement.query_token_ids.as_ref().ok_or_else(|| {
             StateError::Unsupported("NexusKV lookup requires canonical token IDs".to_owned())
         })?;
+        let tenant = requirement
+            .tenant_scope
+            .as_deref()
+            .unwrap_or(&self.config.tenant);
         let response: LookupResponse = self
             .post(
                 "lookup",
@@ -132,10 +138,7 @@ impl StateProvider for NexusKvStateProvider {
                     schema_version: BRIDGE_SCHEMA,
                     nexuskv_schema_version: NEXUSKV_SCHEMA,
                     identity: LookupIdentity {
-                        tenant: requirement
-                            .tenant_scope
-                            .as_deref()
-                            .unwrap_or(&self.config.tenant),
+                        tenant,
                         namespace: &self.config.namespace,
                         model: &requirement.model.model_revision,
                         engine_family: &self.config.engine_family,
@@ -187,7 +190,8 @@ impl StateProvider for NexusKvStateProvider {
         if hit.matched_extent.units == 0 {
             return Ok(Vec::new());
         }
-        let state_id = StateId::new(hit.entry.identity.entry_id.clone());
+        let source_state = hit.entry.identity.entry_id.clone();
+        let state_id = provider_state_id(tenant, &self.config.namespace, &source_state);
         let state_kind = StateKind::new(format!("nexuskv.{}", hit.entry.descriptor.semantic_type));
         if !requirement.accepted_state_kinds.contains(&state_kind) {
             return Ok(Vec::new());
@@ -198,6 +202,8 @@ impl StateProvider for NexusKvStateProvider {
             .insert(
                 state_id.clone(),
                 NexusStateRecord {
+                    source_state,
+                    source_handle: hit.validation.source_handle,
                     source_locator: hit.entry.location.locator.clone(),
                     source_tier: hit.entry.location.tier.clone(),
                 },
@@ -258,7 +264,8 @@ impl StateProvider for NexusKvStateProvider {
                 "estimate",
                 &EstimateRequest {
                     schema_version: BRIDGE_SCHEMA,
-                    source_state: state.id.as_str(),
+                    source_state: &record.source_state,
+                    source_handle: &record.source_handle,
                     source_locator: &record.source_locator,
                     source_tier: &record.source_tier,
                     target_id: target.id.as_str(),
@@ -347,6 +354,21 @@ impl StateProvider for NexusKvStateProvider {
                 response.schema_version
             )));
         }
+        match (
+            response.evidence.level.as_str(),
+            response.evidence.physical_transfer_verified,
+        ) {
+            ("protocol", false)
+                if response.bytes_transferred == 0
+                    && response.receipt.namespace == "nexuskv.protocol-transfer-receipt.v1" => {}
+            ("physical", true)
+                if response.receipt.namespace != "nexuskv.protocol-transfer-receipt.v1" => {}
+            _ => {
+                return Err(StateError::Protocol(
+                    "NexusKV materialization evidence is internally inconsistent".to_owned(),
+                ));
+            }
+        }
         Ok(TransferReceipt {
             import_id: target.import_id.clone(),
             provider: self.identity.clone(),
@@ -374,6 +396,14 @@ fn component_ref(component: &locus_core::SemanticComponentIdentity) -> Component
         revision: &component.revision,
         fingerprint: &component.fingerprint,
     }
+}
+
+fn provider_state_id(tenant: &str, namespace: &str, entry_id: &str) -> StateId {
+    StateId::new(format!(
+        "nexuskv:{}:{tenant}:{}:{namespace}:{entry_id}",
+        tenant.len(),
+        namespace.len()
+    ))
 }
 
 #[derive(Serialize)]
@@ -490,6 +520,7 @@ struct NexusCompatibility {
 struct LocusValidation {
     model_identity: ValidatedModelIdentity,
     input_semantic_identity: ValidatedInputSemanticIdentity,
+    source_handle: String,
 }
 
 impl LocusValidation {
@@ -551,6 +582,7 @@ impl ValidatedComponentIdentity {
 struct EstimateRequest<'a> {
     schema_version: &'static str,
     source_state: &'a str,
+    source_handle: &'a str,
     source_locator: &'a str,
     source_tier: &'a str,
     target_id: &'a str,
@@ -587,10 +619,17 @@ struct MaterializeResponse {
     schema_version: String,
     bytes_transferred: u64,
     receipt: ReceiptHandle,
+    evidence: MaterializationEvidence,
 }
 
 #[derive(Deserialize)]
 struct ReceiptHandle {
     namespace: String,
     value: String,
+}
+
+#[derive(Deserialize)]
+struct MaterializationEvidence {
+    level: String,
+    physical_transfer_verified: bool,
 }

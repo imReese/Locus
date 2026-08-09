@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex};
 use axum::Json;
 use axum::Router;
 use axum::extract::State;
+use axum::http::StatusCode;
 use axum::routing::post;
 use futures::TryStreamExt;
 use locus_core::{
@@ -29,6 +30,7 @@ struct Capture {
     estimates: Arc<Mutex<Vec<Value>>>,
     materializations: Arc<Mutex<Vec<Value>>>,
     mismatch_validation: bool,
+    fail_materialization: bool,
 }
 
 async fn lookup(State(capture): State<Capture>, Json(body): Json<Value>) -> Json<Value> {
@@ -71,7 +73,8 @@ async fn lookup(State(capture): State<Capture>, Json(body): Json<Value>) -> Json
             },
             "validation": {
                 "model_identity": body["locus_model_identity"],
-                "input_semantic_identity": input_semantics
+                "input_semantic_identity": input_semantics,
+                "source_handle": "source-capability-1"
             }
         }
     }))
@@ -93,22 +96,48 @@ async fn estimate(State(capture): State<Capture>, Json(body): Json<Value>) -> Js
     }))
 }
 
-async fn materialize(State(capture): State<Capture>, Json(body): Json<Value>) -> Json<Value> {
+async fn materialize(
+    State(capture): State<Capture>,
+    Json(body): Json<Value>,
+) -> (StatusCode, Json<Value>) {
     capture
         .materializations
         .lock()
         .expect("materialization capture")
         .push(body);
-    Json(json!({
-        "schema_version": "locus.nexuskv-bridge.v1",
-        "bytes_transferred": 4096,
-        "receipt": {"namespace": "nexuskv.transfer-receipt.v1", "value": "receipt-1"}
-    }))
+    if capture.fail_materialization {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "schema_version": "locus.nexuskv-bridge.v1",
+                "error": {
+                    "code": "materialization_unavailable",
+                    "message": "injected bridge materialization failure"
+                }
+            })),
+        );
+    }
+    (
+        StatusCode::OK,
+        Json(json!({
+            "schema_version": "locus.nexuskv-bridge.v1",
+            "bytes_transferred": 0,
+            "receipt": {
+                "namespace": "nexuskv.protocol-transfer-receipt.v1",
+                "value": "receipt-1"
+            },
+            "evidence": {
+                "level": "protocol",
+                "physical_transfer_verified": false
+            }
+        })),
+    )
 }
 
-async fn bridge(mismatch_validation: bool) -> (String, Capture) {
+async fn bridge(mismatch_validation: bool, fail_materialization: bool) -> (String, Capture) {
     let capture = Capture {
         mismatch_validation,
+        fail_materialization,
         ..Capture::default()
     };
     let app = Router::new()
@@ -162,13 +191,14 @@ fn identities() -> (ModelExecutionIdentity, SemanticIdentity) {
     )
 }
 
-#[tokio::test]
-async fn nexuskv_bridge_runs_lookup_estimate_and_import_handshake_end_to_end() {
-    let (base_url, capture) = bridge(false).await;
+fn inference_service(
+    base_url: String,
+    api_key: Option<String>,
+) -> (DefaultInferenceService, Arc<FakeEngineAdapter>) {
     let provider: Arc<dyn StateProvider> = Arc::new(
         NexusKvStateProvider::new(NexusKvBridgeConfig {
             base_url,
-            api_key: Some("bridge-secret".to_owned()),
+            api_key,
             tenant: "tenant-a".to_owned(),
             namespace: "default".to_owned(),
             engine_family: "sglang".to_owned(),
@@ -243,7 +273,13 @@ async fn nexuskv_bridge_runs_lookup_estimate_and_import_handshake_end_to_end() {
     );
     let engines = EngineRegistry::new();
     engines.register(adapter.clone()).expect("register engine");
-    let service = DefaultInferenceService::new(models, engines, provider);
+    (
+        DefaultInferenceService::new(models, engines, provider),
+        adapter,
+    )
+}
+
+async fn run_inference(service: &DefaultInferenceService, request_id: &str) {
     service
         .infer(
             SemanticRequest {
@@ -257,13 +293,20 @@ async fn nexuskv_bridge_runs_lookup_estimate_and_import_handshake_end_to_end() {
                 },
                 ..SemanticRequest::default()
             },
-            OperationContext::new(RequestId::new("req-nexus")),
+            OperationContext::new(RequestId::new(request_id)),
         )
         .await
         .expect("start inference")
         .try_collect::<Vec<_>>()
         .await
         .expect("collect inference");
+}
+
+#[tokio::test]
+async fn nexuskv_bridge_runs_lookup_estimate_and_import_handshake_end_to_end() {
+    let (base_url, capture) = bridge(false, false).await;
+    let (service, adapter) = inference_service(base_url, Some("bridge-secret".to_owned()));
+    run_inference(&service, "req-nexus").await;
 
     assert_eq!(adapter.call_counts().prepare, 1);
     assert_eq!(adapter.call_counts().commit, 1);
@@ -277,11 +320,35 @@ async fn nexuskv_bridge_runs_lookup_estimate_and_import_handshake_end_to_end() {
         "locus.fake.engine-sink.v1"
     );
     assert_eq!(materializations[0]["target_engine_generation"], 1);
+    let estimates = capture.estimates.lock().expect("estimates");
+    assert_eq!(estimates[0]["source_state"], "nexus-state-1");
+    assert_eq!(estimates[0]["source_handle"], "source-capability-1");
+}
+
+#[tokio::test]
+async fn nexuskv_bridge_materialization_failure_aborts_and_falls_back_cold() {
+    let (base_url, capture) = bridge(false, true).await;
+    let (service, adapter) = inference_service(base_url, None);
+    run_inference(&service, "req-fallback").await;
+
+    let calls = adapter.call_counts();
+    assert_eq!(calls.prepare, 1);
+    assert_eq!(calls.commit, 0);
+    assert_eq!(calls.abort, 1);
+    assert_eq!(calls.execute, 1);
+    assert_eq!(
+        capture
+            .materializations
+            .lock()
+            .expect("materializations")
+            .len(),
+        1
+    );
 }
 
 #[tokio::test]
 async fn nexuskv_bridge_fails_closed_on_semantic_validation_mismatch() {
-    let (base_url, _) = bridge(true).await;
+    let (base_url, _) = bridge(true, false).await;
     let provider = NexusKvStateProvider::new(NexusKvBridgeConfig {
         base_url,
         api_key: None,
