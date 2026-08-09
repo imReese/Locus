@@ -24,8 +24,9 @@ API gateway or reverse proxy.
 > server process, content-addressed Hugging Face tokenizer/chat-template
 > profiles, OpenAI Responses and Chat Completions, SGLang/vLLM completion
 > adapters, and an optional NexusKV bridge. CI validates the official OpenAI
-> Python SDK against a real local HTTP server. Live GPU serving and NexusKV
-> physical transfer remain opt-in validations and are not claimed by CI.
+> Python SDK against a real local HTTP server and runs Locus against a separate
+> NexusKV bridge process. Live GPU serving and NexusKV physical transfer remain
+> opt-in validations and are not claimed by CI.
 
 ## Why Locus?
 
@@ -203,10 +204,10 @@ that define the core architecture. Wire formats and Rust APIs remain pre-1.0.
   explicitly configured live runtime, but no live runtime or GPU result is
   checked into or implied by CI.
 - The NexusKV provider requires a separately deployed
-  `locus.nexuskv-bridge.v1` service. The current NexusKV repository exposes the
-  underlying contract and execution abstractions but not these HTTP endpoints.
-  The complete Locus handshake is tested against a bridge double; physical
-  transfer remains unverified.
+  `locus.nexuskv-bridge.v1` service. NexusKV now ships those endpoints, and CI
+  starts that implementation in a separate process with the real Rust matcher.
+  Shared fixtures and the complete Locus prepare/materialize/commit handshake
+  are enforced; native engine import and physical transfer remain unverified.
 - Bearer authentication, global body/concurrency limits, readiness, request IDs,
   and structured tracing are implemented. Per-tenant rate/fairness admission,
   calibrated costs, telemetry export, multimodal normalization, and production

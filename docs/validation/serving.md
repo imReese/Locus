@@ -2,17 +2,19 @@
 
 ## Evidence policy
 
-Locus keeps four evidence levels separate:
+Locus keeps these evidence levels separate:
 
 | Level | What runs | What it establishes |
 | --- | --- | --- |
 | Static and deterministic | Rust tests, strict Clippy, rustdoc, mock HTTP/SSE | Local contracts, ownership, shape, ordering, and failure policy |
 | Real local HTTP client | Official OpenAI Python SDK against `sdk_fixture` | SDK parsing and transport compatibility through a real socket |
+| Cross-process state protocol | Locus against a separate NexusKV process with the Rust matcher | Versioned lookup/estimate/materialize compatibility and prepare/commit orchestration |
 | Live engine | Opt-in SGLang/vLLM harness | Observed behavior of one configured runtime endpoint and model |
 | Live state/hardware | GPU topology, performance, and physical NexusKV transfer | Production properties that mocks and protocol oracles cannot establish |
 
-GitHub CI runs the first two levels. It does not have a configured model server,
-GPU, or NexusKV bridge, so it cannot promote its result to either live level.
+GitHub CI runs the first three levels. It does not have a configured model
+server, GPU, native engine state-import path, or physical NexusKV transport, so
+it cannot promote its result to either live level.
 
 ## Repository gate
 
@@ -24,7 +26,9 @@ bash scripts/ci.sh
 
 It runs formatting, workspace-wide strict Clippy, all-feature tests, rustdoc with
 warnings denied, and Python syntax checks. The `CI` GitHub workflow then starts a
-real local Locus fixture and installs the pinned official `openai` Python SDK.
+real local Locus fixture for the pinned official `openai` Python SDK. A separate
+job checks out NexusKV, starts its bridge process, and runs the shared bridge
+conformance fixture through the Locus planner and import handshake.
 
 ## Official OpenAI SDK E2E
 
@@ -96,5 +100,7 @@ deployment secrets or private endpoint details with a result.
 
 The official SDK fixture passed locally with `openai` 2.53.0 and is enforced by
 GitHub CI. SGLang and vLLM adapter behavior is covered by deterministic mock
-HTTP/SSE tests. No live GPU engine or physical NexusKV transfer was available in
-this workspace, so those evidence levels remain unverified rather than failed.
+HTTP/SSE tests. The cross-process NexusKV protocol path is also automated with
+protocol-only, zero-byte transfer evidence. No live GPU engine, native engine
+state import, or physical NexusKV transfer was available in this workspace, so
+those evidence levels remain unverified rather than failed.
