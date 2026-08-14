@@ -7,7 +7,7 @@ use axum::http::{Request, Response, StatusCode, header};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use http_body_util::BodyExt;
-use locus_server::{ToolParserSettings, build_server, load_config};
+use locus_server::{EngineModelSettings, ToolParserSettings, build_server, load_config};
 use serde_json::{Value, json};
 use tempfile::tempdir;
 use tokenizers::Tokenizer;
@@ -18,10 +18,31 @@ use tower::ServiceExt;
 #[derive(Clone, Default)]
 struct EngineCapture {
     completions: Arc<Mutex<Vec<Value>>>,
+    models: Arc<Mutex<Vec<String>>>,
+}
+
+impl EngineCapture {
+    fn with_models(models: impl IntoIterator<Item = String>) -> Self {
+        Self {
+            completions: Arc::default(),
+            models: Arc::new(Mutex::new(models.into_iter().collect())),
+        }
+    }
 }
 
 async fn engine_health() -> &'static str {
     "ok"
+}
+
+async fn engine_models(State(capture): State<EngineCapture>) -> Json<Value> {
+    let data = capture
+        .models
+        .lock()
+        .expect("model inventory")
+        .iter()
+        .map(|id| json!({"id": id, "object": "model"}))
+        .collect::<Vec<_>>();
+    Json(json!({"object": "list", "data": data}))
 }
 
 async fn engine_completion(
@@ -76,9 +97,16 @@ async fn malformed_parser_engine_completion() -> Response<Body> {
 }
 
 async fn spawn_engine() -> (String, EngineCapture) {
-    let capture = EngineCapture::default();
+    spawn_engine_with_models(["fixture".to_owned()]).await
+}
+
+async fn spawn_engine_with_models(
+    models: impl IntoIterator<Item = String>,
+) -> (String, EngineCapture) {
+    let capture = EngineCapture::with_models(models);
     let app = Router::new()
         .route("/health", get(engine_health))
+        .route("/v1/models", get(engine_models))
         .route("/v1/completions", post(engine_completion))
         .with_state(capture.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -92,9 +120,10 @@ async fn spawn_engine() -> (String, EngineCapture) {
 }
 
 async fn spawn_parser_engine() -> (String, EngineCapture) {
-    let capture = EngineCapture::default();
+    let capture = EngineCapture::with_models(["fixture".to_owned()]);
     let app = Router::new()
         .route("/health", get(engine_health))
+        .route("/v1/models", get(engine_models))
         .route("/v1/completions", post(parser_engine_completion))
         .with_state(capture.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -110,9 +139,12 @@ async fn spawn_parser_engine() -> (String, EngineCapture) {
 }
 
 async fn spawn_malformed_parser_engine() -> String {
+    let capture = EngineCapture::with_models(["fixture".to_owned()]);
     let app = Router::new()
         .route("/health", get(engine_health))
-        .route("/v1/completions", post(malformed_parser_engine_completion));
+        .route("/v1/models", get(engine_models))
+        .route("/v1/completions", post(malformed_parser_engine_completion))
+        .with_state(capture);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind malformed parser engine");
@@ -367,7 +399,7 @@ async fn relative_profile_paths_build_a_server_with_request_ids() {
             .to_bytes(),
     )
     .expect("models JSON");
-    assert_eq!(body["data"][0]["id"], "fixture");
+    assert_eq!(body["data"], json!([]));
 
     let readiness = server
         .app
@@ -484,12 +516,171 @@ async fn configured_raw_completion_bypasses_chat_template_and_forwards_stop() {
 fn engine_must_reference_a_configured_model_alias() {
     let (directory, config_path) = write_config();
     let mut config = load_config(&config_path).expect("load config");
-    config.engines[0].model = "missing".to_owned();
+    config.engines[0].model = Some("missing".to_owned());
     let error = match build_server(config, directory.path()) {
         Ok(_) => panic!("unknown model alias must fail"),
         Err(error) => error,
     };
-    assert!(error.to_string().contains("unknown model alias missing"));
+    assert!(error.to_string().contains("unknown model profile missing"));
+}
+
+#[tokio::test]
+async fn dynamic_inventory_exposes_only_routable_catalog_profiles() {
+    let (engine_url, _) = spawn_engine().await;
+    let (directory, config_path) = write_config();
+    let mut config = load_config(&config_path).expect("load config");
+    let mut offline = config.models[0].clone();
+    offline.aliases = vec!["offline".to_owned()];
+    offline.model_revision = "offline-v1".to_owned();
+    config.models.push(offline);
+    config.engines[0].base_url = engine_url;
+    config.engines[0].served_model = None;
+    config.engines[0].model = None;
+    config.engines[0].target_id = None;
+    let server = build_server(config, directory.path()).expect("build server");
+
+    let readiness = server
+        .app
+        .clone()
+        .oneshot(
+            Request::get("/readyz")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("readiness response");
+    assert_eq!(readiness.status(), StatusCode::OK);
+    let readiness_body: Value = serde_json::from_slice(
+        &readiness
+            .into_body()
+            .collect()
+            .await
+            .expect("readiness body")
+            .to_bytes(),
+    )
+    .expect("readiness JSON");
+    assert_eq!(readiness_body["model_profiles"], 2);
+    assert_eq!(readiness_body["routable_models"], 1);
+
+    let models = server
+        .app
+        .clone()
+        .oneshot(
+            Request::get("/v1/models")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("models response");
+    let models_body: Value = serde_json::from_slice(
+        &models
+            .into_body()
+            .collect()
+            .await
+            .expect("models body")
+            .to_bytes(),
+    )
+    .expect("models JSON");
+    assert_eq!(models_body["data"].as_array().map(Vec::len), Some(1));
+    assert_eq!(models_body["data"][0]["id"], "fixture");
+
+    let unavailable = server
+        .app
+        .oneshot(
+            Request::post("/v1/responses")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({"model": "offline", "input": "hello"}).to_string(),
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("unavailable response");
+    assert_eq!(unavailable.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let unavailable_body: Value = serde_json::from_slice(
+        &unavailable
+            .into_body()
+            .collect()
+            .await
+            .expect("unavailable body")
+            .to_bytes(),
+    )
+    .expect("unavailable JSON");
+    assert_eq!(unavailable_body["error"]["code"], "no_available_target");
+}
+
+#[tokio::test]
+async fn required_models_gate_readiness_explicitly() {
+    let (engine_url, _) = spawn_engine().await;
+    let (directory, config_path) = write_config();
+    let mut config = load_config(&config_path).expect("load config");
+    let mut offline = config.models[0].clone();
+    offline.aliases = vec!["offline".to_owned()];
+    offline.model_revision = "offline-v1".to_owned();
+    config.models.push(offline);
+    config.required_models = vec!["offline".to_owned()];
+    config.engines[0].base_url = engine_url;
+    config.engines[0].served_model = None;
+    config.engines[0].model = None;
+    config.engines[0].target_id = None;
+    let server = build_server(config, directory.path()).expect("build server");
+
+    let readiness = server
+        .app
+        .oneshot(
+            Request::get("/readyz")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("readiness response");
+    assert_eq!(readiness.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = String::from_utf8(
+        readiness
+            .into_body()
+            .collect()
+            .await
+            .expect("readiness body")
+            .to_bytes()
+            .to_vec(),
+    )
+    .expect("UTF-8 readiness body");
+    assert!(body.contains("required models without a ready target: offline"));
+}
+
+#[tokio::test]
+async fn explicit_mapping_translates_catalog_alias_to_upstream_model() {
+    let (engine_url, capture) = spawn_engine_with_models(["upstream-fixture".to_owned()]).await;
+    let (directory, config_path) = write_config();
+    let mut config = load_config(&config_path).expect("load config");
+    config.engines[0].base_url = engine_url;
+    config.engines[0].served_model = None;
+    config.engines[0].model = None;
+    config.engines[0].target_id = None;
+    config.engines[0].model_mappings = vec![EngineModelSettings {
+        upstream_model: "upstream-fixture".to_owned(),
+        profile: "fixture".to_owned(),
+        target_id: None,
+    }];
+    let server = build_server(config, directory.path()).expect("build server");
+
+    let response = server
+        .app
+        .oneshot(
+            Request::post("/v1/responses")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({"model": "fixture", "input": "hello"}).to_string(),
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        capture.completions.lock().expect("completion capture")[0]["model"],
+        "upstream-fixture"
+    );
 }
 
 #[test]

@@ -16,7 +16,9 @@ use locus_core::{
     ExecutionTargetId, ModelExecutionIdentity, ParallelLayout, RuntimeIdentity,
 };
 use locus_engine::{EngineAdapter, EngineRegistry};
-use locus_engine_openai::{RemoteEngineConfig, SglangEngineAdapter, VllmEngineAdapter};
+use locus_engine_openai::{
+    RemoteEngineConfig, RemoteExecutionTarget, SglangEngineAdapter, VllmEngineAdapter,
+};
 use locus_openai::{ApiConfig, router_with_config};
 use locus_runtime::{DefaultInferenceService, InferenceService};
 use locus_semantics::ModelRegistry;
@@ -45,6 +47,8 @@ pub struct ServerConfig {
     #[serde(default)]
     pub api: ApiSettings,
     pub models: Vec<ModelSettings>,
+    #[serde(default)]
+    pub required_models: Vec<String>,
     pub engines: Vec<EngineSettings>,
     #[serde(default)]
     pub state: StateSettings,
@@ -204,8 +208,15 @@ pub struct EngineSettings {
     pub base_url: String,
     #[serde(default)]
     pub api_key_env: Option<String>,
-    pub served_model: String,
-    pub model: String,
+    /// Optional explicit upstream-name to semantic-profile mappings. When this
+    /// is empty, every public catalog alias is a discovery candidate.
+    #[serde(default)]
+    pub model_mappings: Vec<EngineModelSettings>,
+    /// Legacy single-model fields retained for configuration compatibility.
+    #[serde(default)]
+    pub served_model: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
     pub runtime_version: String,
     #[serde(default = "default_adapter_version")]
     pub adapter_version: String,
@@ -215,7 +226,8 @@ pub struct EngineSettings {
     pub hardware: String,
     #[serde(default)]
     pub health_endpoint: Option<String>,
-    pub target_id: String,
+    #[serde(default)]
+    pub target_id: Option<String>,
     #[serde(default = "default_residency")]
     pub residency: String,
     #[serde(default = "default_capability_revision")]
@@ -228,6 +240,21 @@ pub struct EngineSettings {
     pub expert_parallel: u16,
     #[serde(default = "default_layout_revision")]
     pub layout_revision: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EngineModelSettings {
+    pub upstream_model: String,
+    pub profile: String,
+    #[serde(default)]
+    pub target_id: Option<String>,
+}
+
+struct ResolvedEngineModel {
+    upstream_model: String,
+    profile: String,
+    target_id: String,
 }
 
 const fn default_generation() -> u64 {
@@ -364,8 +391,20 @@ pub fn build_server(
         }
     }
 
+    let required_models = config
+        .required_models
+        .iter()
+        .map(|alias| required("required_models", alias))
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    for alias in &required_models {
+        if !model_by_alias.contains_key(alias) {
+            return Err(ServerError::InvalidConfig(format!(
+                "required model references unknown profile alias: {alias}"
+            )));
+        }
+    }
+
     let engines = EngineRegistry::new();
-    let mut models_with_engines = BTreeSet::new();
     let mut engine_ids = BTreeSet::new();
     let mut target_ids = BTreeSet::new();
     for engine in &config.engines {
@@ -375,24 +414,12 @@ pub fn build_server(
                 engine.id
             )));
         }
-        if !target_ids.insert(engine.target_id.clone()) {
-            return Err(ServerError::InvalidConfig(format!(
-                "duplicate execution target id: {}",
-                engine.target_id
-            )));
-        }
         if engine.generation == 0 {
             return Err(ServerError::InvalidConfig(format!(
                 "engine {} generation must be greater than zero",
                 engine.id
             )));
         }
-        let model = model_by_alias.get(&engine.model).cloned().ok_or_else(|| {
-            ServerError::InvalidConfig(format!(
-                "engine {} references unknown model alias {}",
-                engine.id, engine.model
-            ))
-        })?;
         let engine_ref = EngineInstanceRef {
             id: EngineInstanceId::new(required("engines.id", &engine.id)?),
             generation: engine.generation,
@@ -408,53 +435,68 @@ pub fn build_server(
             hardware: required("engines.hardware", &engine.hardware)?,
             health_endpoint: engine.health_endpoint.clone(),
         };
-        let target = ExecutionTarget {
-            id: ExecutionTargetId::new(required("engines.target_id", &engine.target_id)?),
-            engine: engine_ref,
-            model: model.clone(),
-            role: ExecutionRole::Combined,
-            parallel_layout: ParallelLayout {
-                tensor_parallel: nonzero("engines.tensor_parallel", engine.tensor_parallel)?,
-                pipeline_parallel: nonzero("engines.pipeline_parallel", engine.pipeline_parallel)?,
-                expert_parallel: nonzero("engines.expert_parallel", engine.expert_parallel)?,
-                layout_revision: required("engines.layout_revision", &engine.layout_revision)?,
-            },
-            residency: required("engines.residency", &engine.residency)?,
-            capability_revision: required(
-                "engines.capability_revision",
-                &engine.capability_revision,
-            )?,
-        };
+        let bindings = resolve_engine_models(engine, &model_by_alias)?;
+        let mut targets = Vec::with_capacity(bindings.len());
+        for binding in bindings {
+            if !target_ids.insert(binding.target_id.clone()) {
+                return Err(ServerError::InvalidConfig(format!(
+                    "duplicate execution target id: {}",
+                    binding.target_id
+                )));
+            }
+            let model = model_by_alias
+                .get(&binding.profile)
+                .cloned()
+                .ok_or_else(|| {
+                    ServerError::InvalidConfig(format!(
+                        "engine {} references unknown model profile {}",
+                        engine.id, binding.profile
+                    ))
+                })?;
+            targets.push(RemoteExecutionTarget {
+                served_model: binding.upstream_model,
+                target: ExecutionTarget {
+                    id: ExecutionTargetId::new(binding.target_id),
+                    engine: engine_ref.clone(),
+                    model,
+                    role: ExecutionRole::Combined,
+                    parallel_layout: ParallelLayout {
+                        tensor_parallel: nonzero(
+                            "engines.tensor_parallel",
+                            engine.tensor_parallel,
+                        )?,
+                        pipeline_parallel: nonzero(
+                            "engines.pipeline_parallel",
+                            engine.pipeline_parallel,
+                        )?,
+                        expert_parallel: nonzero(
+                            "engines.expert_parallel",
+                            engine.expert_parallel,
+                        )?,
+                        layout_revision: required(
+                            "engines.layout_revision",
+                            &engine.layout_revision,
+                        )?,
+                    },
+                    residency: required("engines.residency", &engine.residency)?,
+                    capability_revision: required(
+                        "engines.capability_revision",
+                        &engine.capability_revision,
+                    )?,
+                },
+            });
+        }
         let remote = RemoteEngineConfig {
             base_url: required("engines.base_url", &engine.base_url)?,
             api_key: resolve_optional_secret(engine.api_key_env.as_deref())?,
-            served_model: required("engines.served_model", &engine.served_model)?,
             instance,
-            target,
+            targets,
         };
         let adapter: Arc<dyn EngineAdapter> = match engine.kind {
             EngineKind::Sglang => Arc::new(SglangEngineAdapter::new(remote)?),
             EngineKind::Vllm => Arc::new(VllmEngineAdapter::new(remote)?),
         };
         engines.register(adapter)?;
-        models_with_engines.insert(model);
-    }
-    let uncovered = config
-        .models
-        .iter()
-        .filter_map(|model| model.aliases.first())
-        .filter(|alias| {
-            model_by_alias
-                .get(*alias)
-                .is_some_and(|identity| !models_with_engines.contains(identity))
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    if !uncovered.is_empty() {
-        return Err(ServerError::InvalidConfig(format!(
-            "models without a configured engine: {}",
-            uncovered.join(", ")
-        )));
     }
 
     let state_provider: Arc<dyn StateProvider> = match &config.state {
@@ -475,11 +517,10 @@ pub fn build_server(
             semantic_type: required("state.semantic_type", semantic_type)?,
         })?),
     };
-    let service: Arc<dyn InferenceService> = Arc::new(DefaultInferenceService::new(
-        models,
-        engines,
-        state_provider,
-    ));
+    let service: Arc<dyn InferenceService> = Arc::new(
+        DefaultInferenceService::new(models, engines, state_provider)
+            .with_required_models(required_models),
+    );
     let api = ApiConfig {
         bearer_token: resolve_optional_secret(config.api.bearer_token_env.as_deref())?,
         max_request_bytes: config.api.max_request_bytes,
@@ -515,6 +556,87 @@ pub fn build_server(
         app,
         observability: config.observability,
     })
+}
+
+fn resolve_engine_models(
+    engine: &EngineSettings,
+    model_by_alias: &BTreeMap<String, ModelExecutionIdentity>,
+) -> Result<Vec<ResolvedEngineModel>, ServerError> {
+    let legacy_fields = [
+        engine.served_model.is_some(),
+        engine.model.is_some(),
+        engine.target_id.is_some(),
+    ];
+    let legacy_count = legacy_fields.into_iter().filter(|present| *present).count();
+    if !engine.model_mappings.is_empty() && legacy_count > 0 {
+        return Err(ServerError::InvalidConfig(format!(
+            "engine {} cannot combine model_mappings with legacy served_model/model/target_id fields",
+            engine.id
+        )));
+    }
+
+    let candidates = if !engine.model_mappings.is_empty() {
+        engine
+            .model_mappings
+            .iter()
+            .map(|mapping| {
+                let upstream_model = required(
+                    "engines.model_mappings.upstream_model",
+                    &mapping.upstream_model,
+                )?;
+                let profile = required("engines.model_mappings.profile", &mapping.profile)?;
+                let target_id = mapping
+                    .target_id
+                    .as_deref()
+                    .map(|value| required("engines.model_mappings.target_id", value))
+                    .transpose()?
+                    .unwrap_or_else(|| format!("{}/{upstream_model}", engine.id));
+                Ok(ResolvedEngineModel {
+                    upstream_model,
+                    profile,
+                    target_id,
+                })
+            })
+            .collect::<Result<Vec<_>, ServerError>>()?
+    } else if legacy_count > 0 {
+        if legacy_count != legacy_fields.len() {
+            return Err(ServerError::InvalidConfig(format!(
+                "engine {} legacy served_model, model, and target_id fields must be configured together",
+                engine.id
+            )));
+        }
+        vec![ResolvedEngineModel {
+            upstream_model: required(
+                "engines.served_model",
+                engine.served_model.as_deref().unwrap_or_default(),
+            )?,
+            profile: required("engines.model", engine.model.as_deref().unwrap_or_default())?,
+            target_id: required(
+                "engines.target_id",
+                engine.target_id.as_deref().unwrap_or_default(),
+            )?,
+        }]
+    } else {
+        model_by_alias
+            .keys()
+            .map(|alias| ResolvedEngineModel {
+                upstream_model: alias.clone(),
+                profile: alias.clone(),
+                target_id: format!("{}/{alias}", engine.id),
+            })
+            .collect()
+    };
+
+    let mut upstream_models = BTreeSet::new();
+    for candidate in &candidates {
+        if !upstream_models.insert(candidate.upstream_model.clone()) {
+            return Err(ServerError::InvalidConfig(format!(
+                "engine {} has duplicate upstream model mapping: {}",
+                engine.id, candidate.upstream_model
+            )));
+        }
+    }
+    Ok(candidates)
 }
 
 fn required(field: &'static str, value: &str) -> Result<String, ServerError> {
