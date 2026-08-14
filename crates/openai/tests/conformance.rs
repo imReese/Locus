@@ -192,6 +192,113 @@ async fn health_models_and_non_streaming_response_are_openai_shaped() {
 }
 
 #[tokio::test]
+async fn legacy_completions_use_raw_text_or_token_prompts_without_a_chat_template() {
+    let (app, adapter) = app(FakeEngineOutput {
+        token_deltas: Vec::new(),
+        text_deltas: vec!["raw completion".to_owned()],
+        ..FakeEngineOutput::default()
+    });
+    let (status, response) = json_response(
+        app.clone(),
+        "POST",
+        "/v1/completions",
+        json!({
+            "model": "locus-test",
+            "prompt": "abc",
+            "max_tokens": 8,
+            "temperature": 0.25,
+            "top_p": 0.9,
+            "seed": 7,
+            "stop": ["END", "DONE"],
+            "n": 1
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(response["object"], "text_completion");
+    assert_eq!(response["choices"][0]["text"], "raw completion");
+    assert_eq!(response["choices"][0]["finish_reason"], "stop");
+    assert_eq!(response["usage"]["prompt_tokens"], 3);
+    assert_eq!(response["usage"]["completion_tokens"], 14);
+
+    let (status, response) = json_response(
+        app,
+        "POST",
+        "/v1/completions",
+        json!({"model": "locus-test", "prompt": [65, 66, 67]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(response["usage"]["prompt_tokens"], 3);
+    assert_eq!(adapter.call_counts().execute, 2);
+}
+
+#[tokio::test]
+async fn legacy_completion_stream_emits_text_finish_usage_and_done() {
+    let (app, _) = app(FakeEngineOutput {
+        token_deltas: Vec::new(),
+        text_deltas: vec!["hel".to_owned(), "lo".to_owned()],
+        finish_reason: locus_core::EngineFinishReason::Length,
+        ..FakeEngineOutput::default()
+    });
+    let response = app
+        .oneshot(
+            Request::post("/v1/completions")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "locus-test",
+                        "prompt": "raw",
+                        "stream": true,
+                        "stream_options": {"include_usage": true}
+                    })
+                    .to_string(),
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = String::from_utf8(
+        response
+            .into_body()
+            .collect()
+            .await
+            .expect("stream body")
+            .to_bytes()
+            .to_vec(),
+    )
+    .expect("UTF-8 stream");
+    assert!(body.contains("\"object\":\"text_completion\""));
+    assert!(body.contains("\"text\":\"hel\""));
+    assert!(body.contains("\"text\":\"lo\""));
+    assert!(body.contains("\"finish_reason\":\"length\""));
+    assert!(body.contains("\"prompt_tokens\":3"));
+    assert!(body.contains("data: [DONE]"));
+}
+
+#[tokio::test]
+async fn legacy_completions_reject_batch_and_unsupported_options_explicitly() {
+    let cases = [
+        (json!({"prompt": ["one", "two"]}), "prompt"),
+        (json!({"prompt": [[1, 2], [3, 4]]}), "prompt"),
+        (json!({"prompt": "x", "n": 2}), "n"),
+        (json!({"prompt": "x", "best_of": 2}), "best_of"),
+        (json!({"prompt": "x", "echo": true}), "echo"),
+        (json!({"prompt": "x", "logprobs": 1}), "logprobs"),
+        (json!({"prompt": "x", "suffix": "y"}), "suffix"),
+    ];
+    for (mut body, parameter) in cases {
+        body["model"] = json!("locus-test");
+        let (app, adapter) = app(FakeEngineOutput::default());
+        let (status, response) = json_response(app, "POST", "/v1/completions", body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "parameter {parameter}");
+        assert_eq!(response["error"]["param"], parameter);
+        assert_eq!(adapter.call_counts().execute, 0);
+    }
+}
+
+#[tokio::test]
 async fn readiness_observes_registered_model_and_live_target() {
     let (app, _) = app(FakeEngineOutput::default());
     let (status, readiness) = json_response(app, "GET", "/readyz", json!({})).await;

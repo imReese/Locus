@@ -433,6 +433,53 @@ async fn configured_huggingface_profile_reaches_remote_engine_as_token_ids() {
     );
 }
 
+#[tokio::test]
+async fn configured_raw_completion_bypasses_chat_template_and_forwards_stop() {
+    let (engine_url, capture) = spawn_engine().await;
+    let (directory, config_path) = write_config();
+    let mut config = load_config(&config_path).expect("load config");
+    config.engines[0].base_url = engine_url;
+    let server = build_server(config, directory.path()).expect("build server");
+    let response = server
+        .app
+        .oneshot(
+            Request::post("/v1/completions")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "fixture",
+                        "prompt": "hello",
+                        "stop": ["END"]
+                    })
+                    .to_string(),
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value = serde_json::from_slice(
+        &response
+            .into_body()
+            .collect()
+            .await
+            .expect("response body")
+            .to_bytes(),
+    )
+    .expect("response JSON");
+    assert_eq!(body["object"], "text_completion");
+    assert_eq!(body["choices"][0]["text"], "configured");
+    let completions = capture.completions.lock().expect("completion capture");
+    assert_eq!(completions.len(), 1);
+    assert_eq!(completions[0]["prompt"], json!([2]));
+    assert_eq!(completions[0]["stop"], json!(["END"]));
+    assert!(
+        completions[0]["rid"]
+            .as_str()
+            .is_some_and(|request_id| request_id.starts_with("cmpl_"))
+    );
+}
+
 #[test]
 fn engine_must_reference_a_configured_model_alias() {
     let (directory, config_path) = write_config();

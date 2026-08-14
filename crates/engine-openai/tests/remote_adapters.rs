@@ -170,6 +170,7 @@ fn request(id: &str) -> CanonicalRequest {
         input,
         sampling: SamplingParameters {
             max_output_tokens: Some(8),
+            stop_sequences: vec!["END".to_owned(), "DONE".to_owned()],
             ..SamplingParameters::default()
         },
     }
@@ -234,6 +235,7 @@ async fn assert_completion(
     let bodies = capture.completions.lock().expect("completion lock");
     let body = bodies.last().expect("completion body");
     assert_eq!(body["prompt"], json!([1, 2, 3]));
+    assert_eq!(body["stop"], json!(["END", "DONE"]));
     assert_eq!(body[expected_request_field], "req-remote");
 }
 

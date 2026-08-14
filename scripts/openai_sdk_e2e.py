@@ -95,6 +95,62 @@ def main() -> None:
         chat_chunks.close()
     assert_text(chat_text)
 
+    legacy = client.completions.create(
+        model=args.model,
+        prompt="raw completion prompt",
+        max_tokens=16,
+        temperature=0.25,
+        top_p=0.9,
+        seed=7,
+        stop=["END", "DONE"],
+    )
+    assert legacy.object == "text_completion"
+    assert_text(legacy.choices[0].text)
+    assert legacy.choices[0].finish_reason == "stop"
+    assert legacy.usage is not None
+    assert legacy.usage.prompt_tokens == len("raw completion prompt")
+
+    token_prompt = client.completions.create(
+        model=args.model,
+        prompt=[65, 66, 67],
+    )
+    assert_text(token_prompt.choices[0].text)
+    assert token_prompt.usage is not None
+    assert token_prompt.usage.prompt_tokens == 3
+
+    legacy_text = ""
+    legacy_finish_reason = None
+    legacy_usage = None
+    legacy_chunks = client.completions.create(
+        model=args.model,
+        prompt="stream raw completion",
+        stream=True,
+        stream_options={"include_usage": True},
+    )
+    try:
+        for chunk in legacy_chunks:
+            if chunk.choices:
+                legacy_text += chunk.choices[0].text
+                if chunk.choices[0].finish_reason:
+                    legacy_finish_reason = chunk.choices[0].finish_reason
+            if chunk.usage:
+                legacy_usage = chunk.usage
+    finally:
+        legacy_chunks.close()
+    assert_text(legacy_text)
+    assert legacy_finish_reason == "stop"
+    assert legacy_usage is not None
+    assert legacy_usage.prompt_tokens == len("stream raw completion")
+
+    try:
+        client.completions.create(model=args.model, prompt="reject n", n=2)
+    except openai.BadRequestError as error:
+        assert error.status_code == 400
+        assert error.param == "n"
+        assert error.code == "invalid_parameter"
+    else:
+        raise AssertionError("n=2 did not raise openai.BadRequestError")
+
     structured = client.responses.create(
         model=args.model,
         input="return an answer object",
@@ -237,6 +293,13 @@ def main() -> None:
                     "cancel",
                 ],
                 "chat_completions": ["json", "sse", "reasoning_tool_parser_sse"],
+                "completions": [
+                    "json",
+                    "token_prompt",
+                    "sse",
+                    "stop",
+                    "strict_rejection",
+                ],
             },
             sort_keys=True,
         )

@@ -57,6 +57,24 @@ pub struct Conversation {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PromptInput {
+    Text(String),
+    TokenIds(Vec<u32>),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SemanticInput {
+    Conversation(Conversation),
+    Prompt(PromptInput),
+}
+
+impl Default for SemanticInput {
+    fn default() -> Self {
+        Self::Conversation(Conversation::default())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ToolDefinition {
     pub name: String,
     pub description: Option<String>,
@@ -107,7 +125,7 @@ impl ReasoningEffort {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct SemanticRequest {
     pub model: String,
-    pub conversation: Conversation,
+    pub input: SemanticInput,
     pub sampling: SamplingParameters,
     pub tools: Vec<ToolDefinition>,
     pub tool_choice: ToolChoice,
@@ -359,14 +377,35 @@ impl ModelSemantics for BasicModelSemantics {
         request: &SemanticRequest,
         request_id: RequestId,
     ) -> Result<NormalizedSemanticRequest, SemanticError> {
-        if request.conversation.messages.is_empty() {
-            return Err(SemanticError::InvalidInput(
-                "conversation must contain at least one message".to_owned(),
-            ));
-        }
         validate_tool_contract(request)?;
-        let rendered = self.template.render(request)?;
-        let tokens = self.tokenizer.encode(&rendered)?;
+        let (tokens, semantic_identity) = match &request.input {
+            SemanticInput::Conversation(conversation) => {
+                if conversation.messages.is_empty() {
+                    return Err(SemanticError::InvalidInput(
+                        "conversation must contain at least one message".to_owned(),
+                    ));
+                }
+                let rendered = self.template.render(request)?;
+                (
+                    self.tokenizer.encode(&rendered)?,
+                    self.profile.semantic_identity.clone(),
+                )
+            }
+            SemanticInput::Prompt(prompt) => {
+                validate_prompt_contract(request)?;
+                let tokens = match prompt {
+                    PromptInput::Text(text) => self.tokenizer.encode(text)?,
+                    PromptInput::TokenIds(token_ids) => TokenSequence {
+                        token_ids: token_ids.clone(),
+                        tokenizer_fingerprint: self.tokenizer.identity().fingerprint.clone(),
+                    },
+                };
+                (
+                    tokens,
+                    raw_prompt_semantic_identity(&self.profile.semantic_identity),
+                )
+            }
+        };
         let mut input = InputBundle {
             items: vec![InputItem {
                 id: InputItemId::new("prompt"),
@@ -391,7 +430,7 @@ impl ModelSemantics for BasicModelSemantics {
             canonical: CanonicalRequest {
                 id: request_id,
                 model: self.profile.model.clone(),
-                semantic_identity: self.profile.semantic_identity.clone(),
+                semantic_identity,
                 requirements,
                 input,
                 sampling: request.sampling.clone(),
@@ -421,6 +460,38 @@ impl ModelSemantics for BasicModelSemantics {
             next_tool_index: 0,
         }))
     }
+}
+
+fn validate_prompt_contract(request: &SemanticRequest) -> Result<(), SemanticError> {
+    if !request.tools.is_empty()
+        || !matches!(request.tool_choice, ToolChoice::Auto | ToolChoice::None)
+    {
+        return Err(SemanticError::Unsupported(
+            "raw prompts do not support function tools".to_owned(),
+        ));
+    }
+    if !matches!(request.response_format, ResponseFormat::Text) {
+        return Err(SemanticError::Unsupported(
+            "raw prompts do not support structured output".to_owned(),
+        ));
+    }
+    if request.reasoning_effort.is_some() {
+        return Err(SemanticError::Unsupported(
+            "raw prompts do not support reasoning controls".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn raw_prompt_semantic_identity(profile: &SemanticIdentity) -> SemanticIdentity {
+    let mut identity = profile.clone();
+    identity.input.template = SemanticComponentIdentity {
+        kind: "locus-raw-prompt".to_owned(),
+        revision: "v1".to_owned(),
+        fingerprint: "locus-raw-prompt-v1".to_owned(),
+    };
+    identity.umbrella_fingerprint = None;
+    identity
 }
 
 fn contract_annotations(request: &SemanticRequest) -> Result<Vec<TypedMetadata>, SemanticError> {
@@ -930,8 +1001,13 @@ impl TemplateRenderer for SimpleTemplateRenderer {
     }
 
     fn render(&self, request: &SemanticRequest) -> Result<String, SemanticError> {
+        let SemanticInput::Conversation(conversation) = &request.input else {
+            return Err(SemanticError::InvalidInput(
+                "chat template requires conversation input".to_owned(),
+            ));
+        };
         let mut rendered = String::new();
-        for message in &request.conversation.messages {
+        for message in &conversation.messages {
             if message.content.is_empty() {
                 return Err(SemanticError::InvalidInput(format!(
                     "{} message content must not be empty",

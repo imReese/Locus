@@ -9,9 +9,9 @@ use locus_core::{
     OutputSemanticIdentity, SemanticComponentIdentity, SemanticIdentity, TokenSequence,
 };
 use locus_semantics::{
-    BasicModelSemantics, ModelProfile, ModelSemantics, SemanticError, SemanticRequest,
-    TaggedJsonToolParserDefinition, TaggedReasoningParserDefinition, TemplateRenderer,
-    TokenDecoder, TokenizerProvider, ToolChoice,
+    BasicModelSemantics, ModelProfile, ModelSemantics, SemanticError, SemanticInput,
+    SemanticRequest, TaggedJsonToolParserDefinition, TaggedReasoningParserDefinition,
+    TemplateRenderer, TokenDecoder, TokenizerProvider, ToolChoice,
 };
 use minijinja::{Environment, Error as TemplateError, ErrorKind, UndefinedBehavior};
 use serde_json::{Value, json};
@@ -356,12 +356,16 @@ impl TemplateRenderer for HuggingFaceTemplateRenderer {
     }
 
     fn render(&self, request: &SemanticRequest) -> Result<String, SemanticError> {
+        let SemanticInput::Conversation(conversation) = &request.input else {
+            return Err(SemanticError::InvalidInput(
+                "chat template requires conversation input".to_owned(),
+            ));
+        };
         let mut context = self.extra_context.clone();
         context.insert(
             "messages".to_owned(),
             Value::Array(
-                request
-                    .conversation
+                conversation
                     .messages
                     .iter()
                     .map(|message| {

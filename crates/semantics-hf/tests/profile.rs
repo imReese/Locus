@@ -5,8 +5,9 @@ use locus_core::{
     EngineEvent, EngineFinishReason, InputItemValue, ModelExecutionIdentity, RequestId, Usage,
 };
 use locus_semantics::{
-    Conversation, ConversationMessage, ConversationRole, ReasoningEffort, SemanticEvent,
-    SemanticFinishReason, SemanticRequest, ToolChoice, ToolDefinition,
+    Conversation, ConversationMessage, ConversationRole, PromptInput, ReasoningEffort,
+    SemanticEvent, SemanticFinishReason, SemanticInput, SemanticRequest, ToolChoice,
+    ToolDefinition,
 };
 use locus_semantics_hf::{
     HuggingFaceProfileSpec, TaggedJsonToolParserSpec, TaggedReasoningParserSpec,
@@ -84,13 +85,13 @@ fn production_profile_renders_and_tokenizes_once_with_content_identities() {
         .normalize(
             &SemanticRequest {
                 model: "fixture".to_owned(),
-                conversation: Conversation {
+                input: SemanticInput::Conversation(Conversation {
                     messages: vec![ConversationMessage {
                         role: ConversationRole::User,
                         content: "hello".to_owned(),
                         tool_call_id: None,
                     }],
-                },
+                }),
                 ..SemanticRequest::default()
             },
             RequestId::new("request-1"),
@@ -129,6 +130,73 @@ fn production_profile_renders_and_tokenizes_once_with_content_identities() {
 }
 
 #[test]
+fn raw_text_and_token_prompts_bypass_the_chat_template_with_distinct_identity() {
+    let (_directory, spec) = write_fixture();
+    let semantics = load_huggingface_semantics(spec).expect("load profile");
+    let text = semantics
+        .normalize(
+            &SemanticRequest {
+                model: "fixture".to_owned(),
+                input: SemanticInput::Prompt(PromptInput::Text("hello".to_owned())),
+                sampling: locus_core::SamplingParameters {
+                    stop_sequences: vec!["END".to_owned()],
+                    ..locus_core::SamplingParameters::default()
+                },
+                ..SemanticRequest::default()
+            },
+            RequestId::new("request-raw-text"),
+        )
+        .expect("normalize raw text");
+    let text_tokens = text
+        .canonical
+        .input
+        .items
+        .iter()
+        .find_map(|item| match &item.value {
+            InputItemValue::TokenSequence(tokens) => Some(tokens),
+            _ => None,
+        })
+        .expect("text token sequence");
+    assert_eq!(text_tokens.token_ids, vec![3]);
+    assert_eq!(
+        text.canonical.semantic_identity.input.template.kind,
+        "locus-raw-prompt"
+    );
+    assert!(
+        text.canonical
+            .semantic_identity
+            .umbrella_fingerprint
+            .is_none()
+    );
+    assert_eq!(
+        text.canonical.sampling.stop_sequences,
+        vec!["END".to_owned()]
+    );
+
+    let tokens = semantics
+        .normalize(
+            &SemanticRequest {
+                model: "fixture".to_owned(),
+                input: SemanticInput::Prompt(PromptInput::TokenIds(vec![91, 92])),
+                ..SemanticRequest::default()
+            },
+            RequestId::new("request-raw-tokens"),
+        )
+        .expect("normalize raw tokens");
+    let token_ids = tokens
+        .canonical
+        .input
+        .items
+        .iter()
+        .find_map(|item| match &item.value {
+            InputItemValue::TokenSequence(tokens) => Some(tokens.token_ids.as_slice()),
+            _ => None,
+        })
+        .expect("token sequence");
+    assert_eq!(token_ids, &[91, 92]);
+}
+
+#[test]
 fn profile_bound_parsers_render_tools_and_emit_typed_events_from_fragmented_text() {
     let (_directory, mut spec) = write_fixture();
     spec.reasoning_parser = Some(TaggedReasoningParserSpec {
@@ -147,13 +215,13 @@ fn profile_bound_parsers_render_tools_and_emit_typed_events_from_fragmented_text
         .normalize(
             &SemanticRequest {
                 model: "fixture".to_owned(),
-                conversation: Conversation {
+                input: SemanticInput::Conversation(Conversation {
                     messages: vec![ConversationMessage {
                         role: ConversationRole::User,
                         content: "hello".to_owned(),
                         tool_call_id: None,
                     }],
-                },
+                }),
                 tools: vec![tool()],
                 tool_choice: ToolChoice::Required,
                 reasoning_effort: Some(ReasoningEffort::High),

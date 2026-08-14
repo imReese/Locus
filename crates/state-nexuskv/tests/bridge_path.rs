@@ -284,13 +284,13 @@ async fn run_inference(service: &DefaultInferenceService, request_id: &str) {
         .infer(
             SemanticRequest {
                 model: "nexus-model".to_owned(),
-                conversation: Conversation {
+                input: locus_semantics::SemanticInput::Conversation(Conversation {
                     messages: vec![ConversationMessage {
                         role: ConversationRole::User,
                         content: "use cached prefix".to_owned(),
                         tool_call_id: None,
                     }],
-                },
+                }),
                 ..SemanticRequest::default()
             },
             OperationContext::new(RequestId::new(request_id)),

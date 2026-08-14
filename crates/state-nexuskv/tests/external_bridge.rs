@@ -150,13 +150,13 @@ async fn real_nexuskv_process_completes_locus_plan_and_import_handshake() {
         .infer(
             SemanticRequest {
                 model: "nexus-model".to_owned(),
-                conversation: Conversation {
+                input: locus_semantics::SemanticInput::Conversation(Conversation {
                     messages: vec![ConversationMessage {
                         role: ConversationRole::User,
                         content: "use cached prefix".to_owned(),
                         tool_call_id: None,
                     }],
-                },
+                }),
                 ..SemanticRequest::default()
             },
             OperationContext::new(RequestId::new("req-real-nexuskv")),

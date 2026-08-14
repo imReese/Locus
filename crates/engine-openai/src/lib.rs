@@ -122,6 +122,9 @@ impl RemoteCompletionAdapter {
         if let Some(seed) = request.sampling.seed {
             body["seed"] = json!(seed);
         }
+        if !request.sampling.stop_sequences.is_empty() {
+            body["stop"] = json!(&request.sampling.stop_sequences);
+        }
         match self.flavor {
             RuntimeFlavor::Sglang => body["rid"] = json!(request.id.as_str()),
             RuntimeFlavor::Vllm => {

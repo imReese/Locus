@@ -11,6 +11,7 @@ pub struct SamplingParameters {
     pub temperature: Option<f32>,
     pub top_p: Option<f32>,
     pub seed: Option<u64>,
+    pub stop_sequences: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]

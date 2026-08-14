@@ -19,9 +19,9 @@ use futures::StreamExt;
 use locus_core::{OperationContext, RequestId, SamplingParameters, Usage};
 use locus_runtime::{InferenceError, InferenceService, SemanticEventStream};
 use locus_semantics::{
-    Conversation, ConversationMessage, ConversationRole, ReasoningEffort, ResponseFormat,
-    SemanticError, SemanticEvent, SemanticFinishReason, SemanticRequest, ToolChoice,
-    ToolDefinition,
+    Conversation, ConversationMessage, ConversationRole, PromptInput, ReasoningEffort,
+    ResponseFormat, SemanticError, SemanticEvent, SemanticFinishReason, SemanticInput,
+    SemanticRequest, ToolChoice, ToolDefinition,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -99,6 +99,7 @@ pub fn router_with_config(
     let mut api = Router::new()
         .route("/v1/models", get(models))
         .route("/v1/responses", post(responses))
+        .route("/v1/completions", post(completions))
         .route("/v1/chat/completions", post(chat_completions));
     if let Some(bearer_token) = config.bearer_token {
         api = api.layer(from_fn_with_state(
@@ -378,12 +379,13 @@ impl ResponsesRequest {
         }
         Ok(SemanticRequest {
             model: self.model,
-            conversation: Conversation { messages },
+            input: SemanticInput::Conversation(Conversation { messages }),
             sampling: SamplingParameters {
                 max_output_tokens: self.max_output_tokens,
                 temperature: self.temperature,
                 top_p: self.top_p,
                 seed: None,
+                stop_sequences: Vec::new(),
             },
             tools: self
                 .tools
@@ -814,6 +816,298 @@ fn usage_value(usage: &Usage) -> Value {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct CompletionRequest {
+    model: String,
+    prompt: CompletionPrompt,
+    #[serde(default)]
+    max_tokens: Option<u32>,
+    #[serde(default)]
+    temperature: Option<f32>,
+    #[serde(default)]
+    top_p: Option<f32>,
+    #[serde(default)]
+    seed: Option<u64>,
+    #[serde(default)]
+    stop: Option<StopSequencesDto>,
+    #[serde(default)]
+    stream: bool,
+    #[serde(default)]
+    stream_options: Option<CompletionStreamOptions>,
+    #[serde(default)]
+    n: Option<u32>,
+    #[serde(default)]
+    best_of: Option<u32>,
+    #[serde(default)]
+    echo: Option<bool>,
+    #[serde(default)]
+    logprobs: Option<u32>,
+    #[serde(default)]
+    suffix: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum CompletionPrompt {
+    Text(String),
+    TokenIds(Vec<u32>),
+    TextBatch(Vec<String>),
+    TokenBatch(Vec<Vec<u32>>),
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum StopSequencesDto {
+    One(String),
+    Many(Vec<String>),
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CompletionStreamOptions {
+    #[serde(default)]
+    include_usage: bool,
+}
+
+impl CompletionRequest {
+    fn into_semantic(self) -> Result<SemanticRequest, ApiError> {
+        if self.n.is_some_and(|n| n != 1) {
+            return Err(ApiError::invalid("n", "n must be 1"));
+        }
+        if self.best_of.is_some() {
+            return Err(ApiError::unsupported("best_of"));
+        }
+        if self.echo.unwrap_or(false) {
+            return Err(ApiError::unsupported("echo"));
+        }
+        if self.logprobs.is_some() {
+            return Err(ApiError::unsupported("logprobs"));
+        }
+        if self.suffix.is_some() {
+            return Err(ApiError::unsupported("suffix"));
+        }
+        if !self.stream && self.stream_options.is_some() {
+            return Err(ApiError::invalid(
+                "stream_options",
+                "stream_options requires stream=true",
+            ));
+        }
+        let input = match self.prompt {
+            CompletionPrompt::Text(text) => PromptInput::Text(text),
+            CompletionPrompt::TokenIds(token_ids) => PromptInput::TokenIds(token_ids),
+            CompletionPrompt::TextBatch(prompts) => {
+                return Err(ApiError::invalid(
+                    "prompt",
+                    format!(
+                        "batched text prompts are unsupported (received {})",
+                        prompts.len()
+                    ),
+                ));
+            }
+            CompletionPrompt::TokenBatch(prompts) => {
+                return Err(ApiError::invalid(
+                    "prompt",
+                    format!(
+                        "batched token prompts are unsupported (received {})",
+                        prompts.len()
+                    ),
+                ));
+            }
+        };
+        let stop_sequences = match self.stop {
+            None => Vec::new(),
+            Some(StopSequencesDto::One(stop)) => vec![stop],
+            Some(StopSequencesDto::Many(stops)) => stops,
+        };
+        if stop_sequences.iter().any(String::is_empty) {
+            return Err(ApiError::invalid(
+                "stop",
+                "stop sequences must not be empty",
+            ));
+        }
+        Ok(SemanticRequest {
+            model: self.model,
+            input: SemanticInput::Prompt(input),
+            sampling: SamplingParameters {
+                max_output_tokens: self.max_tokens,
+                temperature: self.temperature,
+                top_p: self.top_p,
+                seed: self.seed,
+                stop_sequences,
+            },
+            tools: Vec::new(),
+            tool_choice: ToolChoice::None,
+            response_format: ResponseFormat::Text,
+            reasoning_effort: None,
+            metadata: BTreeMap::new(),
+        })
+    }
+}
+
+async fn completions(
+    State(state): State<ApiState>,
+    payload: Result<Json<CompletionRequest>, JsonRejection>,
+) -> Response {
+    let Json(request) = match payload {
+        Ok(payload) => payload,
+        Err(error) => return api_error_from_json_rejection(&error).into_response(),
+    };
+    let stream_requested = request.stream;
+    let include_usage = request
+        .stream_options
+        .as_ref()
+        .is_some_and(|options| options.include_usage);
+    let model = request.model.clone();
+    let request = match request.into_semantic() {
+        Ok(request) => request,
+        Err(error) => return error.into_response(),
+    };
+    let request_id = state.next_id("cmpl");
+    let context = OperationContext::new(RequestId::new(request_id.clone()));
+    let stream = match state.service.infer(request, context).await {
+        Ok(stream) => stream,
+        Err(error) => return api_error_from_inference(&error).into_response(),
+    };
+    if stream_requested {
+        completion_sse(stream, request_id, model, include_usage)
+    } else {
+        collect_completion(stream, request_id, model).await
+    }
+}
+
+async fn collect_completion(
+    mut stream: SemanticEventStream,
+    request_id: String,
+    model: String,
+) -> Response {
+    let mut output = OutputAccumulator::default();
+    while let Some(event) = stream.next().await {
+        match event {
+            Ok(event) => output.apply(&event),
+            Err(error) => return api_error_from_inference(&error).into_response(),
+        }
+    }
+    Json(json!({
+        "id": request_id,
+        "object": "text_completion",
+        "created": unix_timestamp(),
+        "model": model,
+        "choices": [{
+            "text": output.text,
+            "index": 0,
+            "logprobs": null,
+            "finish_reason": completion_finish_reason(output.finish.as_ref())
+        }],
+        "usage": completion_usage_value(&output.usage),
+        "system_fingerprint": null
+    }))
+    .into_response()
+}
+
+fn completion_sse(
+    stream: SemanticEventStream,
+    request_id: String,
+    model: String,
+    include_usage: bool,
+) -> Response {
+    let event_stream = async_stream::stream! {
+        let mut stream = stream;
+        let mut output = OutputAccumulator::default();
+        while let Some(result) = stream.next().await {
+            let event = match result {
+                Ok(event) => event,
+                Err(error) => {
+                    yield Ok::<Event, Infallible>(Event::default().data(json!({"error": api_error_from_inference(&error).body}).to_string()));
+                    break;
+                }
+            };
+            match &event {
+                SemanticEvent::TextDelta { text, .. } => {
+                    yield Ok(completion_chunk(
+                        &request_id,
+                        &model,
+                        vec![json!({
+                            "text": text,
+                            "index": 0,
+                            "logprobs": null,
+                            "finish_reason": null
+                        })],
+                        Value::Null,
+                    ));
+                }
+                SemanticEvent::Finished { reason, .. } => {
+                    yield Ok(completion_chunk(
+                        &request_id,
+                        &model,
+                        vec![json!({
+                            "text": "",
+                            "index": 0,
+                            "logprobs": null,
+                            "finish_reason": completion_finish_reason(Some(reason))
+                        })],
+                        Value::Null,
+                    ));
+                }
+                SemanticEvent::Accepted { .. }
+                | SemanticEvent::ReasoningDelta { .. }
+                | SemanticEvent::ToolCallStarted { .. }
+                | SemanticEvent::ToolCallArgumentsDelta { .. }
+                | SemanticEvent::ToolCallCompleted { .. }
+                | SemanticEvent::Usage { .. } => {}
+            }
+            output.apply(&event);
+            if matches!(event, SemanticEvent::Finished { .. }) {
+                if include_usage {
+                    yield Ok(completion_chunk(
+                        &request_id,
+                        &model,
+                        Vec::new(),
+                        completion_usage_value(&output.usage),
+                    ));
+                }
+                yield Ok(Event::default().data("[DONE]"));
+                break;
+            }
+        }
+    };
+    Sse::new(event_stream.boxed())
+        .keep_alive(KeepAlive::default())
+        .into_response()
+}
+
+fn completion_chunk(request_id: &str, model: &str, choices: Vec<Value>, usage: Value) -> Event {
+    Event::default().data(
+        json!({
+            "id": request_id,
+            "object": "text_completion",
+            "created": unix_timestamp(),
+            "model": model,
+            "choices": choices,
+            "usage": usage,
+            "system_fingerprint": null
+        })
+        .to_string(),
+    )
+}
+
+fn completion_usage_value(usage: &Usage) -> Value {
+    json!({
+        "prompt_tokens": usage.input_tokens,
+        "completion_tokens": usage.output_tokens,
+        "total_tokens": usage.input_tokens.saturating_add(usage.output_tokens)
+    })
+}
+
+fn completion_finish_reason(reason: Option<&SemanticFinishReason>) -> &'static str {
+    match reason {
+        Some(SemanticFinishReason::Length) => "length",
+        Some(SemanticFinishReason::ContentFilter) => "content_filter",
+        Some(SemanticFinishReason::Cancelled | SemanticFinishReason::Error) => "error",
+        _ => "stop",
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ChatRequest {
     model: String,
     messages: Vec<ChatMessage>,
@@ -933,12 +1227,13 @@ impl ChatRequest {
         };
         Ok(SemanticRequest {
             model: self.model,
-            conversation: Conversation { messages },
+            input: SemanticInput::Conversation(Conversation { messages }),
             sampling: SamplingParameters {
                 max_output_tokens: self.max_completion_tokens.or(self.max_tokens),
                 temperature: self.temperature,
                 top_p: self.top_p,
                 seed: None,
+                stop_sequences: Vec::new(),
             },
             tools,
             tool_choice: parse_tool_choice(self.tool_choice)?,

@@ -130,13 +130,13 @@ fn service(output: FakeEngineOutput) -> (DefaultInferenceService, Arc<FakeEngine
 fn request() -> SemanticRequest {
     SemanticRequest {
         model: "test-model".to_owned(),
-        conversation: Conversation {
+        input: locus_semantics::SemanticInput::Conversation(Conversation {
             messages: vec![ConversationMessage {
                 role: ConversationRole::User,
                 content: "hello".to_owned(),
                 tool_call_id: None,
             }],
-        },
+        }),
         ..SemanticRequest::default()
     }
 }
