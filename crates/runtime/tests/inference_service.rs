@@ -9,7 +9,10 @@ use locus_core::{
     ParallelLayout, RequestId, RuntimeIdentity, SemanticComponentIdentity, SemanticIdentity,
 };
 use locus_engine::{EngineRegistry, FakeEngineAdapter, FakeEngineOutput};
-use locus_planner::{ACTIVE_CONFIRMATION, CalibrationPolicy, PersistentCalibrator, PlacementMode};
+use locus_planner::{
+    ACTIVE_CONFIRMATION, CalibrationKey, CalibrationObservation, CalibrationPolicy,
+    PersistentCalibrator, PlacementMode,
+};
 use locus_runtime::{
     DefaultInferenceService, InferenceService, PlacementConfigurationError, PlacementControl,
 };
@@ -255,4 +258,138 @@ async fn active_mode_falls_back_safely_before_calibration_is_qualified() {
     assert!(readiness.calibration_persistent);
     assert!(readiness.calibration_persistence_healthy);
     assert!(readiness.calibration_revision >= 1);
+}
+
+#[tokio::test]
+async fn qualified_active_placement_selects_the_calibrated_target() {
+    let (model, semantic_identity) = model_and_semantics();
+    let models = ModelRegistry::new();
+    models
+        .register(Arc::new(BasicModelSemantics::new(
+            ModelProfile {
+                public_aliases: vec!["test-model".to_owned()],
+                model: model.clone(),
+                semantic_identity: semantic_identity.clone(),
+            },
+            Arc::new(ByteTokenizer::new(
+                semantic_identity.input.tokenizer.clone(),
+            )),
+            Arc::new(SimpleTemplateRenderer::new(
+                semantic_identity.input.template.clone(),
+            )),
+            Arc::new(ByteDecoder),
+        )))
+        .expect("register model");
+
+    let capabilities = EngineCapabilities {
+        supported_input_kinds: BTreeSet::from([InputKind::TokenSequence]),
+        emits_token_deltas: true,
+        emits_text_deltas: true,
+        emits_reasoning_deltas: true,
+        emits_tool_calls: true,
+        supports_structured_output: true,
+        supported_state_kinds: BTreeSet::new(),
+    };
+    let make_engine = |suffix: &str| {
+        let engine_ref = EngineInstanceRef {
+            id: EngineInstanceId::new(format!("engine-{suffix}")),
+            generation: 1,
+        };
+        let instance = EngineInstance {
+            reference: engine_ref.clone(),
+            runtime: RuntimeIdentity {
+                kind: "fake".to_owned(),
+                runtime_version: "v1".to_owned(),
+                adapter_version: "v1".to_owned(),
+            },
+            topology: format!("node-{suffix}"),
+            hardware: "cpu".to_owned(),
+            health_endpoint: None,
+        };
+        let target = ExecutionTarget {
+            id: ExecutionTargetId::new(format!("target-{suffix}")),
+            engine: engine_ref,
+            model: model.clone(),
+            role: ExecutionRole::Combined,
+            parallel_layout: ParallelLayout {
+                tensor_parallel: 1,
+                pipeline_parallel: 1,
+                expert_parallel: 1,
+                layout_revision: "layout-v1".to_owned(),
+            },
+            residency: "resident".to_owned(),
+            capability_revision: "cap-v1".to_owned(),
+        };
+        (
+            Arc::new(FakeEngineAdapter::new(
+                instance,
+                target.clone(),
+                capabilities.clone(),
+            )),
+            target,
+        )
+    };
+    let (engine_a, target_a) = make_engine("a");
+    let (engine_b, target_b) = make_engine("b");
+    let engines = EngineRegistry::new();
+    engines
+        .register(engine_a.clone())
+        .expect("register engine a");
+    engines
+        .register(engine_b.clone())
+        .expect("register engine b");
+
+    let temporary = tempfile::tempdir().expect("temporary directory");
+    let policy = CalibrationPolicy {
+        ewma_alpha_bps: 10_000,
+        min_samples_per_metric: 1,
+        max_mape_bps: 10_000,
+        min_shadow_decisions: 10,
+        min_shadow_agreement_bps: 9_000,
+        persistence_flush_every_updates: 1_000,
+        ..CalibrationPolicy::default()
+    };
+    let calibrator =
+        PersistentCalibrator::load(policy, Some(temporary.path().join("calibration.json")))
+            .expect("persistent calibrator");
+    for _ in 0..10 {
+        calibrator
+            .record_shadow_decision(true, "same", "same")
+            .expect("seed shadow agreement");
+    }
+    for (target, ttft, generation) in [(&target_a, 100_000, 100_000), (&target_b, 100, 100)] {
+        calibrator
+            .record_observation(&CalibrationObservation {
+                key: CalibrationKey::from_target(target),
+                waiting_requests: Some(0),
+                input_tokens: 10,
+                output_tokens: 10,
+                time_to_first_token_micros: Some(ttft),
+                generation_micros: Some(generation),
+                topology_micros: None,
+                materialization: None,
+                completed: true,
+            })
+            .expect("seed target calibration");
+    }
+    let placement =
+        PlacementControl::new(PlacementMode::Active, calibrator, Some(ACTIVE_CONFIRMATION))
+            .expect("active placement");
+    let state_provider: Arc<dyn StateProvider> = Arc::new(NullStateProvider::default());
+    let service = DefaultInferenceService::new(models, engines, state_provider)
+        .with_placement_control(placement);
+
+    service
+        .infer(
+            request(),
+            OperationContext::new(RequestId::new("req-active-qualified")),
+        )
+        .await
+        .expect("start inference")
+        .try_collect::<Vec<_>>()
+        .await
+        .expect("collect response");
+
+    assert_eq!(engine_a.call_counts().execute, 0);
+    assert_eq!(engine_b.call_counts().execute, 1);
 }
