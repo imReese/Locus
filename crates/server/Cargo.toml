@@ -12,6 +12,7 @@ locus-core = { path = "../core" }
 locus-engine = { path = "../engine" }
 locus-engine-openai = { path = "../engine-openai" }
 locus-openai = { path = "../openai" }
+locus-planner = { path = "../planner" }
 locus-runtime = { path = "../runtime" }
 locus-semantics = { path = "../semantics" }
 locus-semantics-hf = { path = "../semantics-hf" }

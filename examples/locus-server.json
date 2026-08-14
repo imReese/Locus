@@ -41,6 +41,15 @@
       "runtime_version": "replace-with-sglang-version",
       "topology": "node-0/gpu-0",
       "hardware": "cuda",
+      "telemetry": {
+        "metrics_path": "/metrics",
+        "request_timeout_millis": 2000,
+        "min_scrape_interval_millis": 500,
+        "valid_for_millis": 5000,
+        "max_response_bytes": 2097152,
+        "max_samples": 20000,
+        "require_fresh_metrics": true
+      },
       "tensor_parallel": 1,
       "pipeline_parallel": 1,
       "expert_parallel": 1
@@ -48,6 +57,17 @@
   ],
   "state": {
     "kind": "disabled"
+  },
+  "placement": {
+    "mode": "shadow",
+    "state_path": "/var/lib/locus/calibration.json",
+    "calibration": {
+      "min_samples_per_metric": 32,
+      "max_mape_bps": 2500,
+      "min_shadow_decisions": 128,
+      "min_shadow_agreement_bps": 9500,
+      "persistence_flush_every_updates": 16
+    }
   },
   "observability": {
     "json": true,

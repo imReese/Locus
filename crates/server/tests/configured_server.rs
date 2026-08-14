@@ -7,7 +7,9 @@ use axum::http::{Request, Response, StatusCode, header};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use http_body_util::BodyExt;
-use locus_server::{EngineModelSettings, ToolParserSettings, build_server, load_config};
+use locus_server::{
+    EngineModelSettings, PlacementModeSettings, ToolParserSettings, build_server, load_config,
+};
 use serde_json::{Value, json};
 use tempfile::tempdir;
 use tokenizers::Tokenizer;
@@ -561,6 +563,9 @@ async fn dynamic_inventory_exposes_only_routable_catalog_profiles() {
     .expect("readiness JSON");
     assert_eq!(readiness_body["model_profiles"], 2);
     assert_eq!(readiness_body["routable_models"], 1);
+    assert_eq!(readiness_body["placement_mode"], "shadow");
+    assert_eq!(readiness_body["calibration_persistent"], false);
+    assert_eq!(readiness_body["calibration_persistence_healthy"], true);
 
     let models = server
         .app
@@ -698,4 +703,40 @@ fn invalid_profile_parser_configuration_fails_startup() {
         Err(error) => error,
     };
     assert!(error.to_string().contains("must be greater than zero"));
+}
+
+#[test]
+fn active_placement_configuration_fails_closed_without_exact_confirmation() {
+    let (directory, config_path) = write_config();
+    let mut config = load_config(&config_path).expect("load config");
+    config.placement.mode = PlacementModeSettings::Active;
+    config.placement.state_path = Some("calibration.json".into());
+    config.placement.active_confirmation = Some("yes".to_owned());
+    let error = match build_server(config, directory.path()) {
+        Ok(_) => panic!("active placement without exact confirmation must fail"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("enable-calibrated-placement"));
+}
+
+#[test]
+fn active_placement_accepts_persistent_state_and_exact_confirmation() {
+    let (directory, config_path) = write_config();
+    let mut config = load_config(&config_path).expect("load config");
+    config.placement.mode = PlacementModeSettings::Active;
+    config.placement.state_path = Some("state/calibration.json".into());
+    config.placement.active_confirmation = Some(locus_planner::ACTIVE_CONFIRMATION.to_owned());
+    build_server(config, directory.path()).expect("build active server");
+}
+
+#[test]
+fn zero_telemetry_limits_fail_startup() {
+    let (directory, config_path) = write_config();
+    let mut config = load_config(&config_path).expect("load config");
+    config.engines[0].telemetry.max_samples = 0;
+    let error = match build_server(config, directory.path()) {
+        Ok(_) => panic!("zero telemetry sample limit must fail"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("telemetry limits"));
 }

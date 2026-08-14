@@ -137,6 +137,13 @@ async fn readiness(State(service): State<Arc<dyn InferenceService>>) -> Response
             "required_models": report.required_models,
             "ready_targets": report.ready_targets,
             "observed_targets": report.observed_targets,
+            "placement_mode": match report.placement_mode {
+                locus_planner::PlacementMode::Shadow => "shadow",
+                locus_planner::PlacementMode::Active => "active",
+            },
+            "calibration_revision": report.calibration_revision,
+            "calibration_persistent": report.calibration_persistent,
+            "calibration_persistence_healthy": report.calibration_persistence_healthy,
         }))
         .into_response(),
         Err(error) => (

@@ -21,7 +21,8 @@ use locus_engine_openai::{
     VllmEngineAdapter,
 };
 use locus_openai::{ApiConfig, router_with_config};
-use locus_runtime::{DefaultInferenceService, InferenceService};
+use locus_planner::{CalibrationPolicy, PersistentCalibrator, PlacementMode};
+use locus_runtime::{DefaultInferenceService, InferenceService, PlacementControl};
 use locus_semantics::ModelRegistry;
 use locus_semantics_hf::{
     HuggingFaceProfileSpec, TaggedJsonToolParserSpec, TaggedReasoningParserSpec,
@@ -55,6 +56,8 @@ pub struct ServerConfig {
     pub state: StateSettings,
     #[serde(default)]
     pub observability: ObservabilitySettings,
+    #[serde(default)]
+    pub placement: PlacementSettings,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -241,6 +244,49 @@ pub struct EngineSettings {
     pub expert_parallel: u16,
     #[serde(default = "default_layout_revision")]
     pub layout_revision: String,
+    #[serde(default)]
+    pub telemetry: EngineTelemetrySettings,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct EngineTelemetrySettings {
+    pub metrics_path: String,
+    pub request_timeout_millis: u64,
+    pub min_scrape_interval_millis: u64,
+    pub valid_for_millis: u64,
+    pub max_response_bytes: usize,
+    pub max_samples: usize,
+    pub require_fresh_metrics: bool,
+}
+
+impl Default for EngineTelemetrySettings {
+    fn default() -> Self {
+        let defaults = RemoteTelemetryConfig::default();
+        Self {
+            metrics_path: defaults.metrics_path,
+            request_timeout_millis: defaults.request_timeout_millis,
+            min_scrape_interval_millis: defaults.min_scrape_interval_millis,
+            valid_for_millis: defaults.valid_for_millis,
+            max_response_bytes: defaults.max_response_bytes,
+            max_samples: defaults.max_samples,
+            require_fresh_metrics: defaults.require_fresh_metrics,
+        }
+    }
+}
+
+impl EngineTelemetrySettings {
+    fn remote_config(&self) -> RemoteTelemetryConfig {
+        RemoteTelemetryConfig {
+            metrics_path: self.metrics_path.clone(),
+            request_timeout_millis: self.request_timeout_millis,
+            min_scrape_interval_millis: self.min_scrape_interval_millis,
+            valid_for_millis: self.valid_for_millis,
+            max_response_bytes: self.max_response_bytes,
+            max_samples: self.max_samples,
+            require_fresh_metrics: self.require_fresh_metrics,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -288,6 +334,101 @@ const fn default_parallel_degree() -> u16 {
 
 fn default_layout_revision() -> String {
     "v1".to_owned()
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PlacementModeSettings {
+    #[default]
+    Shadow,
+    Active,
+}
+
+impl PlacementModeSettings {
+    fn runtime_mode(self) -> PlacementMode {
+        match self {
+            Self::Shadow => PlacementMode::Shadow,
+            Self::Active => PlacementMode::Active,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PlacementSettings {
+    pub mode: PlacementModeSettings,
+    pub state_path: Option<PathBuf>,
+    pub active_confirmation: Option<String>,
+    pub calibration: CalibrationSettings,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CalibrationSettings {
+    pub ewma_alpha_bps: u32,
+    pub min_samples_per_metric: u64,
+    pub max_mape_bps: u64,
+    pub min_shadow_decisions: u64,
+    pub min_shadow_agreement_bps: u64,
+    pub conservative_queue_micros: u64,
+    pub conservative_queue_micros_per_waiting_request: u64,
+    pub conservative_prefill_micros_per_token: u64,
+    pub conservative_decode_micros_per_token: u64,
+    pub conservative_materialization_ratio_bps: u64,
+    pub conservative_topology_micros: u64,
+    pub max_unit_micros: u64,
+    pub max_materialization_ratio_bps: u64,
+    pub persistence_flush_every_updates: u64,
+}
+
+impl Default for CalibrationSettings {
+    fn default() -> Self {
+        Self::from(CalibrationPolicy::default())
+    }
+}
+
+impl From<CalibrationPolicy> for CalibrationSettings {
+    fn from(policy: CalibrationPolicy) -> Self {
+        Self {
+            ewma_alpha_bps: policy.ewma_alpha_bps,
+            min_samples_per_metric: policy.min_samples_per_metric,
+            max_mape_bps: policy.max_mape_bps,
+            min_shadow_decisions: policy.min_shadow_decisions,
+            min_shadow_agreement_bps: policy.min_shadow_agreement_bps,
+            conservative_queue_micros: policy.conservative_queue_micros,
+            conservative_queue_micros_per_waiting_request: policy
+                .conservative_queue_micros_per_waiting_request,
+            conservative_prefill_micros_per_token: policy.conservative_prefill_micros_per_token,
+            conservative_decode_micros_per_token: policy.conservative_decode_micros_per_token,
+            conservative_materialization_ratio_bps: policy.conservative_materialization_ratio_bps,
+            conservative_topology_micros: policy.conservative_topology_micros,
+            max_unit_micros: policy.max_unit_micros,
+            max_materialization_ratio_bps: policy.max_materialization_ratio_bps,
+            persistence_flush_every_updates: policy.persistence_flush_every_updates,
+        }
+    }
+}
+
+impl CalibrationSettings {
+    fn policy(&self) -> CalibrationPolicy {
+        CalibrationPolicy {
+            ewma_alpha_bps: self.ewma_alpha_bps,
+            min_samples_per_metric: self.min_samples_per_metric,
+            max_mape_bps: self.max_mape_bps,
+            min_shadow_decisions: self.min_shadow_decisions,
+            min_shadow_agreement_bps: self.min_shadow_agreement_bps,
+            conservative_queue_micros: self.conservative_queue_micros,
+            conservative_queue_micros_per_waiting_request: self
+                .conservative_queue_micros_per_waiting_request,
+            conservative_prefill_micros_per_token: self.conservative_prefill_micros_per_token,
+            conservative_decode_micros_per_token: self.conservative_decode_micros_per_token,
+            conservative_materialization_ratio_bps: self.conservative_materialization_ratio_bps,
+            conservative_topology_micros: self.conservative_topology_micros,
+            max_unit_micros: self.max_unit_micros,
+            max_materialization_ratio_bps: self.max_materialization_ratio_bps,
+            persistence_flush_every_updates: self.persistence_flush_every_updates,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -492,7 +633,7 @@ pub fn build_server(
             api_key: resolve_optional_secret(engine.api_key_env.as_deref())?,
             instance,
             targets,
-            telemetry: RemoteTelemetryConfig::default(),
+            telemetry: engine.telemetry.remote_config(),
         };
         let adapter: Arc<dyn EngineAdapter> = match engine.kind {
             EngineKind::Sglang => Arc::new(SglangEngineAdapter::new(remote)?),
@@ -519,9 +660,22 @@ pub fn build_server(
             semantic_type: required("state.semantic_type", semantic_type)?,
         })?),
     };
+    let calibration_path = config
+        .placement
+        .state_path
+        .as_deref()
+        .map(|path| resolve_path(config_directory, path));
+    let calibrator =
+        PersistentCalibrator::load(config.placement.calibration.policy(), calibration_path)?;
+    let placement = PlacementControl::new(
+        config.placement.mode.runtime_mode(),
+        calibrator,
+        config.placement.active_confirmation.as_deref(),
+    )?;
     let service: Arc<dyn InferenceService> = Arc::new(
         DefaultInferenceService::new(models, engines, state_provider)
-            .with_required_models(required_models),
+            .with_required_models(required_models)
+            .with_placement_control(placement),
     );
     let api = ApiConfig {
         bearer_token: resolve_optional_secret(config.api.bearer_token_env.as_deref())?,
@@ -732,4 +886,8 @@ pub enum ServerError {
     State(#[from] locus_state::StateError),
     #[error(transparent)]
     Api(#[from] locus_openai::ApiConfigError),
+    #[error(transparent)]
+    Calibration(#[from] locus_planner::CalibrationError),
+    #[error(transparent)]
+    Placement(#[from] locus_runtime::PlacementConfigurationError),
 }

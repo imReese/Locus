@@ -11,6 +11,7 @@ async-stream.workspace = true
 axum.workspace = true
 futures.workspace = true
 locus-core = { path = "../core" }
+locus-planner = { path = "../planner" }
 locus-runtime = { path = "../runtime" }
 locus-semantics = { path = "../semantics" }
 serde.workspace = true
