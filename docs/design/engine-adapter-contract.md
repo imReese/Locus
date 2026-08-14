@@ -6,9 +6,11 @@ This contract is implemented as a pre-1.0 Rust API. A deterministic fake
 validates import and execution lifecycles. The separate
 `locus-engine-openai` crate implements network adapters for SGLang and vLLM
 OpenAI-compatible `/v1/completions` endpoints without introducing their types
-into `locus-engine`. Mock HTTP/SSE tests cover pretokenized requests, text and
-usage events, finish reasons, stop-sequence transport, structured-output fields,
-and SGLang aborts. No
+into `locus-engine`. The adapters discover currently loaded models through
+`GET /v1/models` and publish only candidates bound to immutable Locus model
+identities. Mock HTTP/SSE tests cover dynamic model inventory, pretokenized
+requests, text and usage events, finish reasons, stop-sequence transport,
+structured-output fields, and SGLang aborts. No
 live runtime, GPU, latency, or native state-import result is claimed by CI. The
 opt-in `scripts/live_engine_conformance.py` harness checks a configured runtime's
 health, pretokenized completion SSE lifecycle, usage, finish reason, terminal
@@ -107,6 +109,11 @@ Generated RPC messages and engine SDK types remain inside the adapter crate.
 
 It does not contain one permanent model revision. A multi-model process may
 load or unload several targets during the same instance generation.
+
+For the OpenAI-compatible adapters, configured candidate bindings define the
+trusted mapping from downstream model names to immutable Locus identities. The
+live `/v1/models` response controls which candidates are published. Unknown
+downstream names are not converted into execution identities heuristically.
 
 `ExecutionTarget` is the planner-selectable unit. It references an engine
 instance and generation, then identifies:

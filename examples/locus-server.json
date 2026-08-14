@@ -38,12 +38,9 @@
       "id": "sglang-0",
       "kind": "sglang",
       "base_url": "http://127.0.0.1:30000",
-      "served_model": "my-model",
-      "model": "my-model",
       "runtime_version": "replace-with-sglang-version",
       "topology": "node-0/gpu-0",
       "hardware": "cuda",
-      "target_id": "sglang-0/my-model",
       "tensor_parallel": 1,
       "pipeline_parallel": 1,
       "expert_parallel": 1

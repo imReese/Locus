@@ -15,9 +15,9 @@ stream-close cancellation.
 - `POST /v1/responses`: non-streaming JSON and SSE streaming
 - `POST /v1/chat/completions`: non-streaming JSON and SSE streaming
 - `POST /v1/completions`: single raw text or token-ID prompt, JSON and SSE
-- `GET /v1/models`: registered public model aliases
+- `GET /v1/models`: public aliases with at least one live, healthy execution target
 - `GET /healthz`: process liveness; intentionally does not probe dependencies
-- `GET /readyz`: registered-model coverage and live engine health snapshots
+- `GET /readyz`: gateway routability, explicit required-model gates, and target health
 
 Responses is the primary interface. Chat Completions and Completions are
 compatibility layers: all three translate into `SemanticRequest`, call the same
@@ -43,9 +43,10 @@ completion-shaped usage, and a terminal `[DONE]` for SSE. `stream_options` may
 request a final usage chunk.
 
 Unknown JSON fields and explicitly unsupported options are rejected with an
-OpenAI-shaped error envelope rather than ignored. Model lookup failures,
-invalid requests, unavailable placement, cancellation, deadlines, and internal
-failures map to stable error categories.
+OpenAI-shaped error envelope rather than ignored. An unknown semantic profile
+returns `model_not_found` with HTTP 404; a known profile without an eligible live
+target returns `no_available_target` with HTTP 503. Invalid requests,
+cancellation, deadlines, and internal failures map to stable error categories.
 
 `locus-server` can require a bearer token for every `/v1/*` route while leaving
 the probe routes unauthenticated for an orchestrator. Token comparison is

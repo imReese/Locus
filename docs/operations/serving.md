@@ -2,11 +2,13 @@
 
 ## Status
 
-`locus-server` is the deployable Locus process. It loads one JSON configuration,
-constructs production model semantics, registers SGLang or vLLM adapters and an
-optional NexusKV provider, applies ingress policy, and serves the OpenAI routes.
-The server fails startup on ambiguous or invalid dependency assembly rather than
-starting with a silently partial configuration.
+`locus-server` is the deployable Locus process. It loads a static model-catalog
+source from one JSON configuration, constructs production model semantics,
+registers SGLang or vLLM adapters and an optional NexusKV provider, applies
+ingress policy, and serves the OpenAI routes. Model semantics and live engine
+inventory are separate: a catalog profile may exist while no engine currently
+serves it. Invalid semantic artifacts and ambiguous identity mappings still fail
+startup.
 
 ## Start the server
 
@@ -33,15 +35,17 @@ The top-level configuration contains:
 | --- | --- |
 | `listen` | Socket address for the Locus HTTP server |
 | `api` | Bearer-secret environment variable and global ingress limits |
-| `models` | Public aliases plus immutable model and semantic artifacts |
-| `engines` | SGLang/vLLM instances and planner-selectable targets |
+| `models` | Static catalog source: public aliases plus immutable model and semantic artifacts |
+| `required_models` | Optional aliases that must be routable for readiness |
+| `engines` | SGLang/vLLM instances whose live model inventory is discovered at runtime |
 | `state` | Disabled or a versioned NexusKV bridge configuration |
 | `observability` | Default tracing filter and compact/JSON log format |
 
 Unknown fields are rejected. Empty identities, zero parallel degrees, zero
-engine generations, duplicate engine/target IDs, unknown model references,
-models without an engine, missing secrets, unreadable artifacts, invalid
-tokenizer JSON, and invalid templates all fail startup.
+engine generations, duplicate engine/target IDs, unknown explicit profile
+mappings, missing secrets, unreadable artifacts, invalid tokenizer JSON, and
+invalid templates all fail startup. A model profile without a currently loaded
+engine target does not fail startup.
 
 Secrets are named in configuration and read from the environment. The secret
 value itself does not belong in the JSON file:
@@ -114,9 +118,57 @@ unknown functions, non-object arguments, and over-limit calls fail the request.
 Profiles without a local parser still require compatible typed runtime events
 and are rejected during planning when the adapter cannot provide them.
 
+The `models` array is a semantic catalog, not an engine allowlist. Locus needs a
+trusted tokenizer, template, parser configuration, and immutable execution
+identity before it can safely normalize a request. A downstream model name that
+has no catalog profile is therefore ignored rather than exposed through a
+wildcard passthrough.
+
 The current production template context supports text messages, function tool
 schemas, tool choice, and deployment values. Multimodal bindings and additional
 model-specific parser dialects are not implemented.
+
+## Engine model discovery
+
+Engine entries identify runtime instances, not permanent model deployments. On
+target discovery each SGLang/vLLM adapter calls the instance's `GET /v1/models`
+endpoint and publishes only the intersection between its live inventory and the
+configured model catalog. Loading or unloading a model changes the planner's
+target inventory without restarting Locus.
+
+By default every public catalog alias is offered as a candidate downstream model
+name to every engine. The minimal engine configuration therefore contains only
+instance facts:
+
+```json
+{
+  "id": "sglang-0",
+  "kind": "sglang",
+  "base_url": "http://127.0.0.1:30000",
+  "runtime_version": "0.5.2",
+  "topology": "node-0/gpu-0",
+  "hardware": "cuda"
+}
+```
+
+When the downstream name differs from the public alias, configure an explicit
+identity mapping:
+
+```json
+{
+  "model_mappings": [
+    {
+      "upstream_model": "org/model-runtime-name",
+      "profile": "public-model-name"
+    }
+  ]
+}
+```
+
+An optional `target_id` may be added to a mapping; otherwise Locus derives
+`<engine-id>/<upstream-model>`. The legacy `served_model`, `model`, and
+`target_id` fields remain accepted together as a single-model compatibility
+form, but new configurations should use discovery defaults or `model_mappings`.
 
 ## Raw Completions example
 
@@ -144,11 +196,17 @@ are rejected rather than silently flattened.
 `GET /healthz` is a liveness probe. It answers while the process and router are
 running and intentionally does not call a downstream dependency.
 
-`GET /readyz` is a readiness probe. It loads every registered model profile,
-discovers configured targets, calls their health snapshots, and returns success
-only when every model identity has at least one ready target. Partial engine
-failure is tolerated only when another ready target covers the same model.
-Failure returns HTTP 503 with concise dependency evidence.
+`GET /v1/models` reports the public aliases whose immutable profile has at least
+one currently discovered, healthy target. A known profile without a target is
+omitted until an engine advertises it.
+
+`GET /readyz` is a readiness probe. It succeeds when at least one catalog model
+has a discovered, healthy target. Other catalog profiles may be unavailable
+without taking the whole gateway out of service. Add aliases to top-level
+`required_models` when a deployment contract requires specific models; each
+listed alias must then have a ready target. Failure returns HTTP 503 with concise
+dependency evidence. The response reports total profiles, routable models,
+required models, observed targets, and ready targets.
 
 The probes are intentionally outside bearer authentication so Kubernetes or
 another local orchestrator can call them. Do not expose them as a substitute for
