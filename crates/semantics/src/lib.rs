@@ -234,6 +234,17 @@ pub trait ModelSemantics: Send + Sync {
     ) -> Result<Box<dyn SemanticOutputPipeline>, SemanticError>;
 }
 
+/// Resolves public model names to immutable semantic profiles.
+///
+/// A catalog is intentionally independent from engine inventory: knowing how to
+/// normalize a model does not imply that an execution target is currently
+/// available for it.
+pub trait ModelCatalog: Send + Sync {
+    fn resolve(&self, alias: &str) -> Result<Arc<dyn ModelSemantics>, SemanticError>;
+
+    fn profiles(&self) -> Result<Vec<ModelProfile>, SemanticError>;
+}
+
 #[derive(Clone, Default)]
 pub struct ModelRegistry {
     inner: Arc<RwLock<ModelRegistryInner>>,
@@ -295,6 +306,16 @@ impl ModelRegistry {
             .values()
             .cloned()
             .collect())
+    }
+}
+
+impl ModelCatalog for ModelRegistry {
+    fn resolve(&self, alias: &str) -> Result<Arc<dyn ModelSemantics>, SemanticError> {
+        Self::resolve(self, alias)
+    }
+
+    fn profiles(&self) -> Result<Vec<ModelProfile>, SemanticError> {
+        Self::profiles(self)
     }
 }
 

@@ -19,7 +19,9 @@ use locus_core::{
     SamplingParameters, SemanticComponentIdentity, SemanticIdentity, TypedMetadata,
 };
 use locus_engine::EngineAdapter;
-use locus_engine_openai::{RemoteEngineConfig, SglangEngineAdapter, VllmEngineAdapter};
+use locus_engine_openai::{
+    RemoteEngineConfig, RemoteExecutionTarget, SglangEngineAdapter, VllmEngineAdapter,
+};
 use serde_json::{Value, json};
 
 #[derive(Clone, Default)]
@@ -27,11 +29,23 @@ struct Capture {
     completions: Arc<Mutex<Vec<Value>>>,
     aborts: Arc<Mutex<Vec<Value>>>,
     health_calls: Arc<AtomicUsize>,
+    models: Arc<Mutex<BTreeSet<String>>>,
 }
 
 async fn health(State(capture): State<Capture>) -> &'static str {
     capture.health_calls.fetch_add(1, Ordering::AcqRel);
     "ok"
+}
+
+async fn models(State(capture): State<Capture>) -> Json<Value> {
+    let data = capture
+        .models
+        .lock()
+        .expect("models lock")
+        .iter()
+        .map(|id| json!({"id": id, "object": "model"}))
+        .collect::<Vec<_>>();
+    Json(json!({"object": "list", "data": data}))
 }
 
 async fn completions(State(capture): State<Capture>, Json(body): Json<Value>) -> Response<Body> {
@@ -58,8 +72,14 @@ async fn abort(State(capture): State<Capture>, Json(body): Json<Value>) {
 
 async fn server() -> (String, Capture) {
     let capture = Capture::default();
+    capture
+        .models
+        .lock()
+        .expect("models lock")
+        .insert("served-model".to_owned());
     let app = Router::new()
         .route("/health", get(health))
+        .route("/v1/models", get(models))
         .route("/v1/completions", post(completions))
         .route("/abort_request", post(abort))
         .with_state(capture.clone());
@@ -118,7 +138,6 @@ fn config(base_url: String, kind: &str) -> RemoteEngineConfig {
     RemoteEngineConfig {
         base_url,
         api_key: Some("secret".to_owned()),
-        served_model: "served-model".to_owned(),
         instance: EngineInstance {
             reference: engine.clone(),
             runtime: RuntimeIdentity {
@@ -130,20 +149,23 @@ fn config(base_url: String, kind: &str) -> RemoteEngineConfig {
             hardware: "mock".to_owned(),
             health_endpoint: None,
         },
-        target: ExecutionTarget {
-            id: ExecutionTargetId::new(format!("{kind}-target")),
-            engine,
-            model,
-            role: ExecutionRole::Combined,
-            parallel_layout: ParallelLayout {
-                tensor_parallel: 1,
-                pipeline_parallel: 1,
-                expert_parallel: 1,
-                layout_revision: "v1".to_owned(),
+        targets: vec![RemoteExecutionTarget {
+            served_model: "served-model".to_owned(),
+            target: ExecutionTarget {
+                id: ExecutionTargetId::new(format!("{kind}-target")),
+                engine,
+                model,
+                role: ExecutionRole::Combined,
+                parallel_layout: ParallelLayout {
+                    tensor_parallel: 1,
+                    pipeline_parallel: 1,
+                    expert_parallel: 1,
+                    layout_revision: "v1".to_owned(),
+                },
+                residency: "resident".to_owned(),
+                capability_revision: "v1".to_owned(),
             },
-            residency: "resident".to_owned(),
-            capability_revision: "v1".to_owned(),
-        },
+        }],
     }
 }
 
@@ -363,6 +385,39 @@ async fn vllm_adapter_streams_pretokenized_completions_with_request_id() {
     assert_eq!(body["response_format"]["type"], "json_schema");
     assert_eq!(body["response_format"]["json_schema"]["strict"], true);
     assert_eq!(body["add_special_tokens"], false);
+}
+
+#[tokio::test]
+async fn execution_targets_follow_the_remote_model_inventory() {
+    let (base_url, capture) = server().await;
+    let mut remote = config(base_url, "sglang");
+    let mut second = remote.targets[0].clone();
+    second.served_model = "second-model".to_owned();
+    second.target.id = ExecutionTargetId::new("sglang-second-target");
+    second.target.model.model_revision = "model-v2".to_owned();
+    remote.targets.push(second);
+    let adapter = SglangEngineAdapter::new(remote).expect("adapter");
+    let context = OperationContext::new(RequestId::new("discover-dynamic"));
+
+    let initial = adapter
+        .execution_targets(&context)
+        .await
+        .expect("initial targets");
+    assert_eq!(initial.len(), 1);
+    assert_eq!(initial[0].model.model_revision, "model-v1");
+
+    {
+        let mut models = capture.models.lock().expect("models lock");
+        models.clear();
+        models.insert("second-model".to_owned());
+        models.insert("unconfigured-model".to_owned());
+    }
+    let refreshed = adapter
+        .execution_targets(&context)
+        .await
+        .expect("refreshed targets");
+    assert_eq!(refreshed.len(), 1);
+    assert_eq!(refreshed[0].model.model_revision, "model-v2");
 }
 
 #[test]

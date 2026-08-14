@@ -18,8 +18,15 @@ use locus_engine::{EngineAdapter, EngineError, EngineEventStream};
 pub struct RemoteEngineConfig {
     pub base_url: String,
     pub api_key: Option<String>,
-    pub served_model: String,
     pub instance: EngineInstance,
+    pub targets: Vec<RemoteExecutionTarget>,
+}
+
+#[derive(Clone, Debug)]
+pub struct RemoteExecutionTarget {
+    /// Model name accepted by the downstream OpenAI-compatible API.
+    pub served_model: String,
+    /// Immutable Locus identity and planner metadata for this candidate.
     pub target: ExecutionTarget,
 }
 
@@ -42,10 +49,36 @@ impl RemoteCompletionAdapter {
                 "remote engine base URL must not be empty".to_owned(),
             ));
         }
-        if config.target.engine != config.instance.reference {
+        if config.targets.is_empty() {
             return Err(EngineError::Execution(
-                "remote target generation does not match engine instance".to_owned(),
+                "remote engine must have at least one model candidate".to_owned(),
             ));
+        }
+        let mut target_ids = BTreeSet::new();
+        let mut served_models = BTreeSet::new();
+        for candidate in &config.targets {
+            if candidate.target.engine != config.instance.reference {
+                return Err(EngineError::Execution(
+                    "remote target generation does not match engine instance".to_owned(),
+                ));
+            }
+            if candidate.served_model.trim().is_empty() {
+                return Err(EngineError::Execution(
+                    "remote served model must not be empty".to_owned(),
+                ));
+            }
+            if !target_ids.insert(candidate.target.id.clone()) {
+                return Err(EngineError::Execution(format!(
+                    "duplicate remote target id: {}",
+                    candidate.target.id
+                )));
+            }
+            if !served_models.insert(candidate.served_model.clone()) {
+                return Err(EngineError::Execution(format!(
+                    "duplicate remote served model: {}",
+                    candidate.served_model
+                )));
+            }
         }
         Ok(Self {
             config,
@@ -58,11 +91,15 @@ impl RemoteCompletionAdapter {
         format!("{}{}", self.config.base_url.trim_end_matches('/'), path)
     }
 
-    fn validate_target(&self, target: &ExecutionTarget) -> Result<(), EngineError> {
-        if target != &self.config.target {
-            return Err(EngineError::TargetNotFound(target.id.to_string()));
-        }
-        Ok(())
+    fn target_config(
+        &self,
+        target: &ExecutionTarget,
+    ) -> Result<&RemoteExecutionTarget, EngineError> {
+        self.config
+            .targets
+            .iter()
+            .find(|candidate| candidate.target == *target)
+            .ok_or_else(|| EngineError::TargetNotFound(target.id.to_string()))
     }
 
     fn authorized(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
@@ -73,7 +110,11 @@ impl RemoteCompletionAdapter {
         }
     }
 
-    fn completion_body(&self, request: &CanonicalRequest) -> Result<Value, EngineError> {
+    fn completion_body(
+        &self,
+        request: &CanonicalRequest,
+        served_model: &str,
+    ) -> Result<Value, EngineError> {
         let mut token_sequences = request.input.items.iter().filter_map(|item| {
             if let InputItemValue::TokenSequence(tokens) = &item.value {
                 Some(tokens.token_ids.clone())
@@ -111,7 +152,7 @@ impl RemoteCompletionAdapter {
         }
 
         let mut body = json!({
-            "model": self.config.served_model,
+            "model": served_model,
             "prompt": prompt,
             "stream": true,
             "stream_options": {"include_usage": true},
@@ -136,13 +177,54 @@ impl RemoteCompletionAdapter {
         Ok(body)
     }
 
+    async fn execution_targets(
+        &self,
+        context: &OperationContext,
+    ) -> Result<Vec<ExecutionTarget>, EngineError> {
+        context.ensure_active()?;
+        let response = self
+            .authorized(self.client.get(self.endpoint("/v1/models")))
+            .send()
+            .await
+            .map_err(|error| {
+                EngineError::Execution(format!("model discovery request failed: {error}"))
+            })?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let detail = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "response body was unavailable".to_owned());
+            return Err(EngineError::Execution(format!(
+                "model discovery endpoint returned {status}: {detail}"
+            )));
+        }
+        let inventory = response.json::<RemoteModelList>().await.map_err(|error| {
+            EngineError::Execution(format!("invalid model discovery response: {error}"))
+        })?;
+        let active = inventory
+            .data
+            .into_iter()
+            .map(|model| model.id)
+            .collect::<BTreeSet<_>>();
+        let mut targets = self
+            .config
+            .targets
+            .iter()
+            .filter(|candidate| active.contains(&candidate.served_model))
+            .map(|candidate| candidate.target.clone())
+            .collect::<Vec<_>>();
+        targets.sort_by(|left, right| left.id.cmp(&right.id));
+        Ok(targets)
+    }
+
     async fn snapshot(
         &self,
         target: &ExecutionTarget,
         context: &OperationContext,
     ) -> Result<EngineSnapshot, EngineError> {
         context.ensure_active()?;
-        self.validate_target(target)?;
+        self.target_config(target)?;
         let health_endpoint = self
             .config
             .instance
@@ -171,13 +253,13 @@ impl RemoteCompletionAdapter {
         context: OperationContext,
     ) -> Result<EngineEventStream, EngineError> {
         context.ensure_active()?;
-        self.validate_target(target)?;
+        let served_model = self.target_config(target)?.served_model.clone();
         if state.is_some() {
             return Err(EngineError::Unsupported(
                 "remote completion adapter does not import reusable state".to_owned(),
             ));
         }
-        let body = self.completion_body(&request)?;
+        let body = self.completion_body(&request, &served_model)?;
         let response = self
             .authorized(self.client.post(self.endpoint("/v1/completions")))
             .header("x-request-id", request.id.as_str())
@@ -372,6 +454,17 @@ struct RemoteError {
     message: String,
 }
 
+#[derive(Deserialize)]
+struct RemoteModelList {
+    #[serde(default)]
+    data: Vec<RemoteModel>,
+}
+
+#[derive(Deserialize)]
+struct RemoteModel {
+    id: String,
+}
+
 pub struct SglangEngineAdapter {
     inner: RemoteCompletionAdapter,
 }
@@ -408,8 +501,7 @@ macro_rules! impl_remote_adapter {
                 &self,
                 context: &OperationContext,
             ) -> Result<Vec<ExecutionTarget>, EngineError> {
-                context.ensure_active()?;
-                Ok(vec![self.inner.config.target.clone()])
+                self.inner.execution_targets(context).await
             }
 
             async fn capabilities(
@@ -418,7 +510,7 @@ macro_rules! impl_remote_adapter {
                 context: &OperationContext,
             ) -> Result<EngineCapabilities, EngineError> {
                 context.ensure_active()?;
-                self.inner.validate_target(target)?;
+                self.inner.target_config(target)?;
                 Ok(EngineCapabilities {
                     supported_input_kinds: BTreeSet::from([InputKind::TokenSequence]),
                     emits_token_deltas: false,
