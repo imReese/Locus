@@ -11,6 +11,7 @@ workspace = true
 
 [dependencies]
 async-trait.workspace = true
+futures.workspace = true
 locus-core = { path = "../core" }
 locus-engine = { path = "../engine" }
 locus-state = { path = "../state" }
@@ -19,6 +20,5 @@ serde_json.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
-futures.workspace = true
 tempfile = "3.23.0"
 tokio.workspace = true

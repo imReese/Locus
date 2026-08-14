@@ -1,4 +1,7 @@
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
+use std::time::Instant;
 
 use async_trait::async_trait;
 use locus_core::{CanonicalRequest, OperationContext, StateImportSpec, StateImportTarget};
@@ -15,7 +18,43 @@ pub trait PlanExecutor: Send + Sync {
         plan: PlacementPlan,
         request: CanonicalRequest,
         context: OperationContext,
-    ) -> Result<EngineEventStream, PlanExecutionError>;
+    ) -> Result<PlanExecution, PlanExecutionError>;
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExecutedPath {
+    Cold,
+    Reuse,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MaterializationTiming {
+    pub provider: String,
+    pub state_kind: String,
+    pub target_id: String,
+    pub provider_estimated_micros: u64,
+    pub actual_micros: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlanExecutionMetadata {
+    pub executed_path: ExecutedPath,
+    pub fallback_used: bool,
+    pub materialization: Option<MaterializationTiming>,
+    pub topology_micros: Option<u64>,
+}
+
+pub struct PlanExecution {
+    pub stream: EngineEventStream,
+    pub metadata: PlanExecutionMetadata,
+}
+
+impl futures::Stream for PlanExecution {
+    type Item = Result<locus_core::EngineEvent, EngineError>;
+
+    fn poll_next(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.stream.as_mut().poll_next(context)
+    }
 }
 
 pub struct DefaultPlanExecutor {
@@ -39,14 +78,24 @@ impl DefaultPlanExecutor {
         request: CanonicalRequest,
         context: OperationContext,
         cause: String,
-    ) -> Result<EngineEventStream, PlanExecutionError> {
+        materialization: Option<MaterializationTiming>,
+    ) -> Result<PlanExecution, PlanExecutionError> {
         match fallback {
             FallbackAction::ColdOnSameTarget => {
                 let adapter = self.engines.adapter_for(&plan.target)?;
-                adapter
+                let stream = adapter
                     .execute(&plan.target, request, None, context)
                     .await
-                    .map_err(PlanExecutionError::Engine)
+                    .map_err(PlanExecutionError::Engine)?;
+                Ok(PlanExecution {
+                    stream,
+                    metadata: PlanExecutionMetadata {
+                        executed_path: ExecutedPath::Cold,
+                        fallback_used: true,
+                        materialization,
+                        topology_micros: None,
+                    },
+                })
             }
             FallbackAction::Replan => Err(PlanExecutionError::ReplanRequired(cause)),
             FallbackAction::Fail => Err(PlanExecutionError::PlannedPathFailed(cause)),
@@ -60,13 +109,21 @@ impl DefaultPlanExecutor {
         request: CanonicalRequest,
         context: OperationContext,
         cause: String,
-    ) -> Result<EngineEventStream, PlanExecutionError> {
+        materialization: Option<MaterializationTiming>,
+    ) -> Result<PlanExecution, PlanExecutionError> {
         let adapter = self.engines.adapter_for(&plan.target)?;
         if let Err(cleanup) = adapter.abort_state_import(import, &context).await {
             return Err(PlanExecutionError::CleanupFailed { cause, cleanup });
         }
-        self.apply_fallback(plan.fallback, plan, request, context, cause)
-            .await
+        self.apply_fallback(
+            plan.fallback,
+            plan,
+            request,
+            context,
+            cause,
+            materialization,
+        )
+        .await
     }
 }
 
@@ -77,7 +134,7 @@ impl PlanExecutor for DefaultPlanExecutor {
         plan: PlacementPlan,
         request: CanonicalRequest,
         context: OperationContext,
-    ) -> Result<EngineEventStream, PlanExecutionError> {
+    ) -> Result<PlanExecution, PlanExecutionError> {
         context.ensure_active()?;
         if request.model != plan.target.model {
             return Err(PlanExecutionError::InvalidPlan(
@@ -87,13 +144,23 @@ impl PlanExecutor for DefaultPlanExecutor {
 
         let adapter = self.engines.adapter_for(&plan.target)?;
         let ExecutionPath::Reuse(reuse) = &plan.path else {
-            return adapter
+            let stream = adapter
                 .execute(&plan.target, request, None, context)
                 .await
-                .map_err(PlanExecutionError::Engine);
+                .map_err(PlanExecutionError::Engine)?;
+            return Ok(PlanExecution {
+                stream,
+                metadata: PlanExecutionMetadata {
+                    executed_path: ExecutedPath::Cold,
+                    fallback_used: false,
+                    materialization: None,
+                    topology_micros: None,
+                },
+            });
         };
 
         let spec = StateImportSpec::from_plan(&reuse.state, reuse.compatibility.clone());
+        let activation_started = Instant::now();
         let import = match adapter
             .prepare_state_import(&plan.target, &spec, &context)
             .await
@@ -101,11 +168,19 @@ impl PlanExecutor for DefaultPlanExecutor {
             Ok(import) => import,
             Err(error) => {
                 return self
-                    .apply_fallback(plan.fallback, &plan, request, context, error.to_string())
+                    .apply_fallback(
+                        plan.fallback,
+                        &plan,
+                        request,
+                        context,
+                        error.to_string(),
+                        None,
+                    )
                     .await;
             }
         };
 
+        let materialization_started = Instant::now();
         let receipt = match self
             .state_provider
             .materialize(&reuse.option, &import, &context)
@@ -114,9 +189,16 @@ impl PlanExecutor for DefaultPlanExecutor {
             Ok(receipt) => receipt,
             Err(error) => {
                 return self
-                    .abort_then_fallback(&import, &plan, request, context, error.to_string())
+                    .abort_then_fallback(&import, &plan, request, context, error.to_string(), None)
                     .await;
             }
+        };
+        let materialization = MaterializationTiming {
+            provider: reuse.option.provider.as_str().to_owned(),
+            state_kind: reuse.option.state_kind.as_str().to_owned(),
+            target_id: plan.target.id.to_string(),
+            provider_estimated_micros: reuse.option.estimated_transfer_micros,
+            actual_micros: elapsed_micros(materialization_started),
         };
 
         let attachment = match adapter
@@ -126,16 +208,38 @@ impl PlanExecutor for DefaultPlanExecutor {
             Ok(attachment) => attachment,
             Err(error) => {
                 return self
-                    .abort_then_fallback(&import, &plan, request, context, error.to_string())
+                    .abort_then_fallback(
+                        &import,
+                        &plan,
+                        request,
+                        context,
+                        error.to_string(),
+                        Some(materialization),
+                    )
                     .await;
             }
         };
 
-        adapter
+        let stream = adapter
             .execute(&plan.target, request, Some(attachment), context)
             .await
-            .map_err(PlanExecutionError::Engine)
+            .map_err(PlanExecutionError::Engine)?;
+        let topology_micros =
+            elapsed_micros(activation_started).saturating_sub(materialization.actual_micros);
+        Ok(PlanExecution {
+            stream,
+            metadata: PlanExecutionMetadata {
+                executed_path: ExecutedPath::Reuse,
+                fallback_used: false,
+                materialization: Some(materialization),
+                topology_micros: Some(topology_micros),
+            },
+        })
     }
+}
+
+fn elapsed_micros(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)
 }
 
 #[derive(Debug, Error)]

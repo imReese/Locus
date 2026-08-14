@@ -910,8 +910,10 @@ dependencies = [
  "locus-planner",
  "locus-semantics",
  "locus-state",
+ "tempfile",
  "thiserror",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

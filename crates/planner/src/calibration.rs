@@ -3,7 +3,7 @@ use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
 use locus_core::{ExecutionTarget, InputItemValue};
@@ -37,6 +37,7 @@ pub struct CalibrationPolicy {
     pub conservative_topology_micros: u64,
     pub max_unit_micros: u64,
     pub max_materialization_ratio_bps: u64,
+    pub persistence_flush_every_updates: u64,
 }
 
 impl Default for CalibrationPolicy {
@@ -55,6 +56,7 @@ impl Default for CalibrationPolicy {
             conservative_topology_micros: 0,
             max_unit_micros: 60_000_000,
             max_materialization_ratio_bps: 100_000,
+            persistence_flush_every_updates: 16,
         }
     }
 }
@@ -75,6 +77,7 @@ impl CalibrationPolicy {
             || self.conservative_materialization_ratio_bps < 10_000
             || self.max_unit_micros == 0
             || self.max_materialization_ratio_bps < self.conservative_materialization_ratio_bps
+            || self.persistence_flush_every_updates == 0
         {
             return Err(CalibrationError::InvalidPolicy);
         }
@@ -138,6 +141,7 @@ pub struct CalibrationObservation {
     pub output_tokens: u64,
     pub time_to_first_token_micros: Option<u64>,
     pub generation_micros: Option<u64>,
+    pub topology_micros: Option<u64>,
     pub materialization: Option<MaterializationObservation>,
     pub completed: bool,
 }
@@ -167,12 +171,24 @@ pub struct PromotionStatus {
     pub reasons: Vec<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CalibrationStatus {
+    pub revision: u64,
+    pub persistent: bool,
+    pub persistence_healthy: bool,
+    pub dirty_updates: u64,
+    pub shadow_decisions: u64,
+    pub shadow_agreements: u64,
+    pub replay_mismatches: u64,
+}
+
 #[derive(Clone)]
 pub struct PersistentCalibrator {
     policy: CalibrationPolicy,
     state: Arc<Mutex<CalibrationState>>,
     state_path: Option<PathBuf>,
     persistence_healthy: Arc<AtomicBool>,
+    dirty_updates: Arc<AtomicU64>,
 }
 
 impl PersistentCalibrator {
@@ -190,6 +206,7 @@ impl PersistentCalibrator {
             state: Arc::new(Mutex::new(state)),
             state_path,
             persistence_healthy: Arc::new(AtomicBool::new(true)),
+            dirty_updates: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -250,7 +267,7 @@ impl PersistentCalibrator {
             candidate.cold_estimate.unmatched_prefill_micros =
                 input_tokens.saturating_mul(prefill_unit);
             candidate.cold_estimate.decode_micros = output_tokens.saturating_mul(decode_unit);
-            candidate.cold_estimate.topology_micros = self.policy.conservative_topology_micros;
+            candidate.cold_estimate.topology_micros = 0;
             for state_path in &mut candidate.state_paths {
                 let covered = state_path
                     .state
@@ -263,7 +280,13 @@ impl PersistentCalibrator {
                     .saturating_sub(covered)
                     .saturating_mul(prefill_unit);
                 state_path.estimate.decode_micros = output_tokens.saturating_mul(decode_unit);
-                state_path.estimate.topology_micros = self.policy.conservative_topology_micros;
+                state_path.estimate.topology_micros = record
+                    .map(|record| {
+                        record
+                            .topology_micros
+                            .value_or(self.policy.conservative_topology_micros)
+                    })
+                    .unwrap_or(self.policy.conservative_topology_micros);
                 let path_key = materialization_key(
                     state_path.option.provider.as_str(),
                     state_path.option.state_kind.as_str(),
@@ -276,11 +299,13 @@ impl PersistentCalibrator {
                         self.policy.conservative_materialization_ratio_bps,
                         |metric| metric.estimate,
                     );
-                state_path.option.estimated_transfer_micros = state_path
-                    .option
-                    .estimated_transfer_micros
-                    .saturating_mul(ratio)
-                    / 10_000;
+                state_path.materialization_estimate_micros = Some(
+                    state_path
+                        .option
+                        .estimated_transfer_micros
+                        .saturating_mul(ratio)
+                        / 10_000,
+                );
             }
             evidence.insert(
                 candidate.target.id.to_string(),
@@ -354,6 +379,14 @@ impl PersistentCalibrator {
             );
             changed = true;
         }
+        if let Some(topology_micros) = observation.topology_micros {
+            record.topology_micros.update(
+                topology_micros,
+                &self.policy,
+                self.policy.max_unit_micros,
+            );
+            changed = true;
+        }
         if let Some(materialization) = &observation.materialization
             && materialization.estimated_micros > 0
         {
@@ -372,7 +405,7 @@ impl PersistentCalibrator {
         }
         if changed {
             state.revision = state.revision.saturating_add(1);
-            self.persist_locked(&state)?;
+            self.commit_update_locked(&state)?;
         }
         Ok(())
     }
@@ -392,7 +425,7 @@ impl PersistentCalibrator {
             state.shadow.replay_mismatches = state.shadow.replay_mismatches.saturating_add(1);
         }
         state.revision = state.revision.saturating_add(1);
-        self.persist_locked(&state)
+        self.commit_update_locked(&state)
     }
 
     pub fn promotion_status(
@@ -466,6 +499,12 @@ impl PersistentCalibrator {
             );
         }
         if let ExecutionPath::Reuse(reuse) = &plan.path {
+            qualify_metric(
+                record.map(|record| &record.topology_micros),
+                "topology",
+                &self.policy,
+                &mut reasons,
+            );
             let key = materialization_key(
                 reuse.option.provider.as_str(),
                 reuse.option.state_kind.as_str(),
@@ -478,11 +517,39 @@ impl PersistentCalibrator {
                 &mut reasons,
             );
         }
+        let qualified = reasons.is_empty();
+        if qualified && self.dirty_updates.load(Ordering::Acquire) > 0 {
+            self.persist_locked(&state)?;
+            self.dirty_updates.store(0, Ordering::Release);
+        }
         Ok(PromotionStatus {
-            qualified: reasons.is_empty(),
+            qualified,
             revision: state.revision,
             reasons,
         })
+    }
+
+    pub fn status(&self) -> Result<CalibrationStatus, CalibrationError> {
+        let state = self.lock_state()?;
+        Ok(CalibrationStatus {
+            revision: state.revision,
+            persistent: self.is_persistent(),
+            persistence_healthy: self.persistence_healthy.load(Ordering::Acquire),
+            dirty_updates: self.dirty_updates.load(Ordering::Acquire),
+            shadow_decisions: state.shadow.decisions,
+            shadow_agreements: state.shadow.agreements,
+            replay_mismatches: state.shadow.replay_mismatches,
+        })
+    }
+
+    pub fn flush(&self) -> Result<(), CalibrationError> {
+        if !self.is_persistent() || self.dirty_updates.load(Ordering::Acquire) == 0 {
+            return Ok(());
+        }
+        let state = self.lock_state()?;
+        self.persist_locked(&state)?;
+        self.dirty_updates.store(0, Ordering::Release);
+        Ok(())
     }
 
     pub fn state_json(&self) -> Result<String, CalibrationError> {
@@ -505,6 +572,15 @@ impl PersistentCalibrator {
             return Err(error);
         }
         self.persistence_healthy.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    fn commit_update_locked(&self, state: &CalibrationState) -> Result<(), CalibrationError> {
+        let dirty = self.dirty_updates.fetch_add(1, Ordering::AcqRel) + 1;
+        if self.is_persistent() && dirty >= self.policy.persistence_flush_every_updates {
+            self.persist_locked(state)?;
+            self.dirty_updates.store(0, Ordering::Release);
+        }
         Ok(())
     }
 }
@@ -533,6 +609,7 @@ struct CalibrationRecord {
     queue_micros_per_waiting_request: MetricEstimate,
     prefill_micros_per_token: MetricEstimate,
     decode_micros_per_token: MetricEstimate,
+    topology_micros: MetricEstimate,
     materialization_ratio_bps: BTreeMap<String, MetricEstimate>,
 }
 
@@ -668,6 +745,15 @@ fn materialization_key(provider: &str, state_kind: &str, target_id: &str) -> Str
 }
 
 pub fn plan_fingerprint(plan: &PlacementPlan) -> String {
+    format!(
+        "{}|{}|{}",
+        plan_decision_fingerprint(plan),
+        plan.predicted_cost.total_micros(),
+        plan.rationale.join(";")
+    )
+}
+
+pub fn plan_decision_fingerprint(plan: &PlacementPlan) -> String {
     let path = match &plan.path {
         ExecutionPath::Cold => "cold".to_owned(),
         ExecutionPath::Reuse(reuse) => format!(
@@ -676,12 +762,7 @@ pub fn plan_fingerprint(plan: &PlacementPlan) -> String {
             reuse.option.id.as_str()
         ),
     };
-    format!(
-        "{}|{}|{}",
-        plan.target.id,
-        path,
-        plan.predicted_cost.total_micros()
-    )
+    format!("{}|{}", plan.target.id, path)
 }
 
 fn load_state(path: &Path) -> Result<CalibrationState, CalibrationError> {

@@ -17,6 +17,10 @@ locus-semantics = { path = "../semantics" }
 locus-state = { path = "../state" }
 thiserror.workspace = true
 tokio.workspace = true
+tracing.workspace = true
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+tempfile = "3.23.0"

@@ -12,11 +12,14 @@ use thiserror::Error;
 
 pub use calibration::{
     ACTIVE_CONFIRMATION, CalibrationApplication, CalibrationError, CalibrationKey,
-    CalibrationObservation, CalibrationPolicy, CandidateCalibrationEvidence,
+    CalibrationObservation, CalibrationPolicy, CalibrationStatus, CandidateCalibrationEvidence,
     MaterializationObservation, PersistentCalibrator, PlacementMode, PromotionStatus,
-    plan_fingerprint,
+    plan_decision_fingerprint, plan_fingerprint,
 };
-pub use executor::{DefaultPlanExecutor, PlanExecutionError, PlanExecutor};
+pub use executor::{
+    DefaultPlanExecutor, ExecutedPath, MaterializationTiming, PlanExecution, PlanExecutionError,
+    PlanExecutionMetadata, PlanExecutor,
+};
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CostBreakdown {
@@ -53,6 +56,9 @@ pub struct StatePathCandidate {
     pub state: StateDescriptor,
     pub compatibility: CompatibilityResult,
     pub option: MaterializationOption,
+    /// Planner-only override. The provider estimate in `option` remains immutable so
+    /// observed transfer time is always calibrated against the provider's raw baseline.
+    pub materialization_estimate_micros: Option<u64>,
     pub estimate: ExecutionEstimate,
 }
 
@@ -213,7 +219,9 @@ impl Planner for CostBasedPlanner {
                 let cost = cost_for(
                     queue_micros,
                     &state_path.estimate,
-                    state_path.option.estimated_transfer_micros,
+                    state_path
+                        .materialization_estimate_micros
+                        .unwrap_or(state_path.option.estimated_transfer_micros),
                 );
                 consider(
                     &mut best,

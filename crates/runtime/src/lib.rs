@@ -2,19 +2,23 @@ use std::collections::BTreeSet;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use futures::{Stream, StreamExt, stream::BoxStream};
 use locus_core::{
-    CanonicalRequest, CompatibilityResult, CompatibilityVerdict, EngineCapabilities,
-    EngineSnapshot, ExecutionTarget, InputItemValue, OperationContext, RequestId, StateDescriptor,
-    StateRequirement,
+    CanonicalRequest, CompatibilityResult, CompatibilityVerdict, EngineCapabilities, EngineEvent,
+    EngineFinishReason, EngineSnapshot, ExecutionTarget, InputItemValue, OperationContext,
+    RequestId, StateDescriptor, StateRequirement,
 };
 use locus_engine::{EngineAdapter, EngineError, EngineRegistry};
 use locus_planner::{
-    CostBasedPlanner, DefaultPlanExecutor, ExecutionEstimate, PlanExecutionError, PlanExecutor,
-    Planner, PlanningCandidate, PlanningError, PlanningInput, RoutingPolicy, StateObservation,
-    StatePathCandidate,
+    ACTIVE_CONFIRMATION, CalibrationError, CalibrationKey, CalibrationObservation,
+    CalibrationPolicy, CostBasedPlanner, DefaultPlanExecutor, ExecutionEstimate,
+    MaterializationObservation, PersistentCalibrator, PlacementMode, PlacementPlan,
+    PlanExecutionError, PlanExecutor, Planner, PlanningCandidate, PlanningError, PlanningInput,
+    RoutingPolicy, StateObservation, StatePathCandidate, plan_decision_fingerprint,
+    plan_fingerprint,
 };
 use locus_semantics::{
     ModelCatalog, ModelProfile, ModelRegistry, SemanticError, SemanticEvent, SemanticRequest,
@@ -122,6 +126,47 @@ pub struct ReadinessReport {
     pub required_models: usize,
     pub ready_targets: usize,
     pub observed_targets: usize,
+    pub placement_mode: PlacementMode,
+    pub calibration_revision: u64,
+    pub calibration_persistent: bool,
+    pub calibration_persistence_healthy: bool,
+}
+
+#[derive(Clone)]
+pub struct PlacementControl {
+    mode: PlacementMode,
+    calibrator: PersistentCalibrator,
+}
+
+impl PlacementControl {
+    pub fn new(
+        mode: PlacementMode,
+        calibrator: PersistentCalibrator,
+        active_confirmation: Option<&str>,
+    ) -> Result<Self, PlacementConfigurationError> {
+        if mode == PlacementMode::Active {
+            if active_confirmation != Some(ACTIVE_CONFIRMATION) {
+                return Err(PlacementConfigurationError::ActiveConfirmation);
+            }
+            if !calibrator.is_persistent() {
+                return Err(PlacementConfigurationError::PersistenceRequired);
+            }
+        }
+        Ok(Self { mode, calibrator })
+    }
+
+    #[must_use]
+    pub fn shadow(calibrator: PersistentCalibrator) -> Self {
+        Self {
+            mode: PlacementMode::Shadow,
+            calibrator,
+        }
+    }
+
+    #[must_use]
+    pub fn mode(&self) -> PlacementMode {
+        self.mode
+    }
 }
 
 pub struct DefaultInferenceService {
@@ -133,6 +178,7 @@ pub struct DefaultInferenceService {
     state_provider: Arc<dyn StateProvider>,
     policy: RoutingPolicy,
     required_models: BTreeSet<String>,
+    placement: PlacementControl,
 }
 
 struct TargetInventory {
@@ -164,6 +210,7 @@ impl DefaultInferenceService {
             state_provider,
             policy: RoutingPolicy::default(),
             required_models: BTreeSet::new(),
+            placement: PlacementControl::shadow(default_calibrator()),
         }
     }
 
@@ -186,6 +233,7 @@ impl DefaultInferenceService {
             state_provider,
             policy,
             required_models: BTreeSet::new(),
+            placement: PlacementControl::shadow(default_calibrator()),
         }
     }
 
@@ -195,6 +243,12 @@ impl DefaultInferenceService {
         required_models: impl IntoIterator<Item = String>,
     ) -> Self {
         self.required_models = required_models.into_iter().collect();
+        self
+    }
+
+    #[must_use]
+    pub fn with_placement_control(mut self, placement: PlacementControl) -> Self {
+        self.placement = placement;
         self
     }
 
@@ -319,6 +373,7 @@ impl DefaultInferenceService {
                         state: state.clone(),
                         compatibility: compatibility.clone(),
                         option,
+                        materialization_estimate_micros: None,
                         estimate: reuse_estimate(state, &request),
                     });
                 }
@@ -339,6 +394,142 @@ impl DefaultInferenceService {
             policy: self.policy.clone(),
         })
     }
+
+    async fn select_plan(
+        &self,
+        input: &PlanningInput,
+    ) -> Result<PlacementSelection, InferenceError> {
+        let legacy_plan = self.planner.plan(input).await?;
+        let now_unix_millis = unix_millis();
+        let application = match self.placement.calibrator.apply(input, now_unix_millis) {
+            Ok(application) => application,
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "placement calibration failed; using legacy plan"
+                );
+                return Ok(PlacementSelection::legacy(legacy_plan, "calibration_error"));
+            }
+        };
+        let calibrated_plan = match self.planner.plan(&application.input).await {
+            Ok(plan) => plan,
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "calibrated planning failed; using legacy plan"
+                );
+                return Ok(PlacementSelection::legacy(
+                    legacy_plan,
+                    "calibrated_planning_error",
+                ));
+            }
+        };
+        let replay = self.planner.plan(&application.input).await;
+        let replay_consistent = replay
+            .as_ref()
+            .is_ok_and(|plan| plan_fingerprint(plan) == plan_fingerprint(&calibrated_plan));
+        let calibrator = self.placement.calibrator.clone();
+        let legacy_decision = plan_decision_fingerprint(&legacy_plan);
+        let calibrated_decision = plan_decision_fingerprint(&calibrated_plan);
+        match tokio::task::spawn_blocking(move || {
+            calibrator.record_shadow_decision(
+                replay_consistent,
+                &legacy_decision,
+                &calibrated_decision,
+            )
+        })
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::warn!(
+                    error = %error,
+                    "failed to persist shadow evidence; using legacy plan"
+                );
+                return Ok(PlacementSelection::legacy(
+                    legacy_plan,
+                    "shadow_persistence_error",
+                ));
+            }
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "shadow evidence task failed; using legacy plan"
+                );
+                return Ok(PlacementSelection::legacy(legacy_plan, "shadow_task_error"));
+            }
+        }
+
+        if self.placement.mode == PlacementMode::Shadow {
+            return Ok(PlacementSelection::legacy(legacy_plan, "shadow_mode"));
+        }
+        let evidence = application
+            .evidence
+            .get(calibrated_plan.target.id.as_str())
+            .cloned();
+        let status_calibrator = self.placement.calibrator.clone();
+        let status_plan = calibrated_plan.clone();
+        let status_evidence = evidence.clone();
+        let status = match tokio::task::spawn_blocking(move || {
+            status_calibrator.promotion_status(&status_plan, status_evidence.as_ref())
+        })
+        .await
+        {
+            Ok(status) => status,
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "active promotion task failed; using legacy plan"
+                );
+                return Ok(PlacementSelection::legacy(
+                    legacy_plan,
+                    "promotion_task_error",
+                ));
+            }
+        };
+        match status {
+            Ok(status) if status.qualified => Ok(PlacementSelection {
+                plan: calibrated_plan,
+                source: "calibrated_active",
+                calibration_revision: status.revision,
+                promotion_reasons: Vec::new(),
+            }),
+            Ok(status) => Ok(PlacementSelection {
+                plan: legacy_plan,
+                source: "active_gate_fallback",
+                calibration_revision: status.revision,
+                promotion_reasons: status.reasons,
+            }),
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "active promotion check failed; using legacy plan"
+                );
+                Ok(PlacementSelection::legacy(
+                    legacy_plan,
+                    "promotion_check_error",
+                ))
+            }
+        }
+    }
+}
+
+struct PlacementSelection {
+    plan: PlacementPlan,
+    source: &'static str,
+    calibration_revision: u64,
+    promotion_reasons: Vec<String>,
+}
+
+impl PlacementSelection {
+    fn legacy(plan: PlacementPlan, source: &'static str) -> Self {
+        Self {
+            plan,
+            source,
+            calibration_revision: 0,
+            promotion_reasons: Vec::new(),
+        }
+    }
 }
 
 #[async_trait]
@@ -355,16 +546,99 @@ impl InferenceService for DefaultInferenceService {
         let planning_input = self
             .planning_input(normalized.canonical.clone(), &context)
             .await?;
-        let plan = self.planner.plan(&planning_input).await?;
+        let selection = self.select_plan(&planning_input).await?;
+        let plan = selection.plan;
         let adapter = self.engines.adapter_for(&plan.target)?;
-        let engine_stream = self
+        let observation_key = CalibrationKey::from_target(&plan.target);
+        let waiting_requests = planning_input
+            .candidates
+            .iter()
+            .find(|candidate| candidate.target.id == plan.target.id)
+            .and_then(|candidate| {
+                candidate
+                    .snapshot
+                    .telemetry_is_fresh_at(unix_millis())
+                    .then_some(candidate.snapshot.waiting_requests)
+                    .flatten()
+            });
+        tracing::info!(
+            placement_mode = ?self.placement.mode,
+            placement_source = selection.source,
+            target_id = %plan.target.id,
+            engine_id = %plan.target.engine.id,
+            engine_generation = plan.target.engine.generation,
+            calibration_revision = selection.calibration_revision,
+            promotion_blockers = selection.promotion_reasons.len(),
+            queue_micros = plan.predicted_cost.queue_micros,
+            prefill_micros = plan.predicted_cost.unmatched_prefill_micros,
+            materialization_micros = plan.predicted_cost.state_materialization_micros,
+            decode_micros = plan.predicted_cost.decode_micros,
+            topology_micros = plan.predicted_cost.topology_micros,
+            policy_micros = plan.predicted_cost.policy_micros,
+            "placement decision"
+        );
+        let execution_started = Instant::now();
+        let execution = self
             .executor
             .execute(plan, normalized.canonical, context)
             .await?;
+        let execution_metadata = execution.metadata;
+        let engine_stream = execution.stream;
+        let calibrator = self.placement.calibrator.clone();
         let stream = async_stream::try_stream! {
             let mut engine_stream = engine_stream;
+            let mut first_output_at = None;
             while let Some(event) = engine_stream.next().await {
-                for event in pipeline.process(event?)? {
+                let event = event?;
+                if first_output_at.is_none() && is_output_event(&event) {
+                    first_output_at = Some(Instant::now());
+                }
+                if let EngineEvent::Finished { reason, usage, .. } = &event {
+                    let completed = !matches!(reason, EngineFinishReason::Cancelled | EngineFinishReason::Error);
+                    let materialization = execution_metadata.materialization.as_ref().map(|timing| {
+                        MaterializationObservation {
+                            provider: timing.provider.clone(),
+                            state_kind: timing.state_kind.clone(),
+                            target_id: timing.target_id.clone(),
+                            estimated_micros: timing.provider_estimated_micros,
+                            actual_micros: timing.actual_micros,
+                        }
+                    });
+                    let time_to_first_token_micros = if execution_metadata.fallback_used {
+                        None
+                    } else {
+                        first_output_at.map(|first| {
+                            elapsed_between_micros(execution_started, first)
+                                .saturating_sub(
+                                    execution_metadata
+                                        .materialization
+                                        .as_ref()
+                                        .map_or(0, |timing| timing.actual_micros),
+                                )
+                        })
+                    };
+                    let generation_micros = first_output_at.map(elapsed_micros);
+                    let observation = CalibrationObservation {
+                        key: observation_key.clone(),
+                        waiting_requests,
+                        input_tokens: usage.input_tokens,
+                        output_tokens: usage.output_tokens.saturating_sub(1),
+                        time_to_first_token_micros,
+                        generation_micros,
+                        topology_micros: execution_metadata.topology_micros,
+                        materialization,
+                        completed,
+                    };
+                    let observation_calibrator = calibrator.clone();
+                    match tokio::task::spawn_blocking(move || {
+                        observation_calibrator.record_observation(&observation)
+                    }).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => tracing::warn!(error = %error, "failed to record calibration observation"),
+                        Err(error) => tracing::warn!(error = %error, "calibration observation task failed"),
+                    }
+                }
+                for event in pipeline.process(event)? {
                     yield event;
                 }
             }
@@ -425,12 +699,17 @@ impl InferenceService for DefaultInferenceService {
             .iter()
             .filter(|profile| inventory.ready_models.contains(&profile.model))
             .count();
+        let calibration = self.placement.calibrator.status()?;
         Ok(ReadinessReport {
             model_profiles: inventory.profiles.len(),
             routable_models,
             required_models: self.required_models.len(),
             ready_targets: inventory.ready_targets,
             observed_targets: inventory.observed_targets,
+            placement_mode: self.placement.mode,
+            calibration_revision: calibration.revision,
+            calibration_persistent: calibration.persistent,
+            calibration_persistence_healthy: calibration.persistence_healthy,
         })
     }
 }
@@ -515,6 +794,39 @@ fn input_token_count(request: &CanonicalRequest) -> u64 {
             _ => None,
         })
         .sum()
+}
+
+fn is_output_event(event: &EngineEvent) -> bool {
+    matches!(
+        event,
+        EngineEvent::TokenDelta { .. }
+            | EngineEvent::TextDelta { .. }
+            | EngineEvent::ReasoningDelta { .. }
+            | EngineEvent::ToolCallStarted { .. }
+            | EngineEvent::ToolCallArgumentsDelta { .. }
+            | EngineEvent::ToolCallCompleted { .. }
+    )
+}
+
+fn elapsed_between_micros(started: Instant, finished: Instant) -> u64 {
+    u64::try_from(finished.duration_since(started).as_micros()).unwrap_or(u64::MAX)
+}
+
+fn elapsed_micros(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)
+}
+
+fn unix_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| {
+            u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+        })
+}
+
+fn default_calibrator() -> PersistentCalibrator {
+    PersistentCalibrator::load(CalibrationPolicy::default(), None)
+        .unwrap_or_else(|_| unreachable!("default calibration policy is valid"))
 }
 
 fn cold_estimate(request: &CanonicalRequest) -> ExecutionEstimate {
@@ -608,6 +920,16 @@ pub enum InferenceError {
     Planning(#[from] PlanningError),
     #[error(transparent)]
     Execution(#[from] PlanExecutionError),
+    #[error(transparent)]
+    Calibration(#[from] CalibrationError),
     #[error("target discovery failed: {0}")]
     Discovery(String),
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum PlacementConfigurationError {
+    #[error("active placement requires confirmation value {ACTIVE_CONFIRMATION}")]
+    ActiveConfirmation,
+    #[error("active placement requires a persistent calibration state path")]
+    PersistenceRequired,
 }

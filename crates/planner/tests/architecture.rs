@@ -218,6 +218,7 @@ fn state_path(
             CompatibilityResult::incompatible("fixture identities differ")
         },
         option,
+        materialization_estimate_micros: None,
         estimate: estimate(spec.unmatched_prefill_micros, spec.topology_micros),
     }
 }
@@ -833,6 +834,7 @@ async fn qualified_calibration_survives_restart() {
                 output_tokens: 2,
                 time_to_first_token_micros: Some(400),
                 generation_micros: Some(2_000),
+                topology_micros: None,
                 materialization: None,
                 completed: true,
             })
@@ -908,6 +910,7 @@ async fn prediction_error_blocks_active_promotion() {
                 output_tokens: 2,
                 time_to_first_token_micros: Some(ttft),
                 generation_micros: Some(generation),
+                topology_micros: None,
                 materialization: None,
                 completed: true,
             })
@@ -960,10 +963,8 @@ fn materialization_calibration_is_scoped_to_target() {
         PersistentCalibrator::load(CalibrationPolicy::default(), None).expect("calibrator");
     let conservative = calibrator.apply(&input, 1).expect("conservative apply");
     assert_eq!(
-        conservative.input.candidates[0].state_paths[0]
-            .option
-            .estimated_transfer_micros,
-        150
+        conservative.input.candidates[0].state_paths[0].materialization_estimate_micros,
+        Some(150)
     );
     calibrator
         .record_observation(&CalibrationObservation {
@@ -973,6 +974,7 @@ fn materialization_calibration_is_scoped_to_target() {
             output_tokens: 0,
             time_to_first_token_micros: None,
             generation_micros: None,
+            topology_micros: None,
             materialization: Some(MaterializationObservation {
                 provider: provider.as_str().to_owned(),
                 state_kind: "kv".to_owned(),
@@ -985,10 +987,8 @@ fn materialization_calibration_is_scoped_to_target() {
         .expect("record materialization");
     let learned = calibrator.apply(&input, 1).expect("learned apply");
     assert_eq!(
-        learned.input.candidates[0].state_paths[0]
-            .option
-            .estimated_transfer_micros,
-        200
+        learned.input.candidates[0].state_paths[0].materialization_estimate_micros,
+        Some(200)
     );
 }
 

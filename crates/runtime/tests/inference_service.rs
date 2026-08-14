@@ -9,7 +9,10 @@ use locus_core::{
     ParallelLayout, RequestId, RuntimeIdentity, SemanticComponentIdentity, SemanticIdentity,
 };
 use locus_engine::{EngineRegistry, FakeEngineAdapter, FakeEngineOutput};
-use locus_runtime::{DefaultInferenceService, InferenceService};
+use locus_planner::{ACTIVE_CONFIRMATION, CalibrationPolicy, PersistentCalibrator, PlacementMode};
+use locus_runtime::{
+    DefaultInferenceService, InferenceService, PlacementConfigurationError, PlacementControl,
+};
 use locus_semantics::{
     BasicModelSemantics, ByteDecoder, ByteTokenizer, Conversation, ConversationMessage,
     ConversationRole, ModelProfile, ModelRegistry, SemanticEvent, SemanticRequest,
@@ -191,4 +194,65 @@ async fn dropping_semantic_stream_propagates_cancellation_to_engine() {
     drop(stream);
     tokio::task::yield_now().await;
     assert_eq!(adapter.call_counts().cancel, 1);
+}
+
+#[test]
+fn active_placement_requires_confirmation_and_persistence() {
+    let in_memory = PersistentCalibrator::load(CalibrationPolicy::default(), None)
+        .expect("in-memory calibrator");
+    let persistence_error =
+        PlacementControl::new(PlacementMode::Active, in_memory, Some(ACTIVE_CONFIRMATION))
+            .err()
+            .expect("active mode must require persistence");
+    assert_eq!(
+        persistence_error,
+        PlacementConfigurationError::PersistenceRequired
+    );
+
+    let temporary = tempfile::tempdir().expect("temporary directory");
+    let persistent = PersistentCalibrator::load(
+        CalibrationPolicy::default(),
+        Some(temporary.path().join("calibration.json")),
+    )
+    .expect("persistent calibrator");
+    let confirmation_error = PlacementControl::new(PlacementMode::Active, persistent, Some("yes"))
+        .err()
+        .expect("active mode must require exact confirmation");
+    assert_eq!(
+        confirmation_error,
+        PlacementConfigurationError::ActiveConfirmation
+    );
+}
+
+#[tokio::test]
+async fn active_mode_falls_back_safely_before_calibration_is_qualified() {
+    let (service, adapter) = service(FakeEngineOutput::default());
+    let temporary = tempfile::tempdir().expect("temporary directory");
+    let calibrator = PersistentCalibrator::load(
+        CalibrationPolicy::default(),
+        Some(temporary.path().join("calibration.json")),
+    )
+    .expect("persistent calibrator");
+    let placement =
+        PlacementControl::new(PlacementMode::Active, calibrator, Some(ACTIVE_CONFIRMATION))
+            .expect("active placement configuration");
+    let service = service.with_placement_control(placement);
+
+    service
+        .infer(
+            request(),
+            OperationContext::new(RequestId::new("req-active-gated")),
+        )
+        .await
+        .expect("start inference")
+        .try_collect::<Vec<_>>()
+        .await
+        .expect("collect response");
+
+    assert_eq!(adapter.call_counts().execute, 1);
+    let readiness = service.readiness().await.expect("readiness");
+    assert_eq!(readiness.placement_mode, PlacementMode::Active);
+    assert!(readiness.calibration_persistent);
+    assert!(readiness.calibration_persistence_healthy);
+    assert!(readiness.calibration_revision >= 1);
 }
