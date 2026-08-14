@@ -148,19 +148,21 @@ The Rust 2024 workspace keeps the architecture boundaries small and explicit:
   fingerprints;
 - `locus-engine`: engine adapter contract, registry, and deterministic fake;
 - `locus-state`: state-provider contract, null provider, and deterministic fake;
-- `locus-planner`: cost-based path selection and the side-effecting
-  `PlanExecutor`;
+- `locus-planner`: cost-based path selection, persistent bounded calibration,
+  promotion evidence, and the side-effecting `PlanExecutor`;
 - `locus-runtime`: `InferenceService`, target discovery, state-candidate
-  construction, planning, semantic streaming, and cancellation;
+  construction, shadow/replay and gated active planning, outcome observation,
+  semantic streaming, and cancellation;
 - `locus-openai`: Responses, Chat Completions, raw text/token Completions, model
   listing, health, SSE, and OpenAI-shaped errors;
-- `locus-engine-openai`: network adapters for SGLang and vLLM completion
-  endpoints;
+- `locus-engine-openai`: network adapters for SGLang and vLLM completion and
+  bounded Prometheus telemetry endpoints;
 - `locus-state-nexuskv`: optional, versioned HTTP bridge from NexusKV match and
   materialization results into the generic `StateProvider` handshake;
 - `locus-server`: JSON configuration, dependency assembly, SGLang/vLLM and
   optional NexusKV registration, bearer authentication, request limits,
-  dependency-aware readiness, request IDs, tracing, and graceful shutdown.
+  dependency-aware readiness, calibrated-placement configuration, request IDs,
+  tracing, and graceful shutdown.
 
 The byte tokenizer and simple template renderer remain deterministic reference
 components for unit and SDK fixture tests. Deployments use
@@ -207,8 +209,10 @@ that define the core architecture. Wire formats and Rust APIs remain pre-1.0.
   cover request IDs, profile-parser-gated tool prompt transport,
   structured-output mapping, usage, finish events, and the SGLang abort path. A
   configured-server test fragments tagged reasoning and sequential tool calls
-  across mock SGLang SSE chunks. `scripts/live_engine_conformance.py` can exercise an
-  explicitly configured live runtime, but no live runtime or GPU result is
+  across mock SGLang SSE chunks. Telemetry parser tests cover current
+  SGLang/vLLM scheduler, KV, throughput, and counter aliases.
+  `scripts/live_engine_conformance.py` can exercise an explicitly configured
+  live runtime and verify metric movement, but no live runtime or GPU result is
   checked into or implied by CI.
 - The NexusKV provider requires a separately deployed
   `locus.nexuskv-bridge.v1` service. NexusKV now ships those endpoints, and CI
@@ -217,7 +221,7 @@ that define the core architecture. Wire formats and Rust APIs remain pre-1.0.
   are enforced; native engine import and physical transfer remain unverified.
 - Bearer authentication, global body/concurrency limits, readiness, request IDs,
   and structured tracing are implemented. Per-tenant rate/fairness admission,
-  calibrated costs, telemetry export, multimodal normalization, and production
+  Prometheus export from Locus itself, multimodal normalization, and production
   qualification or additional model-specific parser dialects remain future work.
 
 ## Scope

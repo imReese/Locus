@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
+import re
 import sys
 import urllib.error
 import urllib.request
@@ -12,6 +14,63 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
+
+
+METRIC_LINE = re.compile(
+    r"^([A-Za-z_:][A-Za-z0-9_:]*)(?:\{(.*)\})?\s+([^\s]+)(?:\s+\d+)?$"
+)
+MODEL_LABEL = re.compile(
+    r'(?:^|,)\s*(model_name|model|served_model_name)="((?:\\.|[^"\\])*)"'
+)
+
+METRICS = {
+    "sglang": {
+        "running": ("sglang:num_running_reqs", "sglang_num_running_reqs"),
+        "waiting": ("sglang:num_queue_reqs", "sglang_num_queue_reqs"),
+        "kv_usage": (
+            "sglang:token_usage",
+            "sglang_token_usage",
+            "sglang:full_token_usage",
+            "sglang_full_token_usage",
+        ),
+        "decode_rate": ("sglang:gen_throughput", "sglang_gen_throughput"),
+        "prompt_tokens": (
+            "sglang:prompt_tokens_total",
+            "sglang_prompt_tokens_total",
+            "sglang:input_tokens_total",
+            "sglang_input_tokens_total",
+        ),
+        "generation_tokens": (
+            "sglang:generation_tokens_total",
+            "sglang_generation_tokens_total",
+            "sglang:output_tokens_total",
+            "sglang_output_tokens_total",
+        ),
+    },
+    "vllm": {
+        "running": ("vllm:num_requests_running", "vllm_num_requests_running"),
+        "waiting": ("vllm:num_requests_waiting", "vllm_num_requests_waiting"),
+        "kv_usage": (
+            "vllm:kv_cache_usage_perc",
+            "vllm_kv_cache_usage_perc",
+            "vllm:gpu_cache_usage_perc",
+            "vllm_gpu_cache_usage_perc",
+        ),
+        "decode_rate": (),
+        "prompt_tokens": (
+            "vllm:prompt_tokens_total",
+            "vllm_prompt_tokens_total",
+            "vllm:prompt_tokens",
+            "vllm_prompt_tokens",
+        ),
+        "generation_tokens": (
+            "vllm:generation_tokens_total",
+            "vllm_generation_tokens_total",
+            "vllm:generation_tokens",
+            "vllm_generation_tokens",
+        ),
+    },
+}
 
 
 def headers(api_key: str | None) -> dict[str, str]:
@@ -85,6 +144,106 @@ def completion_body(args: argparse.Namespace, request_id: str) -> dict[str, Any]
                 },
             }
     return body
+
+
+def metric_samples(text: str, model: str, max_samples: int) -> dict[str, list[float]]:
+    samples: dict[str, list[float]] = {}
+    observed = 0
+    for line_number, raw_line in enumerate(text.splitlines(), 1):
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        observed += 1
+        if observed > max_samples:
+            raise AssertionError(f"metrics exceeded {max_samples} samples")
+        match = METRIC_LINE.match(line)
+        if not match:
+            raise AssertionError(f"invalid Prometheus sample on line {line_number}")
+        name, labels, value_text = match.groups()
+        model_labels = MODEL_LABEL.findall(labels or "")
+        if model_labels and not any(value == model for _, value in model_labels):
+            continue
+        try:
+            value = float(value_text)
+        except ValueError as error:
+            raise AssertionError(
+                f"invalid Prometheus value on line {line_number}"
+            ) from error
+        if not math.isfinite(value) or value < 0:
+            continue
+        samples.setdefault(name, []).append(value)
+    return samples
+
+
+def metric_value(
+    samples: dict[str, list[float]], aliases: tuple[str, ...]
+) -> tuple[str | None, float | None]:
+    for name in aliases:
+        values = samples.get(name)
+        if values:
+            return name, sum(values)
+    return None, None
+
+
+def scrape_metrics(args: argparse.Namespace) -> dict[str, Any]:
+    endpoint = args.metrics_path
+    if not endpoint.startswith(("http://", "https://")):
+        endpoint = args.base_url.rstrip("/") + "/" + endpoint.lstrip("/")
+    request_headers = {"Accept": "text/plain"}
+    if args.api_key:
+        request_headers["Authorization"] = f"Bearer {args.api_key}"
+    request = urllib.request.Request(endpoint, headers=request_headers, method="GET")
+    try:
+        with urllib.request.urlopen(request, timeout=args.timeout) as response:
+            raw = response.read(args.max_metrics_bytes + 1)
+    except urllib.error.HTTPError as error:
+        detail = error.read().decode(errors="replace")
+        raise RuntimeError(
+            f"GET metrics endpoint returned {error.code}: {detail}"
+        ) from error
+    if len(raw) > args.max_metrics_bytes:
+        raise AssertionError(
+            f"metrics response exceeded {args.max_metrics_bytes} bytes"
+        )
+    samples = metric_samples(raw.decode(errors="strict"), args.model, args.max_metric_samples)
+    result: dict[str, Any] = {}
+    for logical_name, aliases in METRICS[args.runtime].items():
+        metric_name, value = metric_value(samples, aliases)
+        result[logical_name] = {"metric": metric_name, "value": value}
+    for required in ("running", "waiting", "kv_usage", "prompt_tokens", "generation_tokens"):
+        if result[required]["value"] is None:
+            raise AssertionError(
+                f"metrics endpoint omitted supported {args.runtime} {required} metric"
+            )
+    if args.runtime == "sglang" and result["decode_rate"]["value"] is None:
+        raise AssertionError("metrics endpoint omitted SGLang decode throughput")
+    return result
+
+
+def telemetry_probe(args: argparse.Namespace) -> tuple[dict[str, Any], dict[str, Any]]:
+    before = scrape_metrics(args)
+    stream = normal_stream(args)
+    after = scrape_metrics(args)
+    deltas = {}
+    for name in ("prompt_tokens", "generation_tokens"):
+        before_value = before[name]["value"]
+        after_value = after[name]["value"]
+        if before_value is None or after_value is None or after_value < before_value:
+            raise AssertionError(f"{name} counter reset or disappeared during probe")
+        delta = after_value - before_value
+        if delta <= 0:
+            raise AssertionError(f"{name} counter did not increase during completion")
+        deltas[name] = delta
+    return stream, {
+        "metrics_endpoint": (
+            "absolute_override"
+            if args.metrics_path.startswith(("http://", "https://"))
+            else "base_url_relative"
+        ),
+        "before": before,
+        "after": after,
+        "counter_deltas": deltas,
+    }
 
 
 def normal_stream(args: argparse.Namespace) -> dict[str, Any]:
@@ -196,29 +355,37 @@ def main() -> None:
     parser.add_argument("--max-tokens", type=int, default=16)
     parser.add_argument("--timeout", type=float, default=60.0)
     parser.add_argument("--health-path", default="/health")
+    parser.add_argument("--metrics-path", default="/metrics")
+    parser.add_argument("--max-metrics-bytes", type=int, default=2 * 1024 * 1024)
+    parser.add_argument("--max-metric-samples", type=int, default=20_000)
     parser.add_argument("--json-schema")
     parser.add_argument("--output")
     args = parser.parse_args()
     if args.max_tokens <= 0:
         parser.error("--max-tokens must be greater than zero")
+    if args.max_metrics_bytes <= 0 or args.max_metric_samples <= 0:
+        parser.error("metric limits must be greater than zero")
 
     health_url = args.base_url.rstrip("/") + "/" + args.health_path.lstrip("/")
     with open_request("GET", health_url, args.api_key, timeout=args.timeout) as response:
         response.read()
+    stream, telemetry = telemetry_probe(args)
     result = {
-        "schema_version": "locus.live-engine-conformance.v1",
+        "schema_version": "locus.live-engine-conformance.v2",
         "status": "passed",
         "observed_at": datetime.now(timezone.utc).isoformat(),
         "runtime": args.runtime,
         "model": args.model,
         "pretokenized_prompt_tokens": len(args.prompt_token_ids),
         "health": "passed",
-        "stream": normal_stream(args),
+        "stream": stream,
+        "telemetry": telemetry,
         "cancellation": cancellation_probe(args),
         "structured_output_requested": bool(args.json_schema),
         "claim_boundary": (
-            "This is live HTTP/runtime evidence for the configured endpoint; it does not "
-            "establish GPU performance, state transfer, or cross-runtime semantic equality."
+            "This is live HTTP/runtime and Prometheus-shape evidence for the configured "
+            "endpoint; it does not establish calibrated-placement accuracy, GPU performance, "
+            "state transfer, or cross-runtime semantic equality."
         ),
     }
     serialized = json.dumps(result, indent=2, sort_keys=True)

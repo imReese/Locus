@@ -39,6 +39,7 @@ The top-level configuration contains:
 | `required_models` | Optional aliases that must be routable for readiness |
 | `engines` | SGLang/vLLM instances whose live model inventory is discovered at runtime |
 | `state` | Disabled or a versioned NexusKV bridge configuration |
+| `placement` | Shadow/active calibrated placement, durable state, gates, and conservative priors |
 | `observability` | Default tracing filter and compact/JSON log format |
 
 Unknown fields are rejected. Empty identities, zero parallel degrees, zero
@@ -170,6 +171,91 @@ An optional `target_id` may be added to a mapping; otherwise Locus derives
 `target_id` fields remain accepted together as a single-model compatibility
 form, but new configurations should use discovery defaults or `model_mappings`.
 
+## Live engine telemetry
+
+Each engine entry has a bounded `telemetry` block. Locus scrapes the runtime's
+Prometheus endpoint, filters model-labelled samples to the discovered upstream
+model, and understands current SGLang and vLLM names for running/waiting
+requests, KV pressure, prompt/output token counters, and SGLang generation
+throughput. Counter deltas provide prefill/decode rates after two observations.
+Missing, malformed, oversized, non-finite, or expired data remains unavailable;
+it is never converted to a zero queue.
+
+```json
+{
+  "telemetry": {
+    "metrics_path": "/metrics",
+    "request_timeout_millis": 2000,
+    "min_scrape_interval_millis": 500,
+    "valid_for_millis": 5000,
+    "max_response_bytes": 2097152,
+    "max_samples": 20000,
+    "require_fresh_metrics": true
+  }
+}
+```
+
+Set `require_fresh_metrics` when an engine must be removed from routing if a
+fresh scrape cannot be obtained. When it is false, the target may remain ready,
+but the calibrated scorer substitutes configured conservative costs and active
+promotion remains blocked for that target.
+
+## Calibrated placement lifecycle
+
+Calibrated placement defaults to `shadow`. Both the legacy plan and calibrated
+plan are produced from the same hard model, capability, semantic, state, health,
+and policy filters. Only the legacy plan executes in shadow mode. Locus records
+decision agreement and repeats calibrated planning to detect nondeterminism.
+
+Outcome learning is keyed by engine ID and generation plus immutable model,
+adapter, and execution-profile revisions. Idle TTFT calibrates prefill;
+TTFT residual while requests are waiting calibrates queue delay; inter-token
+completion time calibrates decode; provider estimate versus observed transfer
+calibrates materialization; state-import activation overhead calibrates the
+topology term. Cancelled, failed, incomplete, or ambiguous observations do not
+update the corresponding estimator. Prompts, raw token IDs, output text,
+provider handles, and credentials are never persisted.
+
+```json
+{
+  "placement": {
+    "mode": "shadow",
+    "state_path": "/var/lib/locus/calibration.json",
+    "calibration": {
+      "min_samples_per_metric": 32,
+      "max_mape_bps": 2500,
+      "min_shadow_decisions": 128,
+      "min_shadow_agreement_bps": 9500,
+      "persistence_flush_every_updates": 16
+    }
+  }
+}
+```
+
+The state file is schema-versioned and replaced atomically after a bounded
+number of updates. The last incomplete batch may be lost on an abrupt process
+exit; this can only remove evidence and cause demotion. Before any active
+decision is admitted, pending evidence is synchronously made durable.
+
+Active mode is fail-closed. It requires a persistent state path and the exact
+operator acknowledgement below:
+
+```json
+{
+  "placement": {
+    "mode": "active",
+    "state_path": "/var/lib/locus/calibration.json",
+    "active_confirmation": "enable-calibrated-placement"
+  }
+}
+```
+
+Even then, each selected path must have fresh telemetry, enough samples for all
+cost terms it uses, acceptable EWMA MAPE, sufficient shadow volume and
+agreement, zero replay mismatches, and healthy persistence. Any failed gate or
+calibration error automatically executes the legacy plan; it does not fail the
+inference request or weaken hard constraints.
+
 ## Raw Completions example
 
 The compatibility endpoint accepts one text prompt or one token-ID sequence:
@@ -206,7 +292,8 @@ without taking the whole gateway out of service. Add aliases to top-level
 `required_models` when a deployment contract requires specific models; each
 listed alias must then have a ready target. Failure returns HTTP 503 with concise
 dependency evidence. The response reports total profiles, routable models,
-required models, observed targets, and ready targets.
+required models, observed targets, ready targets, placement mode, calibration
+revision, and calibration persistence health.
 
 The probes are intentionally outside bearer authentication so Kubernetes or
 another local orchestrator can call them. Do not expose them as a substitute for
@@ -228,7 +315,8 @@ collector; compact logs are convenient locally.
 
 SIGINT initiates graceful shutdown: the listener stops accepting new work and
 Axum drains in-flight connections. Deadline policy, per-tenant admission,
-telemetry export, and a deployment manifest remain separate follow-on work.
+Prometheus export from Locus itself, and a deployment manifest remain separate
+follow-on work.
 
 ## Validation
 

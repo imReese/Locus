@@ -11,8 +11,10 @@ mock-conformance-tested; live
 GPU serving and physical state transfer remain unverified. A deployable server,
 production Hugging Face tokenizer/template profiles, global ingress limits,
 bearer authentication, dependency-aware readiness, structured tracing, and
-official OpenAI SDK E2E are implemented. Per-tenant admission and calibrated
-costs remain future work.
+official OpenAI SDK E2E are implemented. Live engine telemetry, persistent
+calibration, shadow evaluation, and gated active placement are implemented;
+their workload-specific live accuracy remains a deployment qualification.
+Per-tenant admission remains future work.
 
 ## Thesis
 
@@ -407,10 +409,13 @@ The following stages are implemented and tested:
 7. a deployable configured server with exact Hugging Face tokenizer/template
    profiles, profile-bound reasoning/tool parsers, authentication, ingress
    limits, readiness, request IDs, and tracing; and
-8. official OpenAI SDK E2E plus opt-in live-engine conformance tooling.
+8. official OpenAI SDK E2E plus opt-in live-engine/telemetry conformance tooling;
+   and
+9. persistent queue/prefill/decode/materialization/topology calibration with
+   shadow replay and fail-closed active promotion.
 
 The next production stages are additional model-specific parser dialects,
-multimodal normalization, per-tenant admission and fairness, calibrated cost
-models, telemetry export, repeated live-runtime qualification, a deployed
+multimodal normalization, per-tenant admission and fairness, telemetry export,
+repeated live-runtime calibration qualification, a deployed
 NexusKV bridge, physical state transfer, and topology/preload/replication
 policies. Engine-neutral boundary tests remain mandatory as integrations grow.

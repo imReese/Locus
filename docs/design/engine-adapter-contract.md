@@ -10,11 +10,14 @@ into `locus-engine`. The adapters discover currently loaded models through
 `GET /v1/models` and publish only candidates bound to immutable Locus model
 identities. Mock HTTP/SSE tests cover dynamic model inventory, pretokenized
 requests, text and usage events, finish reasons, stop-sequence transport,
-structured-output fields, and SGLang aborts. No
+structured-output fields, SGLang aborts, bounded Prometheus parsing, current
+SGLang/vLLM scheduler/KV/token metric aliases, cache expiry, and counter-derived
+rates. No
 live runtime, GPU, latency, or native state-import result is claimed by CI. The
 opt-in `scripts/live_engine_conformance.py` harness checks a configured runtime's
 health, pretokenized completion SSE lifecycle, usage, finish reason, terminal
-sentinel, and cancellation transport, and emits a versioned evidence report.
+sentinel, required telemetry shape and counter movement, and cancellation
+transport, and emits a versioned evidence report.
 These completion adapters advertise structured-output and text streaming but
 not native typed reasoning or tool-call events. A model profile may select local
 incremental parsers over that text stream; in that case the canonical request

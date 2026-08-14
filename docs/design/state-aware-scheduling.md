@@ -3,12 +3,14 @@
 ## Status
 
 This document defines the planner and state-provider abstractions. The Rust
-workspace contains a deterministic cost-based planner, fake providers, the
-state-import execution handshake, and an optional `locus-state-nexuskv` HTTP
-bridge. The bridge maps versioned NexusKV match data into generic descriptors
-and exercises lookup, estimate, prepare, materialize, commit, and execution in
-tests. It is not a calibrated production scheduler, and physical NexusKV/GPU
-transfer has not been validated.
+workspace contains a deterministic cost-based planner, live SGLang/vLLM
+telemetry collection, persistent bounded EWMA calibration, shadow/replay
+evaluation, fail-closed active promotion, fake providers, the state-import
+execution handshake, and an optional `locus-state-nexuskv` HTTP bridge. The
+bridge maps versioned NexusKV match data into generic descriptors and exercises
+lookup, estimate, prepare, materialize, commit, and execution in tests. Live
+calibration accuracy and physical NexusKV/GPU transfer have not been validated
+in this workspace.
 
 ## Principle
 
@@ -530,6 +532,20 @@ of the trace so decisions remain explainable.
 Prompts, raw token sequences, media, provider-private handles, and tenant data
 are excluded unless an explicit privacy policy authorizes them.
 
+The implementation uses a schema-versioned state file and keys learned values
+by engine generation and immutable model/adapter/execution profile. It learns
+queue, prefill, decode, provider-materialization ratio, and state-activation
+topology overhead independently. Samples and EWMA error are bounded; unexpected
+restarts, counter resets, stale metrics, cancellations, and failed executions
+cannot manufacture a successful observation.
+
+Shadow mode compares decision fingerprints without changing execution and also
+replays calibrated planning to prove deterministic output. Active selection is
+per-path, not a global switch: persistence, fresh telemetry, sample count, MAPE,
+shadow volume/agreement, and replay must all qualify. Pending state is flushed
+before promotion. Failure of any gate selects the uncalibrated legacy plan while
+retaining all original hard filters.
+
 ## Initial planner strategy
 
 The first implementation should favor a transparent, bounded candidate scorer
@@ -567,4 +583,7 @@ conformance matrix includes:
 - planner purity and `PlanExecutor` side-effect ownership;
 - deterministic choice and explanation for equal costs.
 
-Passing these tests validates decision semantics, not production cost accuracy.
+Passing these tests validates decision semantics, calibration lifecycle, and
+failure policy, not production cost accuracy. The live-engine harness validates
+metric availability and movement; workload-specific accuracy still requires
+deployment shadow evidence.

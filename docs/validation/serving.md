@@ -67,11 +67,14 @@ use. The default fixture key is intentionally test-only.
 
 ## Live SGLang or vLLM qualification
 
-The live harness sends token IDs directly to `/v1/completions`, requests SSE
-usage, checks JSON chunks, finish reasons and `[DONE]`, and then opens a second
-request for cancellation. For SGLang it combines client disconnect with an
-acknowledged `/abort_request`; for vLLM it records that the public completion
-connection was closed but does not invent a server-side abort acknowledgement.
+The live harness first reads bounded Prometheus telemetry, sends token IDs
+directly to `/v1/completions`, requests SSE usage, checks JSON chunks, finish
+reasons and `[DONE]`, and reads telemetry again. It requires runtime scheduler,
+KV, and token metrics and verifies that prompt/output counters advance. It then
+opens a second request for cancellation. For SGLang it combines client
+disconnect with an acknowledged `/abort_request`; for vLLM it records that the
+public completion connection was closed but does not invent a server-side abort
+acknowledgement.
 
 Example SGLang invocation:
 
@@ -100,17 +103,23 @@ arbitrary IDs proves only transport acceptance and can produce meaningless
 model output. Add `--api-key`, `--health-path`, or `--json-schema` when the live
 deployment requires them.
 
-The result uses schema `locus.live-engine-conformance.v1` and records the runtime,
+Use `--metrics-path` for a non-default or separately hosted endpoint. The
+response and sample counts are bounded by default and can be tightened with
+`--max-metrics-bytes` and `--max-metric-samples`.
+
+The result uses schema `locus.live-engine-conformance.v2` and records the runtime,
 model, observation time, prompt-token count, lifecycle counts, usage, finish
-reasons, cancellation evidence, and an explicit claim boundary. Do not commit
-deployment secrets or private endpoint details with a result.
+reasons, selected metric names and values, counter deltas, cancellation
+evidence, and an explicit claim boundary. It deliberately omits base URLs and
+API keys. Do not commit deployment secrets or private endpoint details with a
+result.
 
 ## Current boundary
 
 The official SDK fixture passed locally with `openai` 2.53.0 and is enforced by
 GitHub CI, including raw Completions and profile-parsed reasoning/tool calls.
-SGLang and vLLM adapter behavior is covered by deterministic mock HTTP/SSE
-tests; configured
+SGLang and vLLM adapter behavior and telemetry aliases are covered by
+deterministic mock HTTP/Prometheus/SSE tests; configured
 parser behavior uses a mock SGLang endpoint, not a live model. The cross-process
 NexusKV protocol path is also automated with protocol-only, zero-byte transfer
 evidence. No live GPU engine, native engine state import, physical NexusKV
