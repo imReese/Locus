@@ -6,7 +6,7 @@ use std::time::Instant;
 use async_trait::async_trait;
 use locus_core::{CanonicalRequest, OperationContext, StateImportSpec, StateImportTarget};
 use locus_engine::{EngineError, EngineEventStream, EngineRegistry};
-use locus_state::{StateError, StateProvider};
+use locus_store::{StateStore, StoreError};
 use thiserror::Error;
 
 use crate::{ExecutionPath, FallbackAction, PlacementPlan};
@@ -29,10 +29,10 @@ pub enum ExecutedPath {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MaterializationTiming {
-    pub provider: String,
+    pub store: String,
     pub state_kind: String,
     pub target_id: String,
-    pub provider_estimated_micros: u64,
+    pub store_estimated_micros: u64,
     pub actual_micros: u64,
 }
 
@@ -59,16 +59,13 @@ impl futures::Stream for PlanExecution {
 
 pub struct DefaultPlanExecutor {
     engines: EngineRegistry,
-    state_provider: Arc<dyn StateProvider>,
+    store: Arc<dyn StateStore>,
 }
 
 impl DefaultPlanExecutor {
     #[must_use]
-    pub fn new(engines: EngineRegistry, state_provider: Arc<dyn StateProvider>) -> Self {
-        Self {
-            engines,
-            state_provider,
-        }
+    pub fn new(engines: EngineRegistry, store: Arc<dyn StateStore>) -> Self {
+        Self { engines, store }
     }
 
     async fn apply_fallback(
@@ -182,7 +179,7 @@ impl PlanExecutor for DefaultPlanExecutor {
 
         let materialization_started = Instant::now();
         let receipt = match self
-            .state_provider
+            .store
             .materialize(&reuse.option, &import, &context)
             .await
         {
@@ -194,10 +191,10 @@ impl PlanExecutor for DefaultPlanExecutor {
             }
         };
         let materialization = MaterializationTiming {
-            provider: reuse.option.provider.as_str().to_owned(),
+            store: reuse.option.store.as_str().to_owned(),
             state_kind: reuse.option.state_kind.as_str().to_owned(),
             target_id: plan.target.id.to_string(),
-            provider_estimated_micros: reuse.option.estimated_transfer_micros,
+            store_estimated_micros: reuse.option.estimated_transfer_micros,
             actual_micros: elapsed_micros(materialization_started),
         };
 
@@ -249,7 +246,7 @@ pub enum PlanExecutionError {
     #[error(transparent)]
     Engine(#[from] EngineError),
     #[error(transparent)]
-    State(#[from] StateError),
+    Store(#[from] StoreError),
     #[error("invalid placement plan: {0}")]
     InvalidPlan(String),
     #[error("planned path failed: {0}")]

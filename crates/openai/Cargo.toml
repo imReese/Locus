@@ -23,7 +23,7 @@ tokio.workspace = true
 [dev-dependencies]
 http-body-util.workspace = true
 locus-engine = { path = "../engine" }
-locus-state = { path = "../state" }
+locus-store = { path = "../store" }
 tower.workspace = true
 
 [lints]

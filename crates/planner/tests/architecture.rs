@@ -10,10 +10,10 @@ use locus_core::{
     EngineSnapshot, ExecutionRole, ExecutionTarget, ExecutionTargetId, GenerationSemanticIdentity,
     InputBundle, InputItem, InputItemId, InputItemValue, InputKind, InputSemanticIdentity,
     MaterializationOption, MaterializationOptionId, MediaReference, ModelExecutionIdentity,
-    OpaqueHandle, OperationContext, OutputSemanticIdentity, ParallelLayout, ProviderId, RequestId,
+    OpaqueHandle, OperationContext, OutputSemanticIdentity, ParallelLayout, RequestId,
     ResumeCoordinate, ReusableBoundary, RuntimeIdentity, SamplingParameters,
     SemanticComponentIdentity, SemanticIdentity, StateDescriptor, StateId, StateImportSpec,
-    StateKind, StateLocality, TransferReceipt,
+    StateKind, StateLocality, StoreId, TransferReceipt,
 };
 use locus_engine::{EngineAdapter, EngineError, EngineRegistry, FakeEngineAdapter};
 use locus_planner::{
@@ -22,7 +22,7 @@ use locus_planner::{
     MaterializationObservation, PersistentCalibrator, PlanExecutor, Planner, PlanningCandidate,
     PlanningInput, RoutingPolicy, StateObservation, StatePathCandidate, plan_fingerprint,
 };
-use locus_state::FakeStateProvider;
+use locus_store::FakeStateStore;
 
 fn component(kind: &str) -> SemanticComponentIdentity {
     SemanticComponentIdentity {
@@ -165,13 +165,13 @@ struct StateFixtureSpec<'a> {
 
 fn state_path(
     target: &ExecutionTarget,
-    provider: &ProviderId,
+    store: &StoreId,
     spec: StateFixtureSpec<'_>,
 ) -> StatePathCandidate {
     let state_kind = StateKind::new("kv");
     let state = StateDescriptor {
         id: StateId::new(spec.id),
-        provider: provider.clone(),
+        store: store.clone(),
         kind: state_kind.clone(),
         model: model(),
         relevant_input_semantics: Some(semantics().input),
@@ -191,14 +191,14 @@ fn state_path(
             validation_digest: format!("boundary-{}", spec.id),
         },
         locations: vec!["fake://state".to_owned()],
-        provider_reference: OpaqueHandle {
+        store_reference: OpaqueHandle {
             namespace: "locus.fake.state.v1".to_owned(),
             value: spec.id.to_owned(),
         },
     };
     let option = MaterializationOption {
         id: MaterializationOptionId::new(format!("option-{}", spec.id)),
-        provider: provider.clone(),
+        store: store.clone(),
         source_state: state.id.clone(),
         target_id: target.id.clone(),
         target_engine: target.engine.clone(),
@@ -275,7 +275,7 @@ fn assert_reuse_on(plan: &locus_planner::PlacementPlan, target: &ExecutionTarget
 #[tokio::test]
 async fn fake_vertical_slice_selects_reuse_and_executor_owns_side_effects() {
     let request = token_request("vertical-slice");
-    let provider_id = ProviderId::new("fake-provider");
+    let store_id = StoreId::new("fake-store");
     let (instance_a, target_a) = engine_and_target("a");
     let (instance_b, target_b) = engine_and_target("b");
     let engine_a = Arc::new(FakeEngineAdapter::new(
@@ -290,7 +290,7 @@ async fn fake_vertical_slice_selects_reuse_and_executor_owns_side_effects() {
     ));
     let reusable = state_path(
         &target_b,
-        &provider_id,
+        &store_id,
         StateFixtureSpec {
             id: "state-b",
             coverage: 900,
@@ -302,8 +302,8 @@ async fn fake_vertical_slice_selects_reuse_and_executor_owns_side_effects() {
             locality: StateLocality::Local,
         },
     );
-    let provider = Arc::new(FakeStateProvider::new(
-        provider_id,
+    let store = Arc::new(FakeStateStore::new(
+        store_id,
         vec![reusable.state.clone()],
         vec![reusable.option.clone()],
     ));
@@ -331,7 +331,7 @@ async fn fake_vertical_slice_selects_reuse_and_executor_owns_side_effects() {
     assert_reuse_on(&plan, &target_b, "state-b");
     assert_eq!(engine_a.call_counts().execute, 0);
     assert_eq!(engine_b.call_counts().prepare, 0);
-    assert_eq!(provider.call_counts().materialize, 0);
+    assert_eq!(store.call_counts().materialize, 0);
 
     let registry = EngineRegistry::new();
     registry
@@ -340,7 +340,7 @@ async fn fake_vertical_slice_selects_reuse_and_executor_owns_side_effects() {
     registry
         .register(engine_b.clone())
         .expect("register engine b");
-    let executor = DefaultPlanExecutor::new(registry, provider.clone());
+    let executor = DefaultPlanExecutor::new(registry, store.clone());
     let events = executor
         .execute(
             plan,
@@ -358,17 +358,17 @@ async fn fake_vertical_slice_selects_reuse_and_executor_owns_side_effects() {
     assert_eq!(engine_b.call_counts().prepare, 1);
     assert_eq!(engine_b.call_counts().commit, 1);
     assert_eq!(engine_b.call_counts().execute, 1);
-    assert_eq!(provider.call_counts().materialize, 1);
+    assert_eq!(store.call_counts().materialize, 1);
 }
 
 #[tokio::test]
 async fn transfer_cost_can_lose_to_cold_recompute() {
     let request = token_request("transfer-loses");
-    let provider = ProviderId::new("fake-provider");
+    let store = StoreId::new("fake-store");
     let (_, target) = engine_and_target("cold-wins");
     let remote = state_path(
         &target,
-        &provider,
+        &store,
         StateFixtureSpec {
             id: "expensive-remote",
             coverage: 1_000,
@@ -401,11 +401,11 @@ async fn transfer_cost_can_lose_to_cold_recompute() {
 #[tokio::test]
 async fn incompatible_state_is_filtered_before_cost_scoring() {
     let request = token_request("incompatible");
-    let provider = ProviderId::new("fake-provider");
+    let store = StoreId::new("fake-store");
     let (_, target) = engine_and_target("compatibility");
     let incompatible = state_path(
         &target,
-        &provider,
+        &store,
         StateFixtureSpec {
             id: "cheap-but-wrong",
             coverage: 1_000,
@@ -464,12 +464,12 @@ async fn capability_rejection_happens_before_scoring() {
 #[tokio::test]
 async fn complete_paths_compare_local_shorter_and_remote_longer_state() {
     let request = token_request("local-vs-remote");
-    let provider = ProviderId::new("fake-provider");
+    let store = StoreId::new("fake-store");
     let (_, local_target) = engine_and_target("local");
     let (_, remote_target) = engine_and_target("remote");
     let local_shorter = state_path(
         &local_target,
-        &provider,
+        &store,
         StateFixtureSpec {
             id: "local-shorter",
             coverage: 600,
@@ -483,7 +483,7 @@ async fn complete_paths_compare_local_shorter_and_remote_longer_state() {
     );
     let remote_longer = state_path(
         &remote_target,
-        &provider,
+        &store,
         StateFixtureSpec {
             id: "remote-longer",
             coverage: 900,
@@ -524,12 +524,12 @@ async fn complete_paths_compare_local_shorter_and_remote_longer_state() {
 #[tokio::test]
 async fn remote_longer_state_wins_when_total_transfer_path_is_cheaper() {
     let request = token_request("remote-wins");
-    let provider = ProviderId::new("fake-provider");
+    let store = StoreId::new("fake-store");
     let (_, local_target) = engine_and_target("local-costly");
     let (_, remote_target) = engine_and_target("remote-cheap");
     let local = state_path(
         &local_target,
-        &provider,
+        &store,
         StateFixtureSpec {
             id: "local",
             coverage: 600,
@@ -543,7 +543,7 @@ async fn remote_longer_state_wins_when_total_transfer_path_is_cheaper() {
     );
     let remote = state_path(
         &remote_target,
-        &provider,
+        &store,
         StateFixtureSpec {
             id: "remote",
             coverage: 900,
@@ -584,7 +584,7 @@ async fn remote_longer_state_wins_when_total_transfer_path_is_cheaper() {
 #[tokio::test]
 async fn stale_engine_generation_invalidates_import_handle() {
     let request = token_request("generation-fence");
-    let provider = ProviderId::new("fake-provider");
+    let store = StoreId::new("fake-store");
     let (instance, target) = engine_and_target("restart");
     let engine = FakeEngineAdapter::new(
         instance,
@@ -593,7 +593,7 @@ async fn stale_engine_generation_invalidates_import_handle() {
     );
     let reusable = state_path(
         &target,
-        &provider,
+        &store,
         StateFixtureSpec {
             id: "state-before-restart",
             coverage: 100,
@@ -614,7 +614,7 @@ async fn stale_engine_generation_invalidates_import_handle() {
     engine.restart();
     let receipt = TransferReceipt {
         import_id: import.import_id.clone(),
-        provider,
+        store,
         bytes_transferred: 1,
         receipt: OpaqueHandle {
             namespace: "test".to_owned(),
@@ -632,7 +632,7 @@ async fn stale_engine_generation_invalidates_import_handle() {
 #[tokio::test]
 async fn materialization_failure_aborts_import_and_uses_encoded_cold_fallback() {
     let request = token_request("materialization-fallback");
-    let provider_id = ProviderId::new("fake-provider");
+    let store_id = StoreId::new("fake-store");
     let (instance, target) = engine_and_target("fallback");
     let engine = Arc::new(FakeEngineAdapter::new(
         instance,
@@ -641,7 +641,7 @@ async fn materialization_failure_aborts_import_and_uses_encoded_cold_fallback() 
     ));
     let reusable = state_path(
         &target,
-        &provider_id,
+        &store_id,
         StateFixtureSpec {
             id: "state-fails",
             coverage: 900,
@@ -653,12 +653,12 @@ async fn materialization_failure_aborts_import_and_uses_encoded_cold_fallback() 
             locality: StateLocality::Local,
         },
     );
-    let provider = Arc::new(FakeStateProvider::new(
-        provider_id,
+    let store = Arc::new(FakeStateStore::new(
+        store_id,
         vec![reusable.state.clone()],
         vec![reusable.option.clone()],
     ));
-    provider.set_fail_materialization(true);
+    store.set_fail_materialization(true);
     let input = planning_input(
         request.clone(),
         vec![candidate(
@@ -674,7 +674,7 @@ async fn materialization_failure_aborts_import_and_uses_encoded_cold_fallback() 
 
     let registry = EngineRegistry::new();
     registry.register(engine.clone()).expect("register engine");
-    let executor = DefaultPlanExecutor::new(registry, provider.clone());
+    let executor = DefaultPlanExecutor::new(registry, store.clone());
     let events = executor
         .execute(
             plan,
@@ -692,13 +692,13 @@ async fn materialization_failure_aborts_import_and_uses_encoded_cold_fallback() 
     assert_eq!(engine.call_counts().commit, 0);
     assert_eq!(engine.call_counts().abort, 1);
     assert_eq!(engine.call_counts().execute, 1);
-    assert_eq!(provider.call_counts().materialize, 1);
+    assert_eq!(store.call_counts().materialize, 1);
 }
 
 #[tokio::test]
-async fn observed_provider_outage_degrades_to_cold_when_policy_allows() {
-    let request = token_request("provider-outage");
-    let provider_id = ProviderId::new("outage-provider");
+async fn observed_store_outage_degrades_to_cold_when_policy_allows() {
+    let request = token_request("store-outage");
+    let store_id = StoreId::new("outage-store");
     let (instance, target) = engine_and_target("outage");
     let engine = Arc::new(FakeEngineAdapter::new(
         instance,
@@ -707,7 +707,7 @@ async fn observed_provider_outage_degrades_to_cold_when_policy_allows() {
     ));
     let reusable = state_path(
         &target,
-        &provider_id,
+        &store_id,
         StateFixtureSpec {
             id: "unavailable-state",
             coverage: 900,
@@ -719,12 +719,12 @@ async fn observed_provider_outage_degrades_to_cold_when_policy_allows() {
             locality: StateLocality::Local,
         },
     );
-    let provider = Arc::new(FakeStateProvider::new(
-        provider_id.clone(),
+    let store = Arc::new(FakeStateStore::new(
+        store_id.clone(),
         vec![reusable.state.clone()],
         vec![reusable.option.clone()],
     ));
-    provider.set_unavailable(true);
+    store.set_unavailable(true);
     let mut input = planning_input(
         request.clone(),
         vec![candidate(
@@ -735,14 +735,14 @@ async fn observed_provider_outage_degrades_to_cold_when_policy_allows() {
             vec![reusable],
         )],
     );
-    input.state_observation.unavailable_providers =
-        BTreeMap::from([(provider_id, "health check failed".to_owned())]);
+    input.state_observation.unavailable_stores =
+        BTreeMap::from([(store_id, "health check failed".to_owned())]);
 
     let plan = CostBasedPlanner.plan(&input).await.expect("cold plan");
     assert!(matches!(plan.path, ExecutionPath::Cold));
     let registry = EngineRegistry::new();
     registry.register(engine.clone()).expect("register engine");
-    let executor = DefaultPlanExecutor::new(registry, provider.clone());
+    let executor = DefaultPlanExecutor::new(registry, store.clone());
     let events = executor
         .execute(
             plan,
@@ -756,7 +756,7 @@ async fn observed_provider_outage_degrades_to_cold_when_policy_allows() {
         .expect("event stream");
 
     assert_eq!(events.len(), 3);
-    assert_eq!(provider.call_counts().materialize, 0);
+    assert_eq!(store.call_counts().materialize, 0);
     assert_eq!(engine.call_counts().prepare, 0);
     assert_eq!(engine.call_counts().execute, 1);
 }
@@ -933,11 +933,11 @@ async fn prediction_error_blocks_active_promotion() {
 
 #[test]
 fn materialization_calibration_is_scoped_to_target() {
-    let provider = ProviderId::new("calibrated-provider");
+    let store = StoreId::new("calibrated-store");
     let (_, target) = engine_and_target("materialization-calibration");
     let reusable = state_path(
         &target,
-        &provider,
+        &store,
         StateFixtureSpec {
             id: "calibrated-state",
             coverage: 2,
@@ -976,7 +976,7 @@ fn materialization_calibration_is_scoped_to_target() {
             generation_micros: None,
             topology_micros: None,
             materialization: Some(MaterializationObservation {
-                provider: provider.as_str().to_owned(),
+                store: store.as_str().to_owned(),
                 state_kind: "kv".to_owned(),
                 target_id: target.id.to_string(),
                 estimated_micros: 100,
@@ -1036,7 +1036,7 @@ fn calibration_state_cardinality_is_bounded() {
     assert!(!state.contains("engine-bounded-a"));
     assert!(state.contains("engine-bounded-b"));
 
-    for provider in ["provider-a", "provider-b"] {
+    for store in ["store-a", "store-b"] {
         calibrator
             .record_observation(&CalibrationObservation {
                 key: CalibrationKey::from_target(&target_b),
@@ -1047,7 +1047,7 @@ fn calibration_state_cardinality_is_bounded() {
                 generation_micros: None,
                 topology_micros: None,
                 materialization: Some(MaterializationObservation {
-                    provider: provider.to_owned(),
+                    store: store.to_owned(),
                     state_kind: "kv".to_owned(),
                     target_id: target_b.id.to_string(),
                     estimated_micros: 10,
@@ -1058,8 +1058,8 @@ fn calibration_state_cardinality_is_bounded() {
             .expect("record bounded materialization");
     }
     let state = calibrator.state_json().expect("state JSON");
-    assert!(!state.contains("provider-a"));
-    assert!(state.contains("provider-b"));
+    assert!(!state.contains("store-a"));
+    assert!(state.contains("store-b"));
 }
 
 #[test]
@@ -1078,13 +1078,13 @@ fn oversized_calibration_state_fails_before_parsing() {
 }
 
 #[tokio::test]
-async fn planner_performs_no_state_provider_mutation() {
+async fn planner_performs_no_store_mutation() {
     let request = token_request("pure-planner");
-    let provider_id = ProviderId::new("fake-provider");
+    let store_id = StoreId::new("fake-store");
     let (_, target) = engine_and_target("pure");
     let reusable = state_path(
         &target,
-        &provider_id,
+        &store_id,
         StateFixtureSpec {
             id: "pure-state",
             coverage: 500,
@@ -1096,8 +1096,8 @@ async fn planner_performs_no_state_provider_mutation() {
             locality: StateLocality::Local,
         },
     );
-    let provider = FakeStateProvider::new(
-        provider_id,
+    let store = FakeStateStore::new(
+        store_id,
         vec![reusable.state.clone()],
         vec![reusable.option.clone()],
     );
@@ -1113,7 +1113,7 @@ async fn planner_performs_no_state_provider_mutation() {
     );
 
     CostBasedPlanner.plan(&input).await.expect("plan");
-    assert_eq!(provider.call_counts(), Default::default());
+    assert_eq!(store.call_counts(), Default::default());
 }
 
 #[test]
@@ -1148,7 +1148,7 @@ fn core_source_has_no_backend_or_framework_domain_type_leaks() {
         "sglang", "vllm", "tensorrt", "nexuskv", "axum::", "tonic::", "pyo3::",
     ];
 
-    for crate_directory in ["core", "model-io", "parser", "engine", "state", "planner"] {
+    for crate_directory in ["core", "model-io", "parser", "engine", "store", "planner"] {
         assert_no_forbidden_source(
             &workspace.join("crates").join(crate_directory).join("src"),
             &forbidden,

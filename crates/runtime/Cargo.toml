@@ -14,7 +14,7 @@ locus-core = { path = "../core" }
 locus-engine = { path = "../engine" }
 locus-planner = { path = "../planner" }
 locus-model-io = { path = "../model-io" }
-locus-state = { path = "../state" }
+locus-store = { path = "../store" }
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true

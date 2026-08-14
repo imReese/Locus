@@ -5,8 +5,8 @@ use std::collections::BTreeMap;
 
 use async_trait::async_trait;
 use locus_core::{
-    CanonicalRequest, CompatibilityResult, ExecutionTarget, MaterializationOption, ProviderId,
-    StateDescriptor,
+    CanonicalRequest, CompatibilityResult, ExecutionTarget, MaterializationOption, StateDescriptor,
+    StoreId,
 };
 use thiserror::Error;
 
@@ -56,8 +56,8 @@ pub struct StatePathCandidate {
     pub state: StateDescriptor,
     pub compatibility: CompatibilityResult,
     pub option: MaterializationOption,
-    /// Planner-only override. The provider estimate in `option` remains immutable so
-    /// observed transfer time is always calibrated against the provider's raw baseline.
+    /// Planner-only override. The store estimate in `option` remains immutable so
+    /// observed transfer time is always calibrated against the store's raw baseline.
     pub materialization_estimate_micros: Option<u64>,
     pub estimate: ExecutionEstimate,
 }
@@ -73,7 +73,7 @@ pub struct PlanningCandidate {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct StateObservation {
-    pub unavailable_providers: BTreeMap<ProviderId, String>,
+    pub unavailable_stores: BTreeMap<StoreId, String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -85,14 +85,14 @@ pub enum FallbackAction {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RoutingPolicy {
-    pub allow_cold_on_provider_outage: bool,
+    pub allow_cold_on_store_outage: bool,
     pub import_failure_fallback: FallbackAction,
 }
 
 impl Default for RoutingPolicy {
     fn default() -> Self {
         Self {
-            allow_cold_on_provider_outage: true,
+            allow_cold_on_store_outage: true,
             import_failure_fallback: FallbackAction::ColdOnSameTarget,
         }
     }
@@ -190,14 +190,14 @@ impl Planner for CostBasedPlanner {
             for state_path in &candidate.state_paths {
                 if input
                     .state_observation
-                    .unavailable_providers
-                    .contains_key(&state_path.option.provider)
+                    .unavailable_stores
+                    .contains_key(&state_path.option.store)
                 {
                     unavailable_path_seen = true;
                     continue;
                 }
                 if !state_path.compatibility.is_compatible()
-                    || state_path.state.provider != state_path.option.provider
+                    || state_path.state.store != state_path.option.store
                     || state_path.state.id != state_path.option.source_state
                     || state_path.state.kind != state_path.option.state_kind
                     || state_path.state.model != input.request.model
@@ -249,10 +249,10 @@ impl Planner for CostBasedPlanner {
 
         let selected = best.ok_or(PlanningError::NoFeasibleCandidate)?;
         if unavailable_path_seen
-            && !input.policy.allow_cold_on_provider_outage
+            && !input.policy.allow_cold_on_store_outage
             && matches!(&selected.path, ExecutionPath::Cold)
         {
-            return Err(PlanningError::StateProviderUnavailable);
+            return Err(PlanningError::StoreUnavailable);
         }
         Ok(PlacementPlan {
             target: selected.target,
@@ -292,6 +292,6 @@ fn consider(best: &mut Option<FeasiblePath>, candidate: FeasiblePath) {
 pub enum PlanningError {
     #[error("no feasible execution target satisfies the request")]
     NoFeasibleCandidate,
-    #[error("a required state provider is unavailable and cold degradation is disabled")]
-    StateProviderUnavailable,
+    #[error("a required state store is unavailable and cold degradation is disabled")]
+    StoreUnavailable,
 }

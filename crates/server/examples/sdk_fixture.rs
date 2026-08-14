@@ -24,7 +24,7 @@ use locus_model_io::{
 use locus_openai::{ApiConfig, router_with_config};
 use locus_parser::{TaggedJsonToolParserDefinition, TaggedReasoningParserDefinition};
 use locus_runtime::{DefaultInferenceService, InferenceService};
-use locus_state::{NullStateProvider, StateProvider};
+use locus_store::{NullStateStore, StateStore};
 use serde_json::json;
 use tokio::net::TcpListener;
 
@@ -330,9 +330,9 @@ async fn main() {
     engines
         .register(parser_adapter)
         .expect("register parser fixture engine");
-    let state: Arc<dyn StateProvider> = Arc::new(NullStateProvider::default());
+    let store: Arc<dyn StateStore> = Arc::new(NullStateStore::default());
     let service: Arc<dyn InferenceService> =
-        Arc::new(DefaultInferenceService::new(models, engines, state));
+        Arc::new(DefaultInferenceService::new(models, engines, store));
     let api = router_with_config(
         service,
         ApiConfig {

@@ -3,11 +3,11 @@ use std::time::Instant;
 
 use async_trait::async_trait;
 use locus_core::{
-    ExecutionTarget, MaterializationOption, OpaqueHandle, OperationContext, ProviderId,
-    StateDescriptor, StateImportTarget, StateRequirement, TransferReceipt,
+    ExecutionTarget, MaterializationOption, OpaqueHandle, OperationContext, StateDescriptor,
+    StateImportTarget, StateRequirement, StoreId, TransferReceipt,
 };
 
-use crate::{StateError, StateProvider};
+use crate::{StateStore, StoreError};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct FakeStateCallCounts {
@@ -16,8 +16,8 @@ pub struct FakeStateCallCounts {
     pub materialize: usize,
 }
 
-pub struct FakeStateProvider {
-    identity: ProviderId,
+pub struct FakeStateStore {
+    identity: StoreId,
     states: Vec<StateDescriptor>,
     options: Vec<MaterializationOption>,
     unavailable: AtomicBool,
@@ -27,10 +27,10 @@ pub struct FakeStateProvider {
     materialize_calls: AtomicUsize,
 }
 
-impl FakeStateProvider {
+impl FakeStateStore {
     #[must_use]
     pub fn new(
-        identity: ProviderId,
+        identity: StoreId,
         states: Vec<StateDescriptor>,
         options: Vec<MaterializationOption>,
     ) -> Self {
@@ -65,8 +65,8 @@ impl FakeStateProvider {
 }
 
 #[async_trait]
-impl StateProvider for FakeStateProvider {
-    fn identity(&self) -> &ProviderId {
+impl StateStore for FakeStateStore {
+    fn identity(&self) -> &StoreId {
         &self.identity
     }
 
@@ -74,11 +74,11 @@ impl StateProvider for FakeStateProvider {
         &self,
         requirement: &StateRequirement,
         context: &OperationContext,
-    ) -> Result<Vec<StateDescriptor>, StateError> {
+    ) -> Result<Vec<StateDescriptor>, StoreError> {
         context.ensure_active()?;
         self.lookup_calls.fetch_add(1, Ordering::AcqRel);
         if self.unavailable.load(Ordering::Acquire) {
-            return Err(StateError::Unavailable("configured fake outage".to_owned()));
+            return Err(StoreError::Unavailable("configured fake outage".to_owned()));
         }
         Ok(self
             .states
@@ -100,11 +100,11 @@ impl StateProvider for FakeStateProvider {
         state: &StateDescriptor,
         target: &ExecutionTarget,
         context: &OperationContext,
-    ) -> Result<Vec<MaterializationOption>, StateError> {
+    ) -> Result<Vec<MaterializationOption>, StoreError> {
         context.ensure_active()?;
         self.estimate_calls.fetch_add(1, Ordering::AcqRel);
         if self.unavailable.load(Ordering::Acquire) {
-            return Err(StateError::Unavailable("configured fake outage".to_owned()));
+            return Err(StoreError::Unavailable("configured fake outage".to_owned()));
         }
         Ok(self
             .options
@@ -119,39 +119,39 @@ impl StateProvider for FakeStateProvider {
         option: &MaterializationOption,
         target: &StateImportTarget,
         context: &OperationContext,
-    ) -> Result<TransferReceipt, StateError> {
+    ) -> Result<TransferReceipt, StoreError> {
         context.ensure_active()?;
         self.materialize_calls.fetch_add(1, Ordering::AcqRel);
         if self.unavailable.load(Ordering::Acquire) {
-            return Err(StateError::Unavailable("configured fake outage".to_owned()));
+            return Err(StoreError::Unavailable("configured fake outage".to_owned()));
         }
         if self.fail_materialization.load(Ordering::Acquire) {
-            return Err(StateError::Materialization(
+            return Err(StoreError::Materialization(
                 "configured fake materialization failure".to_owned(),
             ));
         }
-        if option.provider != self.identity {
-            return Err(StateError::Materialization(
-                "materialization option belongs to another provider".to_owned(),
+        if option.store != self.identity {
+            return Err(StoreError::Materialization(
+                "materialization option belongs to another store".to_owned(),
             ));
         }
         if option.target_id != target.target_id
             || option.target_engine != target.engine
             || option.state_kind != target.state_kind
         {
-            return Err(StateError::Materialization(
+            return Err(StoreError::Materialization(
                 "import target does not match materialization option".to_owned(),
             ));
         }
         if Instant::now() >= target.expires_at {
-            return Err(StateError::Materialization(
+            return Err(StoreError::Materialization(
                 "import target expired before transfer".to_owned(),
             ));
         }
 
         Ok(TransferReceipt {
             import_id: target.import_id.clone(),
-            provider: self.identity.clone(),
+            store: self.identity.clone(),
             bytes_transferred: 4096,
             receipt: OpaqueHandle {
                 namespace: "locus.fake.transfer-receipt.v1".to_owned(),

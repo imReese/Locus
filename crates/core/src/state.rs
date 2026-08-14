@@ -3,8 +3,8 @@ use std::time::Instant;
 
 use crate::{
     AttachmentId, EngineInstanceRef, ExecutionTarget, ExecutionTargetId, ImportId, InputItemId,
-    InputSemanticIdentity, MaterializationOptionId, ModelExecutionIdentity, OpaqueHandle,
-    ProviderId, StateId,
+    InputSemanticIdentity, MaterializationOptionId, ModelExecutionIdentity, OpaqueHandle, StateId,
+    StoreId,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -106,7 +106,7 @@ pub struct StateRequirement {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StateDescriptor {
     pub id: StateId,
-    pub provider: ProviderId,
+    pub store: StoreId,
     pub kind: StateKind,
     pub model: ModelExecutionIdentity,
     pub relevant_input_semantics: Option<InputSemanticIdentity>,
@@ -115,7 +115,7 @@ pub struct StateDescriptor {
     pub runtime_compatibility: Option<String>,
     pub boundary: ReusableBoundary,
     pub locations: Vec<String>,
-    pub provider_reference: OpaqueHandle,
+    pub store_reference: OpaqueHandle,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -127,7 +127,7 @@ pub enum StateLocality {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MaterializationOption {
     pub id: MaterializationOptionId,
-    pub provider: ProviderId,
+    pub store: StoreId,
     pub source_state: StateId,
     pub target_id: ExecutionTargetId,
     pub target_engine: EngineInstanceRef,
@@ -179,7 +179,7 @@ impl StateImportTarget {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TransferReceipt {
     pub import_id: ImportId,
-    pub provider: ProviderId,
+    pub store: StoreId,
     pub bytes_transferred: u64,
     pub receipt: OpaqueHandle,
 }

@@ -199,14 +199,14 @@ separate optional engine capability is explicitly selected.
 
 ## State import transaction
 
-The provider owns state discovery, source identity, and movement. The adapter
+The store owns state discovery, source identity, and movement. The adapter
 owns the runtime destination, device-local allocation, install, and bind.
 `PlanExecutor` coordinates the transaction:
 
 1. `prepare_state_import` validates the target generation and allocates or
    reserves a destination. It returns an expiring `StateImportTarget` with an
    opaque, negotiated sink handle.
-2. The state provider transfers the planned source to that target and returns
+2. The state store transfers the planned source to that target and returns
    a `TransferReceipt`.
 3. `commit_state_import` validates the receipt, completeness, compatibility,
    and current generation, then returns a `PreparedStateAttachment`.
@@ -218,16 +218,16 @@ transfer failure, timeout, cancellation, stale generation, commit failure, or
 executor fallback. Import targets and attachments expire. A restart fails
 closed and invalidates both.
 
-Provider-private source objects and engine-private allocation/layout objects do
+Store-private source objects and engine-private allocation/layout objects do
 not cross core APIs. Opaque handles are allowed only with an explicit namespace
-and scope understood by the participating adapter and provider.
+and scope understood by the participating adapter and store.
 
 Binding failure is explicit. `PlanExecutor` follows the fallback encoded in the
 placement plan: cold execution on the same target, bounded replanning, or
-request failure. Neither adapter nor provider silently chooses another target
+request failure. Neither adapter nor store silently chooses another target
 or state artifact.
 
-This division allows NexusKV or another provider to manage movement while the
+This division allows NexusKV or another store to manage movement while the
 runtime retains device-local allocation and installation. Engines that cannot
 accept external state omit the capability.
 
@@ -315,7 +315,7 @@ handoff mechanisms. The planner may produce a multi-stage placement plan when:
 
 - the request permits the additional latency and failure surface;
 - prefill and decode roles share a compatible state handoff;
-- the state provider or adapter can estimate and execute that handoff;
+- the state store or adapter can estimate and execute that handoff;
 - both stages meet model, semantic, and topology constraints.
 
 Each execution engine still owns local scheduling within its stage. The global

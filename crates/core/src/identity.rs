@@ -28,7 +28,7 @@ macro_rules! string_id {
 string_id!(RequestId);
 string_id!(EngineInstanceId);
 string_id!(ExecutionTargetId);
-string_id!(ProviderId);
+string_id!(StoreId);
 string_id!(StateId);
 string_id!(MaterializationOptionId);
 string_id!(ImportId);

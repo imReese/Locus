@@ -4,7 +4,7 @@
 
 `locus-server` is the deployable Locus process. It loads a static model-catalog
 source from one JSON configuration, constructs production model I/O profiles,
-registers SGLang or vLLM adapters and an optional NexusKV provider, applies
+registers SGLang or vLLM adapters and an optional NexusKV store, applies
 ingress policy, and serves the OpenAI routes. Model I/O profiles and live engine
 inventory are separate: a catalog profile may exist while no engine currently
 serves it. Invalid semantic artifacts and ambiguous identity mappings still fail
@@ -38,7 +38,7 @@ The top-level configuration contains:
 | `models` | Static catalog source: public aliases plus immutable model and semantic artifacts |
 | `required_models` | Optional aliases that must be routable for readiness |
 | `engines` | SGLang/vLLM instances whose live model inventory is discovered at runtime |
-| `state` | Disabled or a versioned NexusKV bridge configuration |
+| `store` | Disabled or a versioned NexusKV store configuration |
 | `placement` | Shadow/active calibrated placement, durable state, gates, and conservative priors |
 | `observability` | Default tracing filter and compact/JSON log format |
 
@@ -210,11 +210,11 @@ decision agreement and repeats calibrated planning to detect nondeterminism.
 Outcome learning is keyed by engine ID and generation plus immutable model,
 adapter, and execution-profile revisions. Idle TTFT calibrates prefill;
 TTFT residual while requests are waiting calibrates queue delay; inter-token
-completion time calibrates decode; provider estimate versus observed transfer
+completion time calibrates decode; store estimate versus observed transfer
 calibrates materialization; state-import activation overhead calibrates the
 topology term. Cancelled, failed, incomplete, or ambiguous observations do not
 update the corresponding estimator. Prompts, raw token IDs, output text,
-provider handles, and credentials are never persisted.
+store handles, and credentials are never persisted.
 
 ```json
 {
@@ -314,7 +314,7 @@ not per-tenant rate or fairness admission.
 
 Every request receives or preserves an `x-request-id`, and the response
 propagates it. The HTTP stack emits tracing spans without logging prompt bodies,
-token IDs, tool arguments, bearer tokens, or provider handles. Set `RUST_LOG` to
+token IDs, tool arguments, bearer tokens, or store handles. Set `RUST_LOG` to
 override the configured default filter. JSON logs are appropriate for a log
 collector; compact logs are convenient locally.
 
@@ -322,7 +322,7 @@ At info level, placement records the selected target, legacy/shadow/active
 source, promotion blockers, freshness/confidence, full selected cost breakdown,
 fallback, and redacted observed timing. Enable `locus_runtime=debug` to emit the
 bounded legacy and calibrated path audit: deterministic rank, hard-constraint
-exclusion reason codes, state kind/provider ID, each cost term, and telemetry
+exclusion reason codes, state kind/store ID, each cost term, and telemetry
 revision/TTL. At most 256 path records per decision variant are emitted; a
 truncation warning reports larger candidate sets. Neither level includes prompt
 content, raw token IDs, generated content, opaque state handles, or credentials.

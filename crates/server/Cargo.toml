@@ -16,8 +16,8 @@ locus-planner = { path = "../planner" }
 locus-runtime = { path = "../runtime" }
 locus-model-io = { path = "../model-io" }
 locus-parser = { path = "../parser" }
-locus-state = { path = "../state" }
-locus-state-nexuskv = { path = "../state-nexuskv" }
+locus-store = { path = "../store" }
+locus-store-nexuskv = { path = "../store/nexuskv" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

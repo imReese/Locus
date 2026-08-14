@@ -2,53 +2,53 @@ mod fake;
 
 use async_trait::async_trait;
 use locus_core::{
-    ContextError, ExecutionTarget, MaterializationOption, OperationContext, ProviderId,
-    StateDescriptor, StateImportTarget, StateRequirement, TransferReceipt,
+    ContextError, ExecutionTarget, MaterializationOption, OperationContext, StateDescriptor,
+    StateImportTarget, StateRequirement, StoreId, TransferReceipt,
 };
 use thiserror::Error;
 
-pub use fake::{FakeStateCallCounts, FakeStateProvider};
+pub use fake::{FakeStateCallCounts, FakeStateStore};
 
 #[async_trait]
-pub trait StateProvider: Send + Sync {
-    fn identity(&self) -> &ProviderId;
+pub trait StateStore: Send + Sync {
+    fn identity(&self) -> &StoreId;
 
     async fn lookup(
         &self,
         requirement: &StateRequirement,
         context: &OperationContext,
-    ) -> Result<Vec<StateDescriptor>, StateError>;
+    ) -> Result<Vec<StateDescriptor>, StoreError>;
 
     async fn estimate(
         &self,
         state: &StateDescriptor,
         target: &ExecutionTarget,
         context: &OperationContext,
-    ) -> Result<Vec<MaterializationOption>, StateError>;
+    ) -> Result<Vec<MaterializationOption>, StoreError>;
 
     async fn materialize(
         &self,
         option: &MaterializationOption,
         target: &StateImportTarget,
         context: &OperationContext,
-    ) -> Result<TransferReceipt, StateError>;
+    ) -> Result<TransferReceipt, StoreError>;
 }
 
-pub struct NullStateProvider {
-    identity: ProviderId,
+pub struct NullStateStore {
+    identity: StoreId,
 }
 
-impl Default for NullStateProvider {
+impl Default for NullStateStore {
     fn default() -> Self {
         Self {
-            identity: ProviderId::new("locus.null-state-provider"),
+            identity: StoreId::new("locus.null-state-store"),
         }
     }
 }
 
 #[async_trait]
-impl StateProvider for NullStateProvider {
-    fn identity(&self) -> &ProviderId {
+impl StateStore for NullStateStore {
+    fn identity(&self) -> &StoreId {
         &self.identity
     }
 
@@ -56,7 +56,7 @@ impl StateProvider for NullStateProvider {
         &self,
         _requirement: &StateRequirement,
         context: &OperationContext,
-    ) -> Result<Vec<StateDescriptor>, StateError> {
+    ) -> Result<Vec<StateDescriptor>, StoreError> {
         context.ensure_active()?;
         Ok(Vec::new())
     }
@@ -66,7 +66,7 @@ impl StateProvider for NullStateProvider {
         _state: &StateDescriptor,
         _target: &ExecutionTarget,
         context: &OperationContext,
-    ) -> Result<Vec<MaterializationOption>, StateError> {
+    ) -> Result<Vec<MaterializationOption>, StoreError> {
         context.ensure_active()?;
         Ok(Vec::new())
     }
@@ -76,25 +76,25 @@ impl StateProvider for NullStateProvider {
         _option: &MaterializationOption,
         _target: &StateImportTarget,
         context: &OperationContext,
-    ) -> Result<TransferReceipt, StateError> {
+    ) -> Result<TransferReceipt, StoreError> {
         context.ensure_active()?;
-        Err(StateError::Unsupported(
-            "null provider cannot materialize state".to_owned(),
+        Err(StoreError::Unsupported(
+            "null store cannot materialize state".to_owned(),
         ))
     }
 }
 
 #[derive(Debug, Error)]
-pub enum StateError {
+pub enum StoreError {
     #[error(transparent)]
     Context(#[from] ContextError),
-    #[error("state provider is unavailable: {0}")]
+    #[error("state store is unavailable: {0}")]
     Unavailable(String),
     #[error("state operation is unsupported: {0}")]
     Unsupported(String),
     #[error("state compatibility failed: {0}")]
     Incompatible(String),
-    #[error("state provider protocol failed: {0}")]
+    #[error("state store protocol failed: {0}")]
     Protocol(String),
     #[error("state materialization failed: {0}")]
     Materialization(String),

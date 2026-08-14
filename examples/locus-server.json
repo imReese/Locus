@@ -55,7 +55,7 @@
       "expert_parallel": 1
     }
   ],
-  "state": {
+  "store": {
     "kind": "disabled"
   },
   "placement": {

@@ -23,7 +23,7 @@ use locus_planner::{
     RoutingPolicy, StateObservation, StatePathCandidate, plan_decision_fingerprint,
     plan_fingerprint,
 };
-use locus_state::{StateError, StateProvider};
+use locus_store::{StateStore, StoreError};
 use thiserror::Error;
 
 pub type ModelEventStream = BoxStream<'static, Result<ModelEvent, InferenceError>>;
@@ -177,7 +177,7 @@ pub struct DefaultInferenceService {
     planner: Arc<dyn Planner>,
     executor: Arc<dyn PlanExecutor>,
     engines: EngineRegistry,
-    state_provider: Arc<dyn StateProvider>,
+    store: Arc<dyn StateStore>,
     policy: RoutingPolicy,
     required_models: BTreeSet<String>,
     placement: PlacementControl,
@@ -193,15 +193,11 @@ struct TargetInventory {
 
 impl DefaultInferenceService {
     #[must_use]
-    pub fn new(
-        models: ModelRegistry,
-        engines: EngineRegistry,
-        state_provider: Arc<dyn StateProvider>,
-    ) -> Self {
+    pub fn new(models: ModelRegistry, engines: EngineRegistry, store: Arc<dyn StateStore>) -> Self {
         let discovery = Arc::new(EngineTargetDiscovery::new(engines.clone()));
         let executor = Arc::new(DefaultPlanExecutor::new(
             engines.clone(),
-            Arc::clone(&state_provider),
+            Arc::clone(&store),
         ));
         Self {
             catalog: Arc::new(models),
@@ -209,7 +205,7 @@ impl DefaultInferenceService {
             planner: Arc::new(CostBasedPlanner),
             executor,
             engines,
-            state_provider,
+            store,
             policy: RoutingPolicy::default(),
             required_models: BTreeSet::new(),
             placement: PlacementControl::shadow(default_calibrator()),
@@ -220,7 +216,7 @@ impl DefaultInferenceService {
     pub fn with_components(
         models: ModelRegistry,
         engines: EngineRegistry,
-        state_provider: Arc<dyn StateProvider>,
+        store: Arc<dyn StateStore>,
         discovery: Arc<dyn TargetDiscovery>,
         planner: Arc<dyn Planner>,
         executor: Arc<dyn PlanExecutor>,
@@ -232,7 +228,7 @@ impl DefaultInferenceService {
             planner,
             executor,
             engines,
-            state_provider,
+            store,
             policy,
             required_models: BTreeSet::new(),
             placement: PlacementControl::shadow(default_calibrator()),
@@ -329,12 +325,12 @@ impl DefaultInferenceService {
                     }),
                     tenant_scope: None,
                 };
-            match self.state_provider.lookup(&requirement, context).await {
+            match self.store.lookup(&requirement, context).await {
                 Ok(states) => states,
-                Err(StateError::Unavailable(reason)) => {
+                Err(StoreError::Unavailable(reason)) => {
                     state_observation
-                        .unavailable_providers
-                        .insert(self.state_provider.identity().clone(), reason);
+                        .unavailable_stores
+                        .insert(self.store.identity().clone(), reason);
                     Vec::new()
                 }
                 Err(error) => return Err(error.into()),
@@ -357,15 +353,15 @@ impl DefaultInferenceService {
                     continue;
                 }
                 let options = match self
-                    .state_provider
+                    .store
                     .estimate(state, &discovered.target, context)
                     .await
                 {
                     Ok(options) => options,
-                    Err(StateError::Unavailable(reason)) => {
+                    Err(StoreError::Unavailable(reason)) => {
                         state_observation
-                            .unavailable_providers
-                            .insert(self.state_provider.identity().clone(), reason);
+                            .unavailable_stores
+                            .insert(self.store.identity().clone(), reason);
                         Vec::new()
                     }
                     Err(error) => return Err(error.into()),
@@ -618,10 +614,10 @@ impl InferenceService for DefaultInferenceService {
                     let completed = !matches!(reason, EngineFinishReason::Cancelled | EngineFinishReason::Error);
                     let materialization = execution_metadata.materialization.as_ref().map(|timing| {
                         MaterializationObservation {
-                            provider: timing.provider.clone(),
+                            store: timing.store.clone(),
                             state_kind: timing.state_kind.clone(),
                             target_id: timing.target_id.clone(),
-                            estimated_micros: timing.provider_estimated_micros,
+                            estimated_micros: timing.store_estimated_micros,
                             actual_micros: timing.actual_micros,
                         }
                     });
@@ -763,7 +759,7 @@ fn compatibility_for(state: &StateDescriptor, request: &CanonicalRequest) -> Com
         None => CompatibilityResult {
             verdict: CompatibilityVerdict::Unknown,
             checked_dimensions: vec!["model_execution".to_owned()],
-            evidence: vec!["provider omitted input semantic identity".to_owned()],
+            evidence: vec!["store omitted input semantic identity".to_owned()],
             required_conversion: None,
         },
     }
@@ -850,7 +846,7 @@ struct PathAudit {
     engine_id: String,
     path_kind: &'static str,
     state_kind: Option<String>,
-    provider: Option<String>,
+    store: Option<String>,
     feasible: bool,
     exclusions: Vec<&'static str>,
     cost: CostBreakdown,
@@ -876,7 +872,7 @@ fn trace_planning_paths(input: &PlanningInput, variant: &'static str) {
             engine_id: candidate.target.engine.id.to_string(),
             path_kind: "cold",
             state_kind: None,
-            provider: None,
+            store: None,
             feasible: candidate_exclusions.is_empty(),
             exclusions: candidate_exclusions.clone(),
             cost: audit_cost(queue_micros, &candidate.cold_estimate, 0),
@@ -899,7 +895,7 @@ fn trace_planning_paths(input: &PlanningInput, variant: &'static str) {
                 engine_id: candidate.target.engine.id.to_string(),
                 path_kind: "reuse",
                 state_kind: Some(state_path.state.kind.as_str().to_owned()),
-                provider: Some(state_path.option.provider.as_str().to_owned()),
+                store: Some(state_path.option.store.as_str().to_owned()),
                 feasible: exclusions.is_empty(),
                 exclusions,
                 cost: audit_cost(queue_micros, &state_path.estimate, materialization_micros),
@@ -934,7 +930,7 @@ fn trace_planning_paths(input: &PlanningInput, variant: &'static str) {
             engine_id = %audit.engine_id,
             path_kind = audit.path_kind,
             state_kind = audit.state_kind.as_deref().unwrap_or("none"),
-            provider = audit.provider.as_deref().unwrap_or("none"),
+            store = audit.store.as_deref().unwrap_or("none"),
             feasible = audit.feasible,
             exclusion_reasons = %audit.exclusions.join(","),
             rank = ?audit.rank,
@@ -991,16 +987,16 @@ fn state_path_exclusions(
     let mut reasons = Vec::new();
     if input
         .state_observation
-        .unavailable_providers
-        .contains_key(&state_path.option.provider)
+        .unavailable_stores
+        .contains_key(&state_path.option.store)
     {
-        reasons.push("state_provider_unavailable");
+        reasons.push("store_unavailable");
     }
     if !state_path.compatibility.is_compatible() {
         reasons.push("state_incompatible");
     }
-    if state_path.state.provider != state_path.option.provider {
-        reasons.push("state_provider_mismatch");
+    if state_path.state.store != state_path.option.store {
+        reasons.push("store_mismatch");
     }
     if state_path.state.id != state_path.option.source_state {
         reasons.push("source_state_mismatch");
@@ -1157,7 +1153,7 @@ pub enum InferenceError {
     #[error(transparent)]
     Engine(#[from] EngineError),
     #[error(transparent)]
-    State(#[from] StateError),
+    Store(#[from] StoreError),
     #[error(transparent)]
     Planning(#[from] PlanningError),
     #[error(transparent)]

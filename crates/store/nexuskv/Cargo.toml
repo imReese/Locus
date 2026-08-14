@@ -1,5 +1,5 @@
 [package]
-name = "locus-state-nexuskv"
+name = "locus-store-nexuskv"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,8 +8,8 @@ repository.workspace = true
 
 [dependencies]
 async-trait.workspace = true
-locus-core = { path = "../core" }
-locus-state = { path = "../state" }
+locus-core = { path = "../../core" }
+locus-store = { path = ".." }
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -17,9 +17,9 @@ serde_json.workspace = true
 [dev-dependencies]
 axum.workspace = true
 futures.workspace = true
-locus-engine = { path = "../engine" }
-locus-runtime = { path = "../runtime" }
-locus-model-io = { path = "../model-io" }
+locus-engine = { path = "../../engine" }
+locus-runtime = { path = "../../runtime" }
+locus-model-io = { path = "../../model-io" }
 tokio.workspace = true
 
 [lints]

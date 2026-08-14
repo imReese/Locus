@@ -26,8 +26,8 @@ use locus_openai::{ApiConfig, router_with_config};
 use locus_parser::{TaggedJsonToolParserSpec, TaggedReasoningParserSpec};
 use locus_planner::{CalibrationPolicy, PersistentCalibrator, PlacementMode};
 use locus_runtime::{DefaultInferenceService, InferenceService, PlacementControl};
-use locus_state::{NullStateProvider, StateProvider};
-use locus_state_nexuskv::{NexusKvBridgeConfig, NexusKvStateProvider};
+use locus_store::{NullStateStore, StateStore};
+use locus_store_nexuskv::{NexusKvStore, NexusKvStoreConfig};
 use serde::Deserialize;
 use serde_json::Value;
 use thiserror::Error;
@@ -51,7 +51,7 @@ pub struct ServerConfig {
     pub required_models: Vec<String>,
     pub engines: Vec<EngineSettings>,
     #[serde(default)]
-    pub state: StateSettings,
+    pub store: StoreSettings,
     #[serde(default)]
     pub observability: ObservabilitySettings,
     #[serde(default)]
@@ -440,7 +440,7 @@ impl CalibrationSettings {
 
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase", deny_unknown_fields)]
-pub enum StateSettings {
+pub enum StoreSettings {
     #[default]
     Disabled,
     Nexuskv {
@@ -649,22 +649,22 @@ pub fn build_server(
         engines.register(adapter)?;
     }
 
-    let state_provider: Arc<dyn StateProvider> = match &config.state {
-        StateSettings::Disabled => Arc::new(NullStateProvider::default()),
-        StateSettings::Nexuskv {
+    let store: Arc<dyn StateStore> = match &config.store {
+        StoreSettings::Disabled => Arc::new(NullStateStore::default()),
+        StoreSettings::Nexuskv {
             base_url,
             api_key_env,
             tenant,
             namespace,
             engine_family,
             semantic_type,
-        } => Arc::new(NexusKvStateProvider::new(NexusKvBridgeConfig {
-            base_url: required("state.base_url", base_url)?,
+        } => Arc::new(NexusKvStore::new(NexusKvStoreConfig {
+            base_url: required("store.base_url", base_url)?,
             api_key: resolve_optional_secret(api_key_env.as_deref())?,
-            tenant: required("state.tenant", tenant)?,
-            namespace: required("state.namespace", namespace)?,
-            engine_family: required("state.engine_family", engine_family)?,
-            semantic_type: required("state.semantic_type", semantic_type)?,
+            tenant: required("store.tenant", tenant)?,
+            namespace: required("store.namespace", namespace)?,
+            engine_family: required("store.engine_family", engine_family)?,
+            semantic_type: required("store.semantic_type", semantic_type)?,
         })?),
     };
     let calibration_path = config
@@ -680,7 +680,7 @@ pub fn build_server(
         config.placement.active_confirmation.as_deref(),
     )?;
     let service: Arc<dyn InferenceService> = Arc::new(
-        DefaultInferenceService::new(models, engines, state_provider)
+        DefaultInferenceService::new(models, engines, store)
             .with_required_models(required_models)
             .with_placement_control(placement),
     );
@@ -890,7 +890,7 @@ pub enum ServerError {
     #[error(transparent)]
     Engine(#[from] locus_engine::EngineError),
     #[error(transparent)]
-    State(#[from] locus_state::StateError),
+    Store(#[from] locus_store::StoreError),
     #[error(transparent)]
     Api(#[from] locus_openai::ApiConfigError),
     #[error(transparent)]

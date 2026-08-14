@@ -219,7 +219,8 @@ fn write_config() -> (tempfile::TempDir, std::path::PathBuf) {
                 "model": "fixture",
                 "runtime_version": "test",
                 "target_id": "sglang-0/fixture"
-            }]
+            }],
+            "store": {"kind": "disabled"}
         })
         .to_string(),
     )

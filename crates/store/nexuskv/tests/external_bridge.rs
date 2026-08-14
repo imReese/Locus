@@ -15,8 +15,8 @@ use locus_model_io::{
     ModelProfile, ModelRegistry, ModelRequest, SimpleTemplateRenderer,
 };
 use locus_runtime::{DefaultInferenceService, InferenceService};
-use locus_state::StateProvider;
-use locus_state_nexuskv::{NexusKvBridgeConfig, NexusKvStateProvider};
+use locus_store::StateStore;
+use locus_store_nexuskv::{NexusKvStore, NexusKvStoreConfig};
 
 fn component(kind: &str) -> SemanticComponentIdentity {
     SemanticComponentIdentity {
@@ -55,8 +55,8 @@ fn identities() -> (ModelExecutionIdentity, SemanticIdentity) {
 }
 
 fn inference_service(base_url: String) -> (DefaultInferenceService, Arc<FakeEngineAdapter>) {
-    let provider: Arc<dyn StateProvider> = Arc::new(
-        NexusKvStateProvider::new(NexusKvBridgeConfig {
+    let store: Arc<dyn StateStore> = Arc::new(
+        NexusKvStore::new(NexusKvStoreConfig {
             base_url,
             api_key: None,
             tenant: "tenant-a".to_owned(),
@@ -64,7 +64,7 @@ fn inference_service(base_url: String) -> (DefaultInferenceService, Arc<FakeEngi
             engine_family: "sglang".to_owned(),
             semantic_type: "mha_kv".to_owned(),
         })
-        .expect("provider"),
+        .expect("store"),
     );
     let (model, semantic_identity) = identities();
     let models = ModelRegistry::new();
@@ -134,7 +134,7 @@ fn inference_service(base_url: String) -> (DefaultInferenceService, Arc<FakeEngi
     let engines = EngineRegistry::new();
     engines.register(adapter.clone()).expect("register engine");
     (
-        DefaultInferenceService::new(models, engines, provider),
+        DefaultInferenceService::new(models, engines, store),
         adapter,
     )
 }

@@ -18,10 +18,10 @@ The canonical engine protocol provides:
 - normalized streaming, usage, execution-finish, error, and cancellation facts;
 - a clean boundary for runtime-specific engine adapters;
 - optional attachment of prepared reusable state without exposing a particular
-  state provider.
+  state store.
 
 It does not standardize engine internals, memory layouts, batching algorithms,
-or provider-specific state-transfer protocols.
+or store-specific state-transfer protocols.
 
 ## Placement in the request path
 
@@ -188,7 +188,7 @@ transaction before execution:
 EngineAdapter.prepare_state_import(StateImportSpec)
   -> StateImportTarget
 
-StateProvider.materialize(MaterializationOption, StateImportTarget)
+StateStore.materialize(MaterializationOption, StateImportTarget)
   -> TransferReceipt
 
 EngineAdapter.commit_state_import(StateImportTarget, TransferReceipt)
@@ -196,9 +196,9 @@ EngineAdapter.commit_state_import(StateImportTarget, TransferReceipt)
 ```
 
 `StateImportTarget` is an opaque negotiated sink scoped to an execution target
-and engine generation. It expires and can be aborted. The provider can transfer
+and engine generation. It expires and can be aborted. The store can transfer
 to the sink without learning engine-local page allocation or device-layout
-objects; the adapter can commit the result without learning provider-private
+objects; the adapter can commit the result without learning store-private
 source types.
 
 The final attachment is short-lived:
@@ -206,7 +206,7 @@ The final attachment is short-lived:
 ```text
 PreparedStateAttachment
   attachment_id: opaque capability-scoped handle
-  provider_kind: opaque namespace
+  state_kind: reusable-state type
   execution_target: target identity + engine generation
   compatibility_proof: structured artifact-specific evidence
   reusable_boundary: structured input coverage
@@ -293,7 +293,7 @@ Remote transports may add a reservation operation if measurements show that
 planning-to-submit races require it. The domain model treats reservation as an
 orchestration concern, not a guarantee that an engine exposes a particular RPC.
 
-State lookup, preload, replication, and movement are `StateProvider`
+State lookup, preload, replication, and movement are `StateStore`
 operations. Destination preparation, commit, bind, and abort are
 `EngineAdapter` operations. `PlanExecutor` coordinates them; the canonical
 protocol does not become a general cache-management API.

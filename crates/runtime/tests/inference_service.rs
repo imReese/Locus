@@ -20,7 +20,7 @@ use locus_planner::{
 use locus_runtime::{
     DefaultInferenceService, InferenceService, PlacementConfigurationError, PlacementControl,
 };
-use locus_state::{NullStateProvider, StateProvider};
+use locus_store::{NullStateStore, StateStore};
 
 fn component(kind: &str) -> SemanticComponentIdentity {
     SemanticComponentIdentity {
@@ -125,9 +125,9 @@ fn service(output: FakeEngineOutput) -> (DefaultInferenceService, Arc<FakeEngine
     );
     let engines = EngineRegistry::new();
     engines.register(adapter.clone()).expect("register engine");
-    let state_provider: Arc<dyn StateProvider> = Arc::new(NullStateProvider::default());
+    let store: Arc<dyn StateStore> = Arc::new(NullStateStore::default());
     (
-        DefaultInferenceService::new(models, engines, state_provider),
+        DefaultInferenceService::new(models, engines, store),
         adapter,
     )
 }
@@ -368,9 +368,9 @@ async fn qualified_active_placement_selects_the_calibrated_target() {
     let placement =
         PlacementControl::new(PlacementMode::Active, calibrator, Some(ACTIVE_CONFIRMATION))
             .expect("active placement");
-    let state_provider: Arc<dyn StateProvider> = Arc::new(NullStateProvider::default());
-    let service = DefaultInferenceService::new(models, engines, state_provider)
-        .with_placement_control(placement);
+    let store: Arc<dyn StateStore> = Arc::new(NullStateStore::default());
+    let service =
+        DefaultInferenceService::new(models, engines, store).with_placement_control(placement);
 
     service
         .infer(

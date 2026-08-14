@@ -889,7 +889,7 @@ dependencies = [
  "locus-model-io",
  "locus-planner",
  "locus-runtime",
- "locus-state",
+ "locus-store",
  "serde",
  "serde_json",
  "subtle",
@@ -915,7 +915,7 @@ dependencies = [
  "futures",
  "locus-core",
  "locus-engine",
- "locus-state",
+ "locus-store",
  "serde",
  "serde_json",
  "tempfile",
@@ -934,7 +934,7 @@ dependencies = [
  "locus-engine",
  "locus-model-io",
  "locus-planner",
- "locus-state",
+ "locus-store",
  "tempfile",
  "thiserror",
  "tokio",
@@ -959,8 +959,8 @@ dependencies = [
  "locus-parser",
  "locus-planner",
  "locus-runtime",
- "locus-state",
- "locus-state-nexuskv",
+ "locus-store",
+ "locus-store-nexuskv",
  "serde",
  "serde_json",
  "tempfile",
@@ -974,7 +974,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "locus-state"
+name = "locus-store"
 version = "0.1.0"
 dependencies = [
  "async-trait",
@@ -983,7 +983,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "locus-state-nexuskv"
+name = "locus-store-nexuskv"
 version = "0.1.0"
 dependencies = [
  "async-trait",
@@ -993,7 +993,7 @@ dependencies = [
  "locus-engine",
  "locus-model-io",
  "locus-runtime",
- "locus-state",
+ "locus-store",
  "reqwest",
  "serde",
  "serde_json",

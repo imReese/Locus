@@ -60,7 +60,7 @@ The core architectural contributions are:
 1. a stable, engine-neutral semantic normalization layer;
 2. a canonical engine protocol;
 3. capability-based engine adapters;
-4. a generic, optional state-provider interface; and
+4. a generic, optional state-store interface; and
 5. cost-based global placement of requests and reusable state.
 
 State locality is a first-class planner input, not an add-on routing policy.
@@ -81,10 +81,10 @@ matching token prefix.
 | routing  | observability   | compute + state placement   |
 +----------------------------+-----------------------------+
              |               |
-             | canonical     | generic StateProvider
+             | canonical     | generic StateStore
              | engine        | (optional)
              | protocol      v
-             |       NexusKV or another state system
+             |       NexusKV or another state store
              v
    +---------+---------+------------------+
    |                   |                  |
@@ -100,8 +100,8 @@ parallelism, and model forward execution.
 
 [NexusKV](https://github.com/imReese/NexusKV) is the intended reference
 integration for reusable model state. It is not a dependency of Locus
-core. A deployment may use another `StateProvider` implementation or run with
-state integration disabled.
+core. A deployment may use another `StateStore` implementation or run with
+store integration disabled.
 
 ## Design principles
 
@@ -147,7 +147,7 @@ The Rust 2024 workspace keeps the architecture boundaries small and explicit:
 - `locus-parser`: request-scoped reasoning and tagged-JSON tool-call parsers
   with bounded streaming state;
 - `locus-engine`: engine adapter contract, registry, and deterministic fake;
-- `locus-state`: state-provider contract, null provider, and deterministic fake;
+- `locus-store`: state-store contract, null store, and deterministic fake;
 - `locus-planner`: cost-based path selection, persistent bounded calibration,
   promotion evidence, and the side-effecting `PlanExecutor`;
 - `locus-runtime`: `InferenceService`, target discovery, state-candidate
@@ -157,8 +157,8 @@ The Rust 2024 workspace keeps the architecture boundaries small and explicit:
   listing, health, SSE, and OpenAI-shaped errors;
 - `locus-engine-openai`: network adapters for SGLang and vLLM completion and
   bounded Prometheus telemetry endpoints;
-- `locus-state-nexuskv`: optional, versioned HTTP bridge from NexusKV match and
-  materialization results into the generic `StateProvider` handshake;
+- `locus-store-nexuskv`: optional, versioned HTTP bridge from NexusKV match and
+  materialization results into the generic `StateStore` handshake;
 - `locus-server`: JSON configuration, dependency assembly, SGLang/vLLM and
   optional NexusKV registration, bearer authentication, request limits,
   dependency-aware readiness, calibrated-placement configuration, request IDs,
@@ -214,7 +214,7 @@ that define the core architecture. Wire formats and Rust APIs remain pre-1.0.
   `scripts/live_engine_conformance.py` can exercise an explicitly configured
   live runtime and verify metric movement, but no live runtime or GPU result is
   checked into or implied by CI.
-- The NexusKV provider requires a separately deployed
+- The NexusKV store requires a separately deployed
   `locus.nexuskv-bridge.v1` service. NexusKV now ships those endpoints, and CI
   starts that implementation in a separate process with the real Rust matcher.
   Shared fixtures and the complete Locus prepare/materialize/commit handshake

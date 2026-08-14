@@ -5,12 +5,12 @@ members = [
     "crates/model-io",
     "crates/parser",
     "crates/engine",
-    "crates/state",
+    "crates/store",
     "crates/planner",
     "crates/runtime",
     "crates/openai",
     "crates/engine-openai",
-    "crates/state-nexuskv",
+    "crates/store/nexuskv",
     "crates/server",
 ]
 

@@ -1,8 +1,8 @@
-# NexusKV State Provider Bridge
+# NexusKV State Store Bridge
 
 ## Status
 
-`locus-state-nexuskv` is an optional network `StateProvider`. It implements the
+`locus-store-nexuskv` is an optional network `StateStore`. It implements the
 Locus side of a versioned bridge and is covered by an end-to-end protocol test
 through planning and the prepare/materialize/commit handshake. NexusKV now
 ships the corresponding HTTP service, and cross-repository E2E starts it as a
@@ -19,7 +19,7 @@ The configurable bridge exposes:
 
 Every envelope uses `locus.nexuskv-bridge.v1`; lookup payloads and results name
 the upstream `nexuskv.contract.v1` schema. Authentication is an optional bearer
-token configured on the provider. The JSON Schema source of truth lives in
+token configured on the store. The JSON Schema source of truth lives in
 NexusKV at `schema/locus_nexuskv_bridge.json`.
 
 Lookup sends the tenant, namespace, immutable model revision, engine family,
@@ -27,7 +27,7 @@ state semantic type, canonical token IDs, request input fingerprint, and
 structured Locus model/input-semantic identities. The bridge must evaluate the
 NexusKV index and echo the exact identities it validated. Locus
 rejects missing or mismatched evidence, schema drift, model mismatch, zero
-coverage, provider incompatibility, and unsupported state kinds. A successful
+coverage, store incompatibility, and unsupported state kinds. A successful
 lookup includes an opaque source capability; Locus must return it during
 estimate, so knowledge of a state ID is insufficient.
 
@@ -47,9 +47,9 @@ engine adapter owns destination allocation and attachment. `PlanExecutor` owns
 operation ordering, abort, cleanup, and fallback. `Planner` receives immutable
 generic candidates and never performs HTTP calls or mutations.
 
-The HTTP bridge is deliberately outside `locus-state`, so core contracts do
-not depend on NexusKV or Reqwest types. Another provider can implement the same
-generic `StateProvider`, and `NullStateProvider` remains a normal deployment.
+The HTTP bridge is deliberately outside `locus-store`, so core contracts do
+not depend on NexusKV or Reqwest types. Another store can implement the same
+generic `StateStore`, and `NullStateStore` remains a normal deployment.
 
 The conformance fixture is vendored byte-identically in both repositories. Run
 the real cross-process gate from a Locus checkout with a sibling NexusKV

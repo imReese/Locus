@@ -2,11 +2,11 @@
 
 ## Status
 
-This document defines the planner and state-provider abstractions. The Rust
+This document defines the planner and state-store abstractions. The Rust
 workspace contains a deterministic cost-based planner, live SGLang/vLLM
 telemetry collection, persistent bounded EWMA calibration, shadow/replay
-evaluation, fail-closed active promotion, fake providers, the state-import
-execution handshake, and an optional `locus-state-nexuskv` HTTP bridge. The
+evaluation, fail-closed active promotion, fake stores, the state-import
+execution handshake, and an optional `locus-store-nexuskv` HTTP bridge. The
 bridge maps versioned NexusKV match data into generic descriptors and exercises
 lookup, estimate, prepare, materialize, commit, and execution in tests. Live
 calibration accuracy and physical NexusKV/GPU transfer have not been validated
@@ -74,14 +74,14 @@ StateRequirement
 ```
 
 The input fingerprint may contain token-segment digests, media digests,
-preprocessing identities, or other typed component identities. A provider sees
+preprocessing identities, or other typed component identities. A store sees
 only the information authorized by tenant and privacy policy.
 
 ### State descriptor
 
-A `StateDescriptor` returned by a provider includes:
+A `StateDescriptor` returned by a store includes:
 
-- provider-scoped artifact identity and state kind;
+- store-scoped artifact identity and state kind;
 - producer model identity and artifact-relevant semantic identity;
 - execution compatibility attributes such as dtype, quantization, layout,
   adapter revision, and parallelism;
@@ -90,7 +90,7 @@ A `StateDescriptor` returned by a provider includes:
 - size and materialization attributes;
 - freshness, lifetime, ownership, and tenant scope;
 - evidence source and confidence;
-- a provider-private reference kept opaque to core logic.
+- a store-private reference kept opaque to core logic.
 
 State kinds use an extensible namespace, not a closed enum whose last value is
 `KvCache`.
@@ -104,7 +104,7 @@ valid state and where execution may resume. It may use:
 - completed item or segment identities;
 - a recurrent checkpoint number or logical step;
 - a media item plus preprocessing stage;
-- a provider-defined typed coordinate negotiated by capability.
+- a store-defined typed coordinate negotiated by capability.
 
 ```text
 ReusableBoundary
@@ -117,7 +117,7 @@ ReusableBoundary
 Coverage and resume coordinates are separate. A recurrent artifact can cover a
 long input but allow resumption only from its latest valid checkpoint. A paged
 cache match can identify shared pages while lacking the terminal page required
-for a valid continuation. The provider must report the executable boundary, not
+for a valid continuation. The store must report the executable boundary, not
 just the amount of data that appears to match.
 
 ### Compatibility
@@ -154,47 +154,47 @@ Unknown required evidence is incompatible for planning purposes. A conversion
 is represented as a materialization option with cost and target compatibility,
 not as a claim that the original artifact is directly compatible.
 
-## `StateProvider` abstraction
+## `StateStore` abstraction
 
 The conceptual asynchronous interface is:
 
 ```rust,ignore
 #[async_trait]
-pub trait StateProvider: Send + Sync {
-    fn identity(&self) -> &StateProviderIdentity;
-    fn capabilities(&self) -> &StateProviderCapabilities;
+pub trait StateStore: Send + Sync {
+    fn identity(&self) -> &StoreId;
+    fn capabilities(&self) -> &StateStoreCapabilities;
 
     async fn lookup(
         &self,
         requirement: &StateRequirement,
         context: &OperationContext,
-    ) -> Result<Vec<StateDescriptor>, StateProviderError>;
+    ) -> Result<Vec<StateDescriptor>, StoreError>;
 
     async fn estimate(
         &self,
         state: &StateDescriptor,
         target: &ExecutionTarget,
         context: &OperationContext,
-    ) -> Result<Vec<MaterializationOption>, StateProviderError>;
+    ) -> Result<Vec<MaterializationOption>, StoreError>;
 
     async fn materialize(
         &self,
         option: &MaterializationOption,
         target: &StateImportTarget,
         context: &OperationContext,
-    ) -> Result<TransferReceipt, StateProviderError>;
+    ) -> Result<TransferReceipt, StoreError>;
 
     async fn preload(
         &self,
         request: PreloadRequest,
         context: &OperationContext,
-    ) -> Result<StateOperation, StateProviderError>;
+    ) -> Result<StateOperation, StoreError>;
 
     async fn replicate(
         &self,
         request: ReplicationRequest,
         context: &OperationContext,
-    ) -> Result<StateOperation, StateProviderError>;
+    ) -> Result<StateOperation, StoreError>;
 }
 ```
 
@@ -207,9 +207,9 @@ Important contract properties are:
 - materialization transfers to a negotiated target and returns a receipt; it
   does not allocate engine-local memory or produce the final attachment;
 - cancellation and deadlines apply to every operation;
-- no provider is required.
+- no store is required.
 
-A `NullStateProvider` returns no matches and rejects mutation operations as
+A `NullStateStore` returns no matches and rejects mutation operations as
 unsupported. This makes cold, state-unaware operation part of normal contract
 testing.
 
@@ -217,7 +217,7 @@ testing.
 
 Real runtime state often needs destination pages, device memory, layout, or an
 import handle before transfer begins. Locus therefore uses a coordinated
-transaction rather than `StateProvider.materialize -> PreparedStateAttachment`:
+transaction rather than `StateStore.materialize -> PreparedStateAttachment`:
 
 ```text
 PlanExecutor
@@ -225,7 +225,7 @@ PlanExecutor
   |-- EngineAdapter.prepare_state_import(StateImportSpec)
   |     -> StateImportTarget
   |
-  |-- StateProvider.materialize(MaterializationOption, StateImportTarget)
+  |-- StateStore.materialize(MaterializationOption, StateImportTarget)
   |     -> TransferReceipt
   |
   |-- EngineAdapter.commit_state_import(StateImportTarget, TransferReceipt)
@@ -234,25 +234,25 @@ PlanExecutor
   `-- EngineAdapter.execute(..., PreparedStateAttachment)
 ```
 
-The provider owns discovery, source identity, and movement. The engine adapter
+The store owns discovery, source identity, and movement. The engine adapter
 owns destination allocation, runtime layout, install, and bind. `PlanExecutor`
 owns ordering, deadlines, cancellation, abort, cleanup, fallback, and bounded
 replanning.
 
 `StateImportTarget` is opaque, namespaced, target-generation scoped, and
-expiring. `TransferReceipt` proves what the provider transferred without
-exposing provider-private objects. `PreparedStateAttachment` is created only
+expiring. `TransferReceipt` proves what the store transferred without
+exposing store-private objects. `PreparedStateAttachment` is created only
 after the adapter validates and commits the import. A partial import is aborted
 idempotently; stale generations fail closed.
 
-Provider and adapter may negotiate a transport namespace, but engine-private
-allocation objects never enter the provider API and provider-private source
-objects never enter the adapter API. NexusKV remains one optional provider.
+Store and adapter may negotiate a transport namespace, but engine-private
+allocation objects never enter the store API and store-private source
+objects never enter the adapter API. NexusKV remains one optional store.
 
 ## NexusKV integration
 
-NexusKV is the reference `StateProvider`. The optional
-`locus-state-nexuskv` crate uses a versioned `locus.nexuskv-bridge.v1` HTTP
+NexusKV is the reference `StateStore`. The optional
+`locus-store-nexuskv` crate uses a versioned `locus.nexuskv-bridge.v1` HTTP
 contract. Lookup requests carry canonical token IDs plus structured model and
 input-semantic identities. A hit is accepted only when the bridge echoes the
 identities it validated and returns `nexuskv.contract.v1` data; missing or
@@ -270,25 +270,25 @@ protocol double, so they prove contract mapping and ownership, not live
 NexusKV transport or device attachment.
 
 The integration lives outside Locus core and depends on Locus's
-provider API. Locus core does not import the NexusKV SDK, use NexusKV
-identifiers as domain types, or assume NexusKV deployment. Another provider can
-implement the same contract, and a deployment can run without any provider.
+store API. Locus core does not import the NexusKV SDK, use NexusKV
+identifiers as domain types, or assume NexusKV deployment. Another store can
+implement the same contract, and a deployment can run without any store.
 
 NexusKV-specific capabilities may use namespaced extensions. Portable
 planner behavior depends only on the generic descriptor, compatibility,
 boundary, location, and cost contracts.
 
-## State-provider decision rationale
+## State-store decision rationale
 
 Reusable state can be KV cache, MLA state, a recurrent/KDA checkpoint, a
 multimodal artifact, encoder output, or a future representation. Its valid
 resume point may not be a token offset, and a matching hash or token prefix does
-not prove that execution can continue. A generic provider contract is therefore
+not prove that execution can continue. A generic store contract is therefore
 necessary for typed boundaries, compatibility evidence, locations, and
 target-specific materialization options.
 
-The abstraction adds schema and lifecycle complexity. Provider estimates can
-be stale, state installation crosses provider and engine ownership, and
+The abstraction adds schema and lifecycle complexity. Store estimates can
+be stale, state installation crosses store and engine ownership, and
 extensions must avoid becoming an unstructured escape channel. These costs are
 handled through evidence-bearing descriptors, expiring attachments,
 calibration, reservations, and explicit fallbacks.
@@ -296,20 +296,20 @@ calibration, reservations, and explicit fallbacks.
 The following alternatives were rejected:
 
 - **Depend directly on NexusKV:** this would make one reference integration a
-  core deployment requirement and prevent independent providers.
+  core deployment requirement and prevent independent stores.
 - **Add cache affinity after engine routing:** this cannot compare queue,
   transfer, recompute, decode, topology, and policy costs as complete paths.
 - **Standardize longest-token-prefix lookup:** this cannot represent recurrent
   checkpoints, multimodal state, incomplete pages, or non-token boundaries.
-- **Let the provider allocate runtime destination memory:** this leaks
-  engine-private page and layout ownership into the provider contract.
-- **Let the provider choose the engine:** the provider does not own admission,
+- **Let the store allocate runtime destination memory:** this leaks
+  engine-private page and layout ownership into the store contract.
+- **Let the store choose the engine:** the store does not own admission,
   engine load, decode cost, tenant fairness, or global topology policy.
 
 ## Planner and executor ownership
 
 The planner compares complete feasible paths and returns a `PlacementPlan`.
-It does not call provider mutation methods, allocate destination memory, reserve
+It does not call store mutation methods, allocate destination memory, reserve
 an engine, submit work, retry, or clean up partial imports.
 
 `PlanExecutor` performs those side effects according to the chosen plan. It may
@@ -390,7 +390,7 @@ Hard topology constraints filter rather than penalize candidates.
 ### Policy cost
 
 Explicit, auditable preferences such as tenant affinity, fairness debt, energy,
-monetary cost, provider quotas, or stability. Policy cost cannot override a
+monetary cost, store quotas, or stability. Policy cost cannot override a
 correctness or authorization constraint.
 
 ## Comparing transfer and recompute
@@ -465,7 +465,7 @@ For prefill/decode disaggregation, a candidate plan includes:
 - decode target and queue/decode cost;
 - failure and fallback behavior across both stages.
 
-A reusable recurrent checkpoint or MLA state can participate if its provider
+A reusable recurrent checkpoint or MLA state can participate if its store
 and adapters describe a compatible handoff. The planner does not assume a
 conventional KV representation.
 
@@ -480,7 +480,7 @@ execution, an engine can fill, an artifact can expire, or link cost can change.
 2. reserve target capacity where supported;
 3. revalidate state, target identity, and engine generation;
 4. ask the engine adapter to prepare an expiring import target;
-5. ask the state provider to materialize into that target;
+5. ask the state store to materialize into that target;
 6. ask the engine adapter to commit the receipt or abort partial state;
 7. submit execution with the committed attachment;
 8. apply the encoded fallback or bounded replan on failure.
@@ -495,10 +495,10 @@ priority, tenant budgets, maximum queue/materialization delay, and overload
 policy. A warm state hit does not bypass admission or fairness.
 
 Admission may reserve separate budgets for foreground execution and background
-preload/replication. Provider degradation can trigger a cold-only mode without
+preload/replication. Store degradation can trigger a cold-only mode without
 changing tenant authorization.
 
-## Provider failure behavior
+## Store failure behavior
 
 State is an optimization unless a request explicitly requires a prepared
 artifact. Failure policy is explicit:
@@ -508,7 +508,7 @@ artifact. Failure policy is explicit:
 - compatibility unknown: reject that state candidate;
 - materialization failure: apply the plan's cold/replan/fail fallback;
 - stale attachment: never submit it as compatible;
-- provider-wide outage: open a circuit and plan cold while policy permits.
+- store-wide outage: open a circuit and plan cold while policy permits.
 
 Fallback decisions still respect the original deadline, residency, capability,
 and admission constraints.
@@ -529,12 +529,12 @@ Comparing estimates with outcomes supports per-engine, per-model, per-state-kind
 and per-topology calibration. Planner versions and parameter revisions are part
 of the trace so decisions remain explainable.
 
-Prompts, raw token sequences, media, provider-private handles, and tenant data
+Prompts, raw token sequences, media, store-private handles, and tenant data
 are excluded unless an explicit privacy policy authorizes them.
 
 The implementation uses a schema-versioned state file and keys learned values
 by engine generation and immutable model/adapter/execution profile. It learns
-queue, prefill, decode, provider-materialization ratio, and state-activation
+queue, prefill, decode, store-materialization ratio, and state-activation
 topology overhead independently. Samples and EWMA error are bounded; unexpected
 restarts, counter resets, stale metrics, cancellations, and failed executions
 cannot manufacture a successful observation.
@@ -564,7 +564,7 @@ data demonstrates a need.
 
 ## Validation
 
-The state and planner contract is tested with fake providers and engines, and
+The state and planner contract is tested with fake stores and engines, and
 the NexusKV bridge path is tested with a protocol double. The broader
 conformance matrix includes:
 
@@ -576,7 +576,7 @@ conformance matrix includes:
 - transfer slower than recompute;
 - PD handoff with incompatible layout;
 - missing, stale, or low-confidence cost observations;
-- provider timeout and materialization failure fallbacks;
+- store timeout and materialization failure fallbacks;
 - prepare, transfer, commit, abort, and partial-import cleanup;
 - tenant isolation and topology restrictions;
 - engine restart invalidating import targets and prepared attachments;

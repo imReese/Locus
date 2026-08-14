@@ -129,7 +129,7 @@ impl CalibrationKey {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MaterializationObservation {
-    pub provider: String,
+    pub store: String,
     pub state_kind: String,
     pub target_id: String,
     pub estimated_micros: u64,
@@ -138,7 +138,7 @@ pub struct MaterializationObservation {
 
 impl MaterializationObservation {
     fn stable_id(&self) -> String {
-        materialization_key(&self.provider, &self.state_kind, &self.target_id)
+        materialization_key(&self.store, &self.state_kind, &self.target_id)
     }
 }
 
@@ -297,7 +297,7 @@ impl PersistentCalibrator {
                     })
                     .unwrap_or(self.policy.conservative_topology_micros);
                 let path_key = materialization_key(
-                    state_path.option.provider.as_str(),
+                    state_path.option.store.as_str(),
                     state_path.option.state_kind.as_str(),
                     &candidate.target.id.to_string(),
                 );
@@ -537,7 +537,7 @@ impl PersistentCalibrator {
                 &mut reasons,
             );
             let key = materialization_key(
-                reuse.option.provider.as_str(),
+                reuse.option.store.as_str(),
                 reuse.option.state_kind.as_str(),
                 &plan.target.id.to_string(),
             );
@@ -798,8 +798,8 @@ fn input_token_count(input: &PlanningInput) -> u64 {
         .sum()
 }
 
-fn materialization_key(provider: &str, state_kind: &str, target_id: &str) -> String {
-    serde_json::to_string(&(provider, state_kind, target_id))
+fn materialization_key(store: &str, state_kind: &str, target_id: &str) -> String {
+    serde_json::to_string(&(store, state_kind, target_id))
         .expect("materialization key serialization is infallible")
 }
 

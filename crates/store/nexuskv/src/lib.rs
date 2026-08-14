@@ -4,11 +4,11 @@ use std::sync::{Arc, RwLock};
 use async_trait::async_trait;
 use locus_core::{
     BoundaryCompleteness, ComponentCoverage, ExecutionTarget, InputItemId, MaterializationOption,
-    MaterializationOptionId, OpaqueHandle, OperationContext, ProviderId, ResumeCoordinate,
-    ReusableBoundary, StateDescriptor, StateId, StateImportTarget, StateKind, StateLocality,
-    StateRequirement, TransferReceipt,
+    MaterializationOptionId, OpaqueHandle, OperationContext, ResumeCoordinate, ReusableBoundary,
+    StateDescriptor, StateId, StateImportTarget, StateKind, StateLocality, StateRequirement,
+    StoreId, TransferReceipt,
 };
-use locus_state::{StateError, StateProvider};
+use locus_store::{StateStore, StoreError};
 use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -17,7 +17,7 @@ const BRIDGE_SCHEMA: &str = "locus.nexuskv-bridge.v1";
 const NEXUSKV_SCHEMA: &str = "nexuskv.contract.v1";
 
 #[derive(Clone, Debug)]
-pub struct NexusKvBridgeConfig {
+pub struct NexusKvStoreConfig {
     pub base_url: String,
     pub api_key: Option<String>,
     pub tenant: String,
@@ -27,35 +27,35 @@ pub struct NexusKvBridgeConfig {
 }
 
 #[derive(Clone)]
-pub struct NexusKvStateProvider {
-    identity: ProviderId,
-    config: NexusKvBridgeConfig,
+pub struct NexusKvStore {
+    identity: StoreId,
+    config: NexusKvStoreConfig,
     client: Client,
-    records: Arc<RwLock<BTreeMap<StateId, NexusStateRecord>>>,
+    records: Arc<RwLock<BTreeMap<StateId, NexusStoreRecord>>>,
 }
 
 #[derive(Clone)]
-struct NexusStateRecord {
+struct NexusStoreRecord {
     source_state: String,
     source_handle: String,
     source_locator: String,
     source_tier: String,
 }
 
-impl NexusKvStateProvider {
-    pub fn new(config: NexusKvBridgeConfig) -> Result<Self, StateError> {
+impl NexusKvStore {
+    pub fn new(config: NexusKvStoreConfig) -> Result<Self, StoreError> {
         if config.base_url.trim().is_empty() {
-            return Err(StateError::Protocol(
+            return Err(StoreError::Protocol(
                 "NexusKV bridge base URL must not be empty".to_owned(),
             ));
         }
         if config.tenant.is_empty() || config.namespace.is_empty() {
-            return Err(StateError::Protocol(
+            return Err(StoreError::Protocol(
                 "NexusKV tenant and namespace must not be empty".to_owned(),
             ));
         }
         Ok(Self {
-            identity: ProviderId::new("locus.nexuskv-bridge"),
+            identity: StoreId::new("locus.nexuskv-bridge"),
             config,
             client: Client::new(),
             records: Arc::new(RwLock::new(BTreeMap::new())),
@@ -81,7 +81,7 @@ impl NexusKvStateProvider {
         &self,
         operation: &str,
         request: &Request,
-    ) -> Result<Response, StateError>
+    ) -> Result<Response, StoreError>
     where
         Request: Serialize + Sync,
         Response: for<'de> Deserialize<'de>,
@@ -91,7 +91,7 @@ impl NexusKvStateProvider {
             .json(request)
             .send()
             .await
-            .map_err(|error| StateError::Unavailable(error.to_string()))?;
+            .map_err(|error| StoreError::Unavailable(error.to_string()))?;
         let status = response.status();
         if !status.is_success() {
             let detail = response
@@ -99,22 +99,22 @@ impl NexusKvStateProvider {
                 .await
                 .unwrap_or_else(|_| "response body was unavailable".to_owned());
             return Err(match status {
-                StatusCode::CONFLICT => StateError::Incompatible(detail),
-                StatusCode::UNPROCESSABLE_ENTITY => StateError::Unsupported(detail),
-                status if status.is_server_error() => StateError::Unavailable(detail),
-                _ => StateError::Protocol(format!("bridge returned {status}: {detail}")),
+                StatusCode::CONFLICT => StoreError::Incompatible(detail),
+                StatusCode::UNPROCESSABLE_ENTITY => StoreError::Unsupported(detail),
+                status if status.is_server_error() => StoreError::Unavailable(detail),
+                _ => StoreError::Protocol(format!("bridge returned {status}: {detail}")),
             });
         }
         response
             .json()
             .await
-            .map_err(|error| StateError::Protocol(format!("invalid bridge response: {error}")))
+            .map_err(|error| StoreError::Protocol(format!("invalid bridge response: {error}")))
     }
 }
 
 #[async_trait]
-impl StateProvider for NexusKvStateProvider {
-    fn identity(&self) -> &ProviderId {
+impl StateStore for NexusKvStore {
+    fn identity(&self) -> &StoreId {
         &self.identity
     }
 
@@ -122,10 +122,10 @@ impl StateProvider for NexusKvStateProvider {
         &self,
         requirement: &StateRequirement,
         context: &OperationContext,
-    ) -> Result<Vec<StateDescriptor>, StateError> {
+    ) -> Result<Vec<StateDescriptor>, StoreError> {
         context.ensure_active()?;
         let tokens = requirement.query_token_ids.as_ref().ok_or_else(|| {
-            StateError::Unsupported("NexusKV lookup requires canonical token IDs".to_owned())
+            StoreError::Unsupported("NexusKV lookup requires canonical token IDs".to_owned())
         })?;
         let tenant = requirement
             .tenant_scope
@@ -168,7 +168,7 @@ impl StateProvider for NexusKvStateProvider {
             return Ok(Vec::new());
         };
         if !hit.validation.matches(requirement) {
-            return Err(StateError::Incompatible(
+            return Err(StoreError::Incompatible(
                 "NexusKV bridge did not validate the requested model and input semantics"
                     .to_owned(),
             ));
@@ -177,12 +177,12 @@ impl StateProvider for NexusKvStateProvider {
             return Ok(Vec::new());
         }
         if hit.entry.identity.key.model != requirement.model.model_revision {
-            return Err(StateError::Incompatible(
+            return Err(StoreError::Incompatible(
                 "NexusKV match model does not equal the requested revision".to_owned(),
             ));
         }
         if hit.entry.descriptor.schema_version != NEXUSKV_SCHEMA {
-            return Err(StateError::Protocol(format!(
+            return Err(StoreError::Protocol(format!(
                 "unsupported NexusKV descriptor schema: {}",
                 hit.entry.descriptor.schema_version
             )));
@@ -191,17 +191,17 @@ impl StateProvider for NexusKvStateProvider {
             return Ok(Vec::new());
         }
         let source_state = hit.entry.identity.entry_id.clone();
-        let state_id = provider_state_id(tenant, &self.config.namespace, &source_state);
+        let state_id = store_state_id(tenant, &self.config.namespace, &source_state);
         let state_kind = StateKind::new(format!("nexuskv.{}", hit.entry.descriptor.semantic_type));
         if !requirement.accepted_state_kinds.contains(&state_kind) {
             return Ok(Vec::new());
         }
         self.records
             .write()
-            .map_err(|_| StateError::Protocol("NexusKV record lock poisoned".to_owned()))?
+            .map_err(|_| StoreError::Protocol("NexusKV record lock poisoned".to_owned()))?
             .insert(
                 state_id.clone(),
-                NexusStateRecord {
+                NexusStoreRecord {
                     source_state,
                     source_handle: hit.validation.source_handle,
                     source_locator: hit.entry.location.locator.clone(),
@@ -210,7 +210,7 @@ impl StateProvider for NexusKvStateProvider {
             );
         Ok(vec![StateDescriptor {
             id: state_id,
-            provider: self.identity.clone(),
+            store: self.identity.clone(),
             kind: state_kind,
             model: requirement.model.clone(),
             relevant_input_semantics: Some(requirement.input_semantics.clone()),
@@ -233,7 +233,7 @@ impl StateProvider for NexusKvStateProvider {
                 ),
             },
             locations: vec![hit.entry.location.locator.clone()],
-            provider_reference: OpaqueHandle {
+            store_reference: OpaqueHandle {
                 namespace: "nexuskv.contract.v1.entry".to_owned(),
                 value: hit.entry.identity.entry_id,
             },
@@ -245,20 +245,20 @@ impl StateProvider for NexusKvStateProvider {
         state: &StateDescriptor,
         target: &ExecutionTarget,
         context: &OperationContext,
-    ) -> Result<Vec<MaterializationOption>, StateError> {
+    ) -> Result<Vec<MaterializationOption>, StoreError> {
         context.ensure_active()?;
-        if state.provider != self.identity {
-            return Err(StateError::Incompatible(
-                "state belongs to another provider".to_owned(),
+        if state.store != self.identity {
+            return Err(StoreError::Incompatible(
+                "state belongs to another store".to_owned(),
             ));
         }
         let record = self
             .records
             .read()
-            .map_err(|_| StateError::Protocol("NexusKV record lock poisoned".to_owned()))?
+            .map_err(|_| StoreError::Protocol("NexusKV record lock poisoned".to_owned()))?
             .get(&state.id)
             .cloned()
-            .ok_or_else(|| StateError::Protocol("unknown NexusKV state record".to_owned()))?;
+            .ok_or_else(|| StoreError::Protocol("unknown NexusKV state record".to_owned()))?;
         let response: EstimateResponse = self
             .post(
                 "estimate",
@@ -276,14 +276,14 @@ impl StateProvider for NexusKvStateProvider {
             )
             .await?;
         if response.schema_version != BRIDGE_SCHEMA {
-            return Err(StateError::Protocol(format!(
+            return Err(StoreError::Protocol(format!(
                 "unsupported estimate schema: {}",
                 response.schema_version
             )));
         }
         Ok(vec![MaterializationOption {
             id: MaterializationOptionId::new(response.option_id),
-            provider: self.identity.clone(),
+            store: self.identity.clone(),
             source_state: state.id.clone(),
             target_id: target.id.clone(),
             target_engine: target.engine.clone(),
@@ -310,25 +310,25 @@ impl StateProvider for NexusKvStateProvider {
         option: &MaterializationOption,
         target: &StateImportTarget,
         context: &OperationContext,
-    ) -> Result<TransferReceipt, StateError> {
+    ) -> Result<TransferReceipt, StoreError> {
         context.ensure_active()?;
-        if option.provider != self.identity
+        if option.store != self.identity
             || option.target_id != target.target_id
             || option.target_engine != target.engine
             || option.state_kind != target.state_kind
             || option.option_handle.namespace != "locus.nexuskv-bridge.materialization.v1"
         {
-            return Err(StateError::Incompatible(
+            return Err(StoreError::Incompatible(
                 "NexusKV materialization option does not match the import target".to_owned(),
             ));
         }
         if !self
             .records
             .read()
-            .map_err(|_| StateError::Protocol("NexusKV record lock poisoned".to_owned()))?
+            .map_err(|_| StoreError::Protocol("NexusKV record lock poisoned".to_owned()))?
             .contains_key(&option.source_state)
         {
-            return Err(StateError::Protocol(
+            return Err(StoreError::Protocol(
                 "unknown NexusKV materialization source".to_owned(),
             ));
         }
@@ -349,7 +349,7 @@ impl StateProvider for NexusKvStateProvider {
             )
             .await?;
         if response.schema_version != BRIDGE_SCHEMA {
-            return Err(StateError::Protocol(format!(
+            return Err(StoreError::Protocol(format!(
                 "unsupported materialization schema: {}",
                 response.schema_version
             )));
@@ -364,14 +364,14 @@ impl StateProvider for NexusKvStateProvider {
             ("physical", true)
                 if response.receipt.namespace != "nexuskv.protocol-transfer-receipt.v1" => {}
             _ => {
-                return Err(StateError::Protocol(
+                return Err(StoreError::Protocol(
                     "NexusKV materialization evidence is internally inconsistent".to_owned(),
                 ));
             }
         }
         Ok(TransferReceipt {
             import_id: target.import_id.clone(),
-            provider: self.identity.clone(),
+            store: self.identity.clone(),
             bytes_transferred: response.bytes_transferred,
             receipt: OpaqueHandle {
                 namespace: response.receipt.namespace,
@@ -381,9 +381,9 @@ impl StateProvider for NexusKvStateProvider {
     }
 }
 
-fn validate_schema(bridge: &str, nexuskv: &str) -> Result<(), StateError> {
+fn validate_schema(bridge: &str, nexuskv: &str) -> Result<(), StoreError> {
     if bridge != BRIDGE_SCHEMA || nexuskv != NEXUSKV_SCHEMA {
-        return Err(StateError::Protocol(format!(
+        return Err(StoreError::Protocol(format!(
             "unsupported bridge schemas: bridge={bridge}, nexuskv={nexuskv}"
         )));
     }
@@ -398,7 +398,7 @@ fn component_ref(component: &locus_core::SemanticComponentIdentity) -> Component
     }
 }
 
-fn provider_state_id(tenant: &str, namespace: &str, entry_id: &str) -> StateId {
+fn store_state_id(tenant: &str, namespace: &str, entry_id: &str) -> StateId {
     StateId::new(format!(
         "nexuskv:{}:{tenant}:{}:{namespace}:{entry_id}",
         tenant.len(),

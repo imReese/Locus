@@ -17,7 +17,7 @@ use locus_model_io::{
 };
 use locus_openai::{ApiConfig, router, router_with_config};
 use locus_runtime::{DefaultInferenceService, InferenceService};
-use locus_state::{NullStateProvider, StateProvider};
+use locus_store::{NullStateStore, StateStore};
 use serde_json::{Value, json};
 use tower::ServiceExt;
 
@@ -121,9 +121,9 @@ fn service(output: FakeEngineOutput) -> (Arc<dyn InferenceService>, Arc<FakeEngi
     );
     let engines = EngineRegistry::new();
     engines.register(adapter.clone()).expect("register engine");
-    let state: Arc<dyn StateProvider> = Arc::new(NullStateProvider::default());
+    let store: Arc<dyn StateStore> = Arc::new(NullStateStore::default());
     let service: Arc<dyn InferenceService> =
-        Arc::new(DefaultInferenceService::new(models, engines, state));
+        Arc::new(DefaultInferenceService::new(models, engines, store));
     (service, adapter)
 }
 

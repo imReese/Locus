@@ -20,8 +20,8 @@ use locus_model_io::{
     ModelProfile, ModelRegistry, ModelRequest, SimpleTemplateRenderer,
 };
 use locus_runtime::{DefaultInferenceService, InferenceService};
-use locus_state::{StateError, StateProvider};
-use locus_state_nexuskv::{NexusKvBridgeConfig, NexusKvStateProvider};
+use locus_store::{StateStore, StoreError};
+use locus_store_nexuskv::{NexusKvStore, NexusKvStoreConfig};
 use serde_json::{Value, json};
 
 #[derive(Clone, Default)]
@@ -195,8 +195,8 @@ fn inference_service(
     base_url: String,
     api_key: Option<String>,
 ) -> (DefaultInferenceService, Arc<FakeEngineAdapter>) {
-    let provider: Arc<dyn StateProvider> = Arc::new(
-        NexusKvStateProvider::new(NexusKvBridgeConfig {
+    let store: Arc<dyn StateStore> = Arc::new(
+        NexusKvStore::new(NexusKvStoreConfig {
             base_url,
             api_key,
             tenant: "tenant-a".to_owned(),
@@ -204,7 +204,7 @@ fn inference_service(
             engine_family: "sglang".to_owned(),
             semantic_type: "mha_kv".to_owned(),
         })
-        .expect("provider"),
+        .expect("store"),
     );
     let (model, semantic_identity) = identities();
     let models = ModelRegistry::new();
@@ -274,7 +274,7 @@ fn inference_service(
     let engines = EngineRegistry::new();
     engines.register(adapter.clone()).expect("register engine");
     (
-        DefaultInferenceService::new(models, engines, provider),
+        DefaultInferenceService::new(models, engines, store),
         adapter,
     )
 }
@@ -349,7 +349,7 @@ async fn nexuskv_bridge_materialization_failure_aborts_and_falls_back_cold() {
 #[tokio::test]
 async fn nexuskv_bridge_fails_closed_on_semantic_validation_mismatch() {
     let (base_url, _) = bridge(true, false).await;
-    let provider = NexusKvStateProvider::new(NexusKvBridgeConfig {
+    let store = NexusKvStore::new(NexusKvStoreConfig {
         base_url,
         api_key: None,
         tenant: "tenant-a".to_owned(),
@@ -357,9 +357,9 @@ async fn nexuskv_bridge_fails_closed_on_semantic_validation_mismatch() {
         engine_family: "sglang".to_owned(),
         semantic_type: "mha_kv".to_owned(),
     })
-    .expect("provider");
+    .expect("store");
     let (model, semantic_identity) = identities();
-    let error = provider
+    let error = store
         .lookup(
             &StateRequirement {
                 model,
@@ -373,5 +373,5 @@ async fn nexuskv_bridge_fails_closed_on_semantic_validation_mismatch() {
         )
         .await
         .expect_err("semantic mismatch must fail closed");
-    assert!(matches!(error, StateError::Incompatible(_)));
+    assert!(matches!(error, StoreError::Incompatible(_)));
 }

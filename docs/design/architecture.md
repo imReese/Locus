@@ -49,8 +49,8 @@ Southbound       canonical engine protocol
 Backends         capability-based engine adapters
                   SGLang | vLLM | TensorRT-LLM | future engines
 
-State plane      generic StateProvider
-                  NexusKV reference integration | other providers | disabled
+Store plane      generic StateStore
+                  NexusKV reference integration | other stores | disabled
 ```
 
 The northbound boundary is application-facing and may support multiple API
@@ -108,18 +108,18 @@ The following alternatives were rejected:
 Locus chooses an eligible target and supplies normalized work. It does not
 dictate how the target batches or executes that work after admission.
 
-### State providers own
+### State stores own
 
 - lookup of reusable model state;
-- provider-specific state identity and metadata;
+- store-specific state identity and metadata;
 - locality and topology reporting;
 - compatibility evidence;
 - estimated transfer or materialization options;
-- provider-specific preload, replication, and transfer operations;
-- lifecycle and health of state managed by that provider.
+- store-specific preload, replication, and transfer operations;
+- lifecycle and health of state managed by that store.
 
-The planner decides whether a provider operation is worthwhile. `PlanExecutor`
-coordinates it. The provider does not make the final request-placement
+The planner decides whether a store operation is worthwhile. `PlanExecutor`
+coordinates it. The store does not make the final request-placement
 decision or allocate engine-local destination memory.
 
 ## Logical components
@@ -213,7 +213,7 @@ Planner -> PlacementPlan -> PlanExecutor
 
 **Planner decides. `PlanExecutor` performs side effects.** The executor
 revalidates the target generation and plan preconditions, coordinates engine
-and state-provider transactions, and records actual outcomes. It follows the
+and state-store transactions, and records actual outcomes. It follows the
 fallback encoded in the plan; it does not silently substitute a different
 placement decision.
 
@@ -223,14 +223,14 @@ placement decision.
 discover capabilities, report health and load, accept canonical work, emit
 canonical output facts, and support cancellation. For reusable state, an
 adapter prepares an engine-generation-scoped import destination, then commits
-or aborts that import after the provider transfers state. Optional operations
+or aborts that import after the store transfers state. Optional operations
 are gated by advertised target capabilities.
 
 See [Engine adapter contract](engine-adapter-contract.md).
 
-### State providers
+### State stores
 
-`StateProvider` supplies typed, evidence-bearing state candidates and explicit
+`StateStore` supplies typed, evidence-bearing state candidates and explicit
 materialization options. It may represent a distributed cache service, an
 engine-local index, or another state system. A null implementation makes
 state-free operation a normal configuration.
@@ -279,7 +279,7 @@ regardless of concrete Rust module layout:
 | `ReusableBoundary` | Separate covered input from executable resume point |
 | `CompatibilityResult` | Report artifact evidence; unknown fails closed |
 | `MaterializationOption` | Estimate one source-to-target state path |
-| `StateProvider` | Discover state and transfer it to negotiated destinations |
+| `StateStore` | Discover state and transfer it to negotiated destinations |
 | `PreparedStateAttachment` | Bind committed state to one target generation |
 | `RoutingPolicy` | Add constraints and policy cost without owning execution |
 | `Planner` | Select request placement and state actions together |
@@ -303,13 +303,13 @@ types remain at the edges.
    constraints. The current service proceeds directly to discovery.
 5. The capability registry filters execution targets that cannot satisfy the
    request.
-6. For eligible requests, the state provider returns reusable-state candidates
-   and materialization estimates. With no provider, this is an empty result.
+6. For eligible requests, the state store returns reusable-state candidates
+   and materialization estimates. With no store, this is an empty result.
 7. The planner chooses an execution target and optional state path without
    causing side effects.
 8. `PlanExecutor` reserves the target and asks its engine adapter to prepare a
    generation-scoped state-import destination when reuse is planned.
-9. The state provider transfers the selected source to that destination and
+9. The state store transfers the selected source to that destination and
    returns a receipt. The engine adapter commits the import to a
    `PreparedStateAttachment`, or aborts partial work on failure.
 10. `PlanExecutor` submits the canonical request and optional committed
@@ -333,7 +333,7 @@ processes:
 - The **request data plane** performs normalization, planning, streaming, and
   execution orchestration.
 - The **state data plane** performs state lookup and movement through an
-  optional provider.
+  optional store.
 
 A first implementation may host these roles in one Rust process. Stable traits
 and protocol boundaries should allow later separation without forcing it now.
@@ -367,7 +367,7 @@ Errors are classified by ownership and retry safety:
 - `InvalidRequest`: client-visible and not retried;
 - `Unsupported`: no eligible capability or semantic profile;
 - `Rejected`: admission or policy decision;
-- `Unavailable`: transient adapter, engine, or provider failure;
+- `Unavailable`: transient adapter, engine, or store failure;
 - `DeadlineExceeded`: planning, materialization, or execution exceeded budget;
 - `ExecutionFailed`: engine accepted the request but failed it;
 - `Internal`: invariant or unexpected integration failure.
@@ -380,14 +380,14 @@ never depends on treating an unverified state match as compatible.
 ## Security and isolation
 
 Northbound content, templates, tokenizer assets, tool definitions, media, and
-provider metadata cross trust boundaries. Implementations should:
+store metadata cross trust boundaries. Implementations should:
 
 - bound request and streamed-output sizes;
-- authenticate engines and state providers;
+- authenticate engines and state stores;
 - validate media schemes and dereference through controlled fetchers;
-- isolate tenant state and include tenant scope in provider queries;
+- isolate tenant state and include tenant scope in store queries;
 - treat model-supplied templates and custom code as untrusted;
-- keep credentials and provider-private handles out of logs;
+- keep credentials and store-private handles out of logs;
 - enforce deadlines and cancellation across downstream operations.
 
 Unusual `trust_remote_code` behavior may eventually run in an isolated Python
@@ -399,7 +399,7 @@ The following stages are implemented and tested:
 
 1. core DTOs, semantic identities, and structured errors;
 2. pure planning and side-effecting execution boundaries with deterministic
-   engines and state providers;
+   engines and state stores;
 3. the protocol-neutral `InferenceService`, model registry, target discovery,
    and semantic-event pipeline;
 4. OpenAI Responses, Chat Completions, and raw-prompt Completions adapters with

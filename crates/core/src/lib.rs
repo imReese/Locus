@@ -13,8 +13,8 @@ pub use identity::{
     AttachmentId, EngineInstance, EngineInstanceId, EngineInstanceRef, ExecutionRole,
     ExecutionTarget, ExecutionTargetId, GenerationSemanticIdentity, ImportId,
     InputSemanticIdentity, MaterializationOptionId, ModelExecutionIdentity, OpaqueHandle,
-    OutputSemanticIdentity, ParallelLayout, ProviderId, RequestId, RuntimeIdentity,
-    SemanticComponentIdentity, SemanticIdentity, StateId,
+    OutputSemanticIdentity, ParallelLayout, RequestId, RuntimeIdentity, SemanticComponentIdentity,
+    SemanticIdentity, StateId, StoreId,
 };
 pub use input::{
     InputBundle, InputItem, InputItemId, InputItemValue, InputKind, InputRelation, MediaReference,
