@@ -15,7 +15,7 @@ from pathlib import Path
 
 LOCUS_ROOT = Path(__file__).resolve().parents[1]
 LOCUS_FIXTURE = (
-    LOCUS_ROOT / "crates" / "locus-state-nexuskv" / "tests" / "fixtures" / "conformance.json"
+    LOCUS_ROOT / "crates" / "state-nexuskv" / "tests" / "fixtures" / "conformance.json"
 )
 EXTERNAL_TEST = "real_nexuskv_process_completes_locus_plan_and_import_handshake"
 

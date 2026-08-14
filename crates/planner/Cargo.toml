@@ -11,9 +11,9 @@ workspace = true
 
 [dependencies]
 async-trait.workspace = true
-locus-core = { path = "../locus-core" }
-locus-engine = { path = "../locus-engine" }
-locus-state = { path = "../locus-state" }
+locus-core = { path = "../core" }
+locus-engine = { path = "../engine" }
+locus-state = { path = "../state" }
 thiserror.workspace = true
 
 [dev-dependencies]

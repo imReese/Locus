@@ -11,5 +11,5 @@ workspace = true
 
 [dependencies]
 async-trait.workspace = true
-locus-core = { path = "../locus-core" }
+locus-core = { path = "../core" }
 thiserror.workspace = true

@@ -8,8 +8,8 @@ repository.workspace = true
 
 [dependencies]
 async-trait.workspace = true
-locus-core = { path = "../locus-core" }
-locus-state = { path = "../locus-state" }
+locus-core = { path = "../core" }
+locus-state = { path = "../state" }
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -17,9 +17,9 @@ serde_json.workspace = true
 [dev-dependencies]
 axum.workspace = true
 futures.workspace = true
-locus-engine = { path = "../locus-engine" }
-locus-runtime = { path = "../locus-runtime" }
-locus-semantics = { path = "../locus-semantics" }
+locus-engine = { path = "../engine" }
+locus-runtime = { path = "../runtime" }
+locus-semantics = { path = "../semantics" }
 tokio.workspace = true
 
 [lints]

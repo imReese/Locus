@@ -820,15 +820,9 @@ fn core_source_has_no_backend_or_framework_domain_type_leaks() {
         "sglang", "vllm", "tensorrt", "nexuskv", "axum::", "tonic::", "pyo3::",
     ];
 
-    for crate_name in [
-        "locus-core",
-        "locus-semantics",
-        "locus-engine",
-        "locus-state",
-        "locus-planner",
-    ] {
+    for crate_directory in ["core", "semantics", "engine", "state", "planner"] {
         assert_no_forbidden_source(
-            &workspace.join("crates").join(crate_name).join("src"),
+            &workspace.join("crates").join(crate_directory).join("src"),
             &forbidden,
         );
     }

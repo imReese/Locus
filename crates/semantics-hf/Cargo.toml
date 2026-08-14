@@ -7,8 +7,8 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-locus-core = { path = "../locus-core" }
-locus-semantics = { path = "../locus-semantics" }
+locus-core = { path = "../core" }
+locus-semantics = { path = "../semantics" }
 minijinja.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

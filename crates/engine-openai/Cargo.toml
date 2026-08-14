@@ -1,5 +1,5 @@
 [package]
-name = "locus-runtime"
+name = "locus-engine-openai"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,13 +9,16 @@ repository.workspace = true
 [dependencies]
 async-stream.workspace = true
 async-trait.workspace = true
+eventsource-stream.workspace = true
 futures.workspace = true
-locus-core = { path = "../locus-core" }
-locus-engine = { path = "../locus-engine" }
-locus-planner = { path = "../locus-planner" }
-locus-semantics = { path = "../locus-semantics" }
-locus-state = { path = "../locus-state" }
-thiserror.workspace = true
+locus-core = { path = "../core" }
+locus-engine = { path = "../engine" }
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+axum.workspace = true
 tokio.workspace = true
 
 [lints]

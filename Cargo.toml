@@ -1,17 +1,17 @@
 [workspace]
 resolver = "3"
 members = [
-    "crates/locus-core",
-    "crates/locus-engine",
-    "crates/locus-engine-openai",
-    "crates/locus-openai",
-    "crates/locus-planner",
-    "crates/locus-runtime",
-    "crates/locus-semantics",
-    "crates/locus-semantics-hf",
-    "crates/locus-server",
-    "crates/locus-state",
-    "crates/locus-state-nexuskv",
+    "crates/core",
+    "crates/semantics",
+    "crates/engine",
+    "crates/state",
+    "crates/planner",
+    "crates/runtime",
+    "crates/openai",
+    "crates/semantics-hf",
+    "crates/engine-openai",
+    "crates/state-nexuskv",
+    "crates/server",
 ]
 
 [workspace.package]

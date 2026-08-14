@@ -8,15 +8,15 @@ repository.workspace = true
 
 [dependencies]
 axum.workspace = true
-locus-core = { path = "../locus-core" }
-locus-engine = { path = "../locus-engine" }
-locus-engine-openai = { path = "../locus-engine-openai" }
-locus-openai = { path = "../locus-openai" }
-locus-runtime = { path = "../locus-runtime" }
-locus-semantics = { path = "../locus-semantics" }
-locus-semantics-hf = { path = "../locus-semantics-hf" }
-locus-state = { path = "../locus-state" }
-locus-state-nexuskv = { path = "../locus-state-nexuskv" }
+locus-core = { path = "../core" }
+locus-engine = { path = "../engine" }
+locus-engine-openai = { path = "../engine-openai" }
+locus-openai = { path = "../openai" }
+locus-runtime = { path = "../runtime" }
+locus-semantics = { path = "../semantics" }
+locus-semantics-hf = { path = "../semantics-hf" }
+locus-state = { path = "../state" }
+locus-state-nexuskv = { path = "../state-nexuskv" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
