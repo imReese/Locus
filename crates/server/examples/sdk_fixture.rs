@@ -18,12 +18,12 @@ use locus_engine::{
     EngineAdapter, EngineError, EngineEventStream, EngineRegistry, FakeEngineAdapter,
     FakeEngineOutput,
 };
-use locus_openai::{ApiConfig, router_with_config};
-use locus_runtime::{DefaultInferenceService, InferenceService};
-use locus_semantics::{
-    BasicModelSemantics, ByteDecoder, ByteTokenizer, ModelProfile, ModelRegistry,
-    SimpleTemplateRenderer, TaggedJsonToolParserDefinition, TaggedReasoningParserDefinition,
+use locus_model_io::{
+    BasicModelIo, ByteDecoder, ByteTokenizer, ModelProfile, ModelRegistry, SimpleTemplateRenderer,
 };
+use locus_openai::{ApiConfig, router_with_config};
+use locus_parser::{TaggedJsonToolParserDefinition, TaggedReasoningParserDefinition};
+use locus_runtime::{DefaultInferenceService, InferenceService};
 use locus_state::{NullStateProvider, StateProvider};
 use serde_json::json;
 use tokio::net::TcpListener;
@@ -157,7 +157,7 @@ async fn main() {
     };
     let models = ModelRegistry::new();
     models
-        .register(Arc::new(BasicModelSemantics::new(
+        .register(Arc::new(BasicModelIo::new(
             ModelProfile {
                 public_aliases: vec!["locus-test".to_owned()],
                 model: model.clone(),
@@ -189,7 +189,7 @@ async fn main() {
         },
         umbrella_fingerprint: Some("sdk-parser-fixture-e2e-v1".to_owned()),
     };
-    let parser_semantics = BasicModelSemantics::new(
+    let parser_semantics = BasicModelIo::new(
         ModelProfile {
             public_aliases: vec!["locus-parser-test".to_owned()],
             model: parser_model.clone(),

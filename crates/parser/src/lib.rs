@@ -1,9 +1,31 @@
 use locus_core::SemanticComponentIdentity;
 use serde_json::Value;
-
-use crate::SemanticError;
+use thiserror::Error;
 
 const MAX_DELIMITER_BYTES: usize = 256;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TaggedReasoningParserSpec {
+    pub revision: String,
+    pub start_delimiter: String,
+    pub end_delimiter: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TaggedJsonToolParserSpec {
+    pub revision: String,
+    pub start_delimiter: String,
+    pub end_delimiter: String,
+    pub max_buffered_bytes: usize,
+}
+
+#[derive(Clone, Debug, Error, PartialEq, Eq)]
+pub enum ParserError {
+    #[error("invalid parser configuration: {0}")]
+    InvalidConfig(String),
+    #[error("parser processing failed: {0}")]
+    Processing(String),
+}
 
 #[derive(Clone, Debug)]
 pub struct TaggedReasoningParserDefinition {
@@ -17,7 +39,7 @@ impl TaggedReasoningParserDefinition {
         identity: SemanticComponentIdentity,
         start_delimiter: impl Into<String>,
         end_delimiter: impl Into<String>,
-    ) -> Result<Self, SemanticError> {
+    ) -> Result<Self, ParserError> {
         let start_delimiter = start_delimiter.into();
         let end_delimiter = end_delimiter.into();
         validate_delimiters("reasoning", &start_delimiter, &end_delimiter)?;
@@ -33,7 +55,7 @@ impl TaggedReasoningParserDefinition {
         &self.identity
     }
 
-    pub(crate) fn state(&self) -> TaggedReasoningParserState {
+    pub fn state(&self) -> TaggedReasoningParserState {
         TaggedReasoningParserState {
             definition: self.clone(),
             mode: ReasoningMode::Text,
@@ -57,12 +79,12 @@ impl TaggedJsonToolParserDefinition {
         start_delimiter: impl Into<String>,
         end_delimiter: impl Into<String>,
         max_buffered_bytes: usize,
-    ) -> Result<Self, SemanticError> {
+    ) -> Result<Self, ParserError> {
         let start_delimiter = start_delimiter.into();
         let end_delimiter = end_delimiter.into();
         validate_delimiters("tool", &start_delimiter, &end_delimiter)?;
         if max_buffered_bytes == 0 {
-            return Err(SemanticError::InvalidInput(
+            return Err(ParserError::InvalidConfig(
                 "tool parser max_buffered_bytes must be greater than zero".to_owned(),
             ));
         }
@@ -79,7 +101,7 @@ impl TaggedJsonToolParserDefinition {
         &self.identity
     }
 
-    pub(crate) fn state(&self) -> TaggedJsonToolParserState {
+    pub fn state(&self) -> TaggedJsonToolParserState {
         TaggedJsonToolParserState {
             definition: self.clone(),
             mode: ToolMode::Text,
@@ -88,19 +110,19 @@ impl TaggedJsonToolParserDefinition {
     }
 }
 
-fn validate_delimiters(kind: &str, start: &str, end: &str) -> Result<(), SemanticError> {
+fn validate_delimiters(kind: &str, start: &str, end: &str) -> Result<(), ParserError> {
     if start.is_empty() || end.is_empty() {
-        return Err(SemanticError::InvalidInput(format!(
+        return Err(ParserError::InvalidConfig(format!(
             "{kind} parser delimiters must not be empty"
         )));
     }
     if start == end {
-        return Err(SemanticError::InvalidInput(format!(
+        return Err(ParserError::InvalidConfig(format!(
             "{kind} parser delimiters must be distinct"
         )));
     }
     if start.len() > MAX_DELIMITER_BYTES || end.len() > MAX_DELIMITER_BYTES {
-        return Err(SemanticError::InvalidInput(format!(
+        return Err(ParserError::InvalidConfig(format!(
             "{kind} parser delimiters must not exceed {MAX_DELIMITER_BYTES} bytes"
         )));
     }
@@ -113,12 +135,13 @@ enum ReasoningMode {
     Reasoning,
 }
 
-pub(crate) enum ReasoningSegment {
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReasoningSegment {
     Text(String),
     Reasoning(String),
 }
 
-pub(crate) struct TaggedReasoningParserState {
+pub struct TaggedReasoningParserState {
     definition: TaggedReasoningParserDefinition,
     mode: ReasoningMode,
     pending: String,
@@ -126,7 +149,7 @@ pub(crate) struct TaggedReasoningParserState {
 }
 
 impl TaggedReasoningParserState {
-    pub(crate) fn push(&mut self, delta: &str) -> Result<Vec<ReasoningSegment>, SemanticError> {
+    pub fn push(&mut self, delta: &str) -> Result<Vec<ReasoningSegment>, ParserError> {
         self.pending.push_str(delta);
         let mut output = Vec::new();
         loop {
@@ -145,7 +168,7 @@ impl TaggedReasoningParserState {
             if forbidden_position.is_some_and(|position| {
                 delimiter_position.is_none_or(|delimiter_position| position < delimiter_position)
             }) {
-                return Err(SemanticError::Processing(format!(
+                return Err(ParserError::Processing(format!(
                     "reasoning parser observed unexpected delimiter {forbidden:?}"
                 )));
             }
@@ -156,7 +179,7 @@ impl TaggedReasoningParserState {
                 match self.mode {
                     ReasoningMode::Text => {
                         if self.saw_reasoning {
-                            return Err(SemanticError::Processing(
+                            return Err(ParserError::Processing(
                                 "reasoning parser observed multiple reasoning sections".to_owned(),
                             ));
                         }
@@ -180,14 +203,14 @@ impl TaggedReasoningParserState {
         Ok(output)
     }
 
-    pub(crate) fn finish(&mut self) -> Result<Vec<ReasoningSegment>, SemanticError> {
+    pub fn finish(&mut self) -> Result<Vec<ReasoningSegment>, ParserError> {
         if self.mode == ReasoningMode::Reasoning {
-            return Err(SemanticError::Processing(
+            return Err(ParserError::Processing(
                 "engine finished with an unterminated reasoning section".to_owned(),
             ));
         }
         if !self.pending.is_empty() {
-            return Err(SemanticError::Processing(
+            return Err(ParserError::Processing(
                 "engine finished with an incomplete reasoning delimiter".to_owned(),
             ));
         }
@@ -211,19 +234,20 @@ enum ToolMode {
     Tool,
 }
 
-pub(crate) enum ToolSegment {
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ToolSegment {
     Text(String),
     Call { name: String, arguments: String },
 }
 
-pub(crate) struct TaggedJsonToolParserState {
+pub struct TaggedJsonToolParserState {
     definition: TaggedJsonToolParserDefinition,
     mode: ToolMode,
     pending: String,
 }
 
 impl TaggedJsonToolParserState {
-    pub(crate) fn push(&mut self, delta: &str) -> Result<Vec<ToolSegment>, SemanticError> {
+    pub fn push(&mut self, delta: &str) -> Result<Vec<ToolSegment>, ParserError> {
         self.pending.push_str(delta);
         let mut output = Vec::new();
         loop {
@@ -236,7 +260,7 @@ impl TaggedJsonToolParserState {
                     if end_position.is_some_and(|position| {
                         start_position.is_none_or(|start_position| position < start_position)
                     }) {
-                        return Err(SemanticError::Processing(format!(
+                        return Err(ParserError::Processing(format!(
                             "tool parser observed unexpected delimiter {end:?}"
                         )));
                     }
@@ -260,7 +284,7 @@ impl TaggedJsonToolParserState {
                 ToolMode::Tool => {
                     let Some((end_position, name, arguments)) = self.complete_call() else {
                         if self.pending.len() > self.definition.max_buffered_bytes {
-                            return Err(SemanticError::Processing(format!(
+                            return Err(ParserError::Processing(format!(
                                 "tool call exceeds configured {} byte parser limit",
                                 self.definition.max_buffered_bytes
                             )));
@@ -268,7 +292,7 @@ impl TaggedJsonToolParserState {
                         break;
                     };
                     if end_position > self.definition.max_buffered_bytes {
-                        return Err(SemanticError::Processing(format!(
+                        return Err(ParserError::Processing(format!(
                             "tool call exceeds configured {} byte parser limit",
                             self.definition.max_buffered_bytes
                         )));
@@ -296,14 +320,14 @@ impl TaggedJsonToolParserState {
         None
     }
 
-    pub(crate) fn finish(&mut self) -> Result<Vec<ToolSegment>, SemanticError> {
+    pub fn finish(&mut self) -> Result<Vec<ToolSegment>, ParserError> {
         if self.mode == ToolMode::Tool {
-            return Err(SemanticError::Processing(
+            return Err(ParserError::Processing(
                 "engine finished with an unterminated or malformed tool call".to_owned(),
             ));
         }
         if !self.pending.is_empty() {
-            return Err(SemanticError::Processing(
+            return Err(ParserError::Processing(
                 "engine finished with an incomplete tool delimiter".to_owned(),
             ));
         }
@@ -311,16 +335,16 @@ impl TaggedJsonToolParserState {
     }
 }
 
-fn parse_tool_envelope(input: &str) -> Result<(String, String), SemanticError> {
+fn parse_tool_envelope(input: &str) -> Result<(String, String), ParserError> {
     let value = serde_json::from_str::<Value>(input)
-        .map_err(|error| SemanticError::Processing(format!("invalid tool call JSON: {error}")))?;
+        .map_err(|error| ParserError::Processing(format!("invalid tool call JSON: {error}")))?;
     let Value::Object(mut object) = value else {
-        return Err(SemanticError::Processing(
+        return Err(ParserError::Processing(
             "tool call envelope must be a JSON object".to_owned(),
         ));
     };
     if object.len() != 2 || !object.contains_key("name") || !object.contains_key("arguments") {
-        return Err(SemanticError::Processing(
+        return Err(ParserError::Processing(
             "tool call envelope must contain exactly name and arguments".to_owned(),
         ));
     }
@@ -328,15 +352,15 @@ fn parse_tool_envelope(input: &str) -> Result<(String, String), SemanticError> {
         .remove("name")
         .and_then(|value| value.as_str().map(str::to_owned))
         .filter(|name| !name.is_empty())
-        .ok_or_else(|| SemanticError::Processing("tool call name must be a string".to_owned()))?;
+        .ok_or_else(|| ParserError::Processing("tool call name must be a string".to_owned()))?;
     let arguments = object.remove("arguments").expect("key checked above");
     if !arguments.is_object() {
-        return Err(SemanticError::Processing(
+        return Err(ParserError::Processing(
             "tool call arguments must be a JSON object".to_owned(),
         ));
     }
     let arguments = serde_json::to_string(&arguments).map_err(|error| {
-        SemanticError::Processing(format!("failed to normalize tool call arguments: {error}"))
+        ParserError::Processing(format!("failed to normalize tool call arguments: {error}"))
     })?;
     Ok((name, arguments))
 }

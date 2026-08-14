@@ -8,16 +8,20 @@ use locus_core::{
     GenerationSemanticIdentity, InputSemanticIdentity, ModelExecutionIdentity,
     OutputSemanticIdentity, SemanticComponentIdentity, SemanticIdentity, TokenSequence,
 };
-use locus_semantics::{
-    BasicModelSemantics, ModelProfile, ModelSemantics, SemanticError, SemanticInput,
-    SemanticRequest, TaggedJsonToolParserDefinition, TaggedReasoningParserDefinition,
-    TemplateRenderer, TokenDecoder, TokenizerProvider, ToolChoice,
+use locus_parser::{
+    TaggedJsonToolParserDefinition, TaggedJsonToolParserSpec, TaggedReasoningParserDefinition,
+    TaggedReasoningParserSpec,
 };
 use minijinja::{Environment, Error as TemplateError, ErrorKind, UndefinedBehavior};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokenizers::Tokenizer;
+
+use crate::{
+    BasicModelIo, ModelInput, ModelIo, ModelIoError, ModelProfile, ModelRequest, TemplateRenderer,
+    TokenDecoder, TokenizerProvider, ToolChoice,
+};
 
 const DEFAULT_MAX_RENDERED_BYTES: usize = 4 * 1024 * 1024;
 
@@ -34,21 +38,6 @@ pub struct HuggingFaceProfileSpec {
     pub max_rendered_bytes: usize,
     pub reasoning_parser: Option<TaggedReasoningParserSpec>,
     pub tool_parser: Option<TaggedJsonToolParserSpec>,
-}
-
-#[derive(Clone, Debug)]
-pub struct TaggedReasoningParserSpec {
-    pub revision: String,
-    pub start_delimiter: String,
-    pub end_delimiter: String,
-}
-
-#[derive(Clone, Debug)]
-pub struct TaggedJsonToolParserSpec {
-    pub revision: String,
-    pub start_delimiter: String,
-    pub end_delimiter: String,
-    pub max_buffered_bytes: usize,
 }
 
 impl HuggingFaceProfileSpec {
@@ -75,14 +64,14 @@ impl HuggingFaceProfileSpec {
     }
 }
 
-pub fn load_huggingface_semantics(
+pub fn load_huggingface_model_io(
     spec: HuggingFaceProfileSpec,
-) -> Result<Arc<dyn ModelSemantics>, HuggingFaceSemanticsError> {
+) -> Result<Arc<dyn ModelIo>, HuggingFaceModelIoError> {
     validate_spec(&spec)?;
     let tokenizer_bytes = read(&spec.tokenizer_json, "tokenizer JSON")?;
     let template_bytes = read(&spec.chat_template, "chat template")?;
     let template_source = String::from_utf8(template_bytes.clone()).map_err(|error| {
-        HuggingFaceSemanticsError::InvalidTemplate(format!("chat template is not UTF-8: {error}"))
+        HuggingFaceModelIoError::InvalidTemplate(format!("chat template is not UTF-8: {error}"))
     })?;
     let tokenizer_fingerprint = sha256(&tokenizer_bytes);
     let template_fingerprint = sha256(&template_bytes);
@@ -99,7 +88,7 @@ pub fn load_huggingface_semantics(
     let (reasoning_identity, reasoning_parser) = build_reasoning_parser(&spec)?;
     let (tool_identity, tool_parser) = build_tool_parser(&spec)?;
     let tokenizer = Tokenizer::from_bytes(tokenizer_bytes).map_err(|error| {
-        HuggingFaceSemanticsError::InvalidTokenizer(format!(
+        HuggingFaceModelIoError::InvalidTokenizer(format!(
             "failed to load {}: {error}",
             spec.tokenizer_json.display()
         ))
@@ -124,7 +113,7 @@ pub fn load_huggingface_semantics(
         add_generation_prompt: spec.add_generation_prompt,
         max_rendered_bytes: spec.max_rendered_bytes,
     });
-    let semantics = BasicModelSemantics::new(
+    let model_io = BasicModelIo::new(
         ModelProfile {
             public_aliases: spec.public_aliases,
             model: spec.model,
@@ -135,8 +124,8 @@ pub fn load_huggingface_semantics(
         tokenizer,
     )
     .with_output_parsers(reasoning_parser, tool_parser)
-    .map_err(|error| HuggingFaceSemanticsError::InvalidProfile(error.to_string()))?;
-    Ok(Arc::new(semantics))
+    .map_err(|error| HuggingFaceModelIoError::InvalidProfile(error.to_string()))?;
+    Ok(Arc::new(model_io))
 }
 
 fn build_reasoning_parser(
@@ -146,7 +135,7 @@ fn build_reasoning_parser(
         Option<SemanticComponentIdentity>,
         Option<TaggedReasoningParserDefinition>,
     ),
-    HuggingFaceSemanticsError,
+    HuggingFaceModelIoError,
 > {
     let Some(parser) = &spec.reasoning_parser else {
         return Ok((None, None));
@@ -164,7 +153,7 @@ fn build_reasoning_parser(
         parser.start_delimiter.clone(),
         parser.end_delimiter.clone(),
     )
-    .map_err(|error| HuggingFaceSemanticsError::InvalidProfile(error.to_string()))?;
+    .map_err(|error| HuggingFaceModelIoError::InvalidProfile(error.to_string()))?;
     Ok((Some(identity), Some(definition)))
 }
 
@@ -175,7 +164,7 @@ fn build_tool_parser(
         Option<SemanticComponentIdentity>,
         Option<TaggedJsonToolParserDefinition>,
     ),
-    HuggingFaceSemanticsError,
+    HuggingFaceModelIoError,
 > {
     let Some(parser) = &spec.tool_parser else {
         return Ok((None, None));
@@ -196,7 +185,7 @@ fn build_tool_parser(
         parser.end_delimiter.clone(),
         parser.max_buffered_bytes,
     )
-    .map_err(|error| HuggingFaceSemanticsError::InvalidProfile(error.to_string()))?;
+    .map_err(|error| HuggingFaceModelIoError::InvalidProfile(error.to_string()))?;
     Ok((Some(identity), Some(definition)))
 }
 
@@ -204,9 +193,9 @@ fn parser_identity(
     kind: &str,
     revision: &str,
     fields: &[&str],
-) -> Result<SemanticComponentIdentity, HuggingFaceSemanticsError> {
+) -> Result<SemanticComponentIdentity, HuggingFaceModelIoError> {
     if revision.trim().is_empty() {
-        return Err(HuggingFaceSemanticsError::InvalidProfile(format!(
+        return Err(HuggingFaceModelIoError::InvalidProfile(format!(
             "{kind} revision must not be empty"
         )));
     }
@@ -225,9 +214,9 @@ fn parser_identity(
     })
 }
 
-fn validate_spec(spec: &HuggingFaceProfileSpec) -> Result<(), HuggingFaceSemanticsError> {
+fn validate_spec(spec: &HuggingFaceProfileSpec) -> Result<(), HuggingFaceModelIoError> {
     if spec.public_aliases.is_empty() {
-        return Err(HuggingFaceSemanticsError::InvalidProfile(
+        return Err(HuggingFaceModelIoError::InvalidProfile(
             "at least one public model alias is required".to_owned(),
         ));
     }
@@ -236,23 +225,23 @@ fn validate_spec(spec: &HuggingFaceProfileSpec) -> Result<(), HuggingFaceSemanti
         .iter()
         .any(|alias| alias.trim().is_empty())
     {
-        return Err(HuggingFaceSemanticsError::InvalidProfile(
+        return Err(HuggingFaceModelIoError::InvalidProfile(
             "public model aliases must not be empty".to_owned(),
         ));
     }
     if spec.tokenizer_revision.trim().is_empty() || spec.template_revision.trim().is_empty() {
-        return Err(HuggingFaceSemanticsError::InvalidProfile(
+        return Err(HuggingFaceModelIoError::InvalidProfile(
             "tokenizer and template revisions must not be empty".to_owned(),
         ));
     }
     if spec.max_rendered_bytes == 0 {
-        return Err(HuggingFaceSemanticsError::InvalidProfile(
+        return Err(HuggingFaceModelIoError::InvalidProfile(
             "max_rendered_bytes must be greater than zero".to_owned(),
         ));
     }
     for reserved in ["messages", "tools", "tool_choice", "add_generation_prompt"] {
         if spec.template_context.contains_key(reserved) {
-            return Err(HuggingFaceSemanticsError::InvalidProfile(format!(
+            return Err(HuggingFaceModelIoError::InvalidProfile(format!(
                 "template_context cannot replace reserved field {reserved}"
             )));
         }
@@ -260,8 +249,8 @@ fn validate_spec(spec: &HuggingFaceProfileSpec) -> Result<(), HuggingFaceSemanti
     Ok(())
 }
 
-fn read(path: &Path, description: &str) -> Result<Vec<u8>, HuggingFaceSemanticsError> {
-    fs::read(path).map_err(|error| HuggingFaceSemanticsError::Read {
+fn read(path: &Path, description: &str) -> Result<Vec<u8>, HuggingFaceModelIoError> {
+    fs::read(path).map_err(|error| HuggingFaceModelIoError::Read {
         description: description.to_owned(),
         path: path.to_path_buf(),
         source: error,
@@ -322,11 +311,11 @@ impl TokenizerProvider for HuggingFaceTokenizer {
         &self.identity
     }
 
-    fn encode(&self, input: &str) -> Result<TokenSequence, SemanticError> {
+    fn encode(&self, input: &str) -> Result<TokenSequence, ModelIoError> {
         let encoding = self
             .tokenizer
             .encode(input, false)
-            .map_err(|error| SemanticError::Processing(format!("tokenization failed: {error}")))?;
+            .map_err(|error| ModelIoError::Processing(format!("tokenization failed: {error}")))?;
         Ok(TokenSequence {
             token_ids: encoding.get_ids().to_vec(),
             tokenizer_fingerprint: self.identity.fingerprint.clone(),
@@ -335,10 +324,10 @@ impl TokenizerProvider for HuggingFaceTokenizer {
 }
 
 impl TokenDecoder for HuggingFaceTokenizer {
-    fn decode(&self, token_ids: &[u32]) -> Result<String, SemanticError> {
+    fn decode(&self, token_ids: &[u32]) -> Result<String, ModelIoError> {
         self.tokenizer
             .decode(token_ids, false)
-            .map_err(|error| SemanticError::Processing(format!("detokenization failed: {error}")))
+            .map_err(|error| ModelIoError::Processing(format!("detokenization failed: {error}")))
     }
 }
 
@@ -355,9 +344,9 @@ impl TemplateRenderer for HuggingFaceTemplateRenderer {
         &self.identity
     }
 
-    fn render(&self, request: &SemanticRequest) -> Result<String, SemanticError> {
-        let SemanticInput::Conversation(conversation) = &request.input else {
-            return Err(SemanticError::InvalidInput(
+    fn render(&self, request: &ModelRequest) -> Result<String, ModelIoError> {
+        let ModelInput::Conversation(conversation) = &request.input else {
+            return Err(ModelIoError::InvalidInput(
                 "chat template requires conversation input".to_owned(),
             ));
         };
@@ -384,7 +373,7 @@ impl TemplateRenderer for HuggingFaceTemplateRenderer {
             .map(|tool| {
                 let parameters =
                     serde_json::from_str::<Value>(&tool.parameters_schema).map_err(|error| {
-                        SemanticError::InvalidInput(format!(
+                        ModelIoError::InvalidInput(format!(
                             "invalid parameters schema for tool {}: {error}",
                             tool.name
                         ))
@@ -398,7 +387,7 @@ impl TemplateRenderer for HuggingFaceTemplateRenderer {
                 }
                 Ok(json!({"type": "function", "function": function}))
             })
-            .collect::<Result<Vec<_>, SemanticError>>()?;
+            .collect::<Result<Vec<_>, ModelIoError>>()?;
         context.insert("tools".to_owned(), Value::Array(tools));
         context.insert(
             "tool_choice".to_owned(),
@@ -418,9 +407,9 @@ impl TemplateRenderer for HuggingFaceTemplateRenderer {
         let environment = template_environment();
         let rendered = environment
             .render_str(&self.source, context)
-            .map_err(|error| SemanticError::Processing(format!("chat template failed: {error}")))?;
+            .map_err(|error| ModelIoError::Processing(format!("chat template failed: {error}")))?;
         if rendered.len() > self.max_rendered_bytes {
-            return Err(SemanticError::InvalidInput(format!(
+            return Err(ModelIoError::InvalidInput(format!(
                 "rendered prompt exceeds configured {} byte limit",
                 self.max_rendered_bytes
             )));
@@ -429,11 +418,11 @@ impl TemplateRenderer for HuggingFaceTemplateRenderer {
     }
 }
 
-fn validate_template(source: &str) -> Result<(), HuggingFaceSemanticsError> {
+fn validate_template(source: &str) -> Result<(), HuggingFaceModelIoError> {
     template_environment()
         .template_from_str(source)
         .map(|_| ())
-        .map_err(|error| HuggingFaceSemanticsError::InvalidTemplate(error.to_string()))
+        .map_err(|error| HuggingFaceModelIoError::InvalidTemplate(error.to_string()))
 }
 
 fn template_environment<'source>() -> Environment<'source> {
@@ -459,7 +448,7 @@ fn sha256(bytes: &[u8]) -> String {
 }
 
 #[derive(Debug, Error)]
-pub enum HuggingFaceSemanticsError {
+pub enum HuggingFaceModelIoError {
     #[error("invalid Hugging Face model profile: {0}")]
     InvalidProfile(String),
     #[error("failed to read {description} at {path}: {source}")]

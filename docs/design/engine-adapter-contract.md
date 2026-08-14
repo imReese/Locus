@@ -23,7 +23,7 @@ not native typed reasoning or tool-call events. A model profile may select local
 incremental parsers over that text stream; in that case the canonical request
 does not falsely require native typed engine events. Tool-bearing prompts cross
 the adapter only when the canonical semantic identity contains a tool parser.
-The vLLM adapter sends `add_special_tokens: false` because `ModelSemantics` has
+The vLLM adapter sends `add_special_tokens: false` because `ModelIo` has
 already rendered and tokenized the prompt; adapters must not add a second BOS.
 
 ## Purpose
@@ -194,7 +194,7 @@ it first completes the import handshake described below. The adapter then:
 Adapters may split or coalesce transport frames but must preserve event
 ordering. They report execution facts and may not silently drop sampling
 parameters, output tokens, multimodal inputs, or finish information. Tool-call,
-reasoning, and application finish semantics remain in `ModelSemantics` unless a
+reasoning, and application finish semantics remain in `ModelIo` unless a
 separate optional engine capability is explicitly selected.
 
 ## State import transaction
@@ -238,8 +238,8 @@ facts such as stop, length, cancellation, error, or a namespaced
 runtime-specific value. They do not infer tool calls, reasoning completion,
 content filtering, or another application outcome by default.
 
-`ModelSemantics` consumes the ordered engine output and derives
-`SemanticFinishReason`. If a runtime provides semantic events itself, the
+`ModelIo` consumes the ordered engine output and derives
+`ModelFinishReason`. If a runtime provides semantic events itself, the
 adapter advertises that optional capability and Locus selects it knowingly.
 
 ## Runtime-specific features

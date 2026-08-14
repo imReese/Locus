@@ -862,6 +862,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "locus-model-io"
+version = "0.1.0"
+dependencies = [
+ "ahash",
+ "locus-core",
+ "locus-parser",
+ "minijinja",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror",
+ "tokenizers",
+]
+
+[[package]]
 name = "locus-openai"
 version = "0.1.0"
 dependencies = [
@@ -871,9 +886,9 @@ dependencies = [
  "http-body-util",
  "locus-core",
  "locus-engine",
+ "locus-model-io",
  "locus-planner",
  "locus-runtime",
- "locus-semantics",
  "locus-state",
  "serde",
  "serde_json",
@@ -881,6 +896,15 @@ dependencies = [
  "thiserror",
  "tokio",
  "tower",
+]
+
+[[package]]
+name = "locus-parser"
+version = "0.1.0"
+dependencies = [
+ "locus-core",
+ "serde_json",
+ "thiserror",
 ]
 
 [[package]]
@@ -908,37 +932,13 @@ dependencies = [
  "futures",
  "locus-core",
  "locus-engine",
+ "locus-model-io",
  "locus-planner",
- "locus-semantics",
  "locus-state",
  "tempfile",
  "thiserror",
  "tokio",
  "tracing",
-]
-
-[[package]]
-name = "locus-semantics"
-version = "0.1.0"
-dependencies = [
- "locus-core",
- "serde_json",
- "thiserror",
-]
-
-[[package]]
-name = "locus-semantics-hf"
-version = "0.1.0"
-dependencies = [
- "ahash",
- "locus-core",
- "locus-semantics",
- "minijinja",
- "serde_json",
- "sha2",
- "tempfile",
- "thiserror",
- "tokenizers",
 ]
 
 [[package]]
@@ -954,11 +954,11 @@ dependencies = [
  "locus-core",
  "locus-engine",
  "locus-engine-openai",
+ "locus-model-io",
  "locus-openai",
+ "locus-parser",
  "locus-planner",
  "locus-runtime",
- "locus-semantics",
- "locus-semantics-hf",
  "locus-state",
  "locus-state-nexuskv",
  "serde",
@@ -991,8 +991,8 @@ dependencies = [
  "futures",
  "locus-core",
  "locus-engine",
+ "locus-model-io",
  "locus-runtime",
- "locus-semantics",
  "locus-state",
  "reqwest",
  "serde",

@@ -15,11 +15,11 @@ use locus_core::{
     StateKind, StateRequirement,
 };
 use locus_engine::{EngineRegistry, FakeEngineAdapter, FakeEngineOutput};
-use locus_runtime::{DefaultInferenceService, InferenceService};
-use locus_semantics::{
-    BasicModelSemantics, ByteDecoder, ByteTokenizer, Conversation, ConversationMessage,
-    ConversationRole, ModelProfile, ModelRegistry, SemanticRequest, SimpleTemplateRenderer,
+use locus_model_io::{
+    BasicModelIo, ByteDecoder, ByteTokenizer, Conversation, ConversationMessage, ConversationRole,
+    ModelProfile, ModelRegistry, ModelRequest, SimpleTemplateRenderer,
 };
+use locus_runtime::{DefaultInferenceService, InferenceService};
 use locus_state::{StateError, StateProvider};
 use locus_state_nexuskv::{NexusKvBridgeConfig, NexusKvStateProvider};
 use serde_json::{Value, json};
@@ -209,7 +209,7 @@ fn inference_service(
     let (model, semantic_identity) = identities();
     let models = ModelRegistry::new();
     models
-        .register(Arc::new(BasicModelSemantics::new(
+        .register(Arc::new(BasicModelIo::new(
             ModelProfile {
                 public_aliases: vec!["nexus-model".to_owned()],
                 model: model.clone(),
@@ -282,16 +282,16 @@ fn inference_service(
 async fn run_inference(service: &DefaultInferenceService, request_id: &str) {
     service
         .infer(
-            SemanticRequest {
+            ModelRequest {
                 model: "nexus-model".to_owned(),
-                input: locus_semantics::SemanticInput::Conversation(Conversation {
+                input: locus_model_io::ModelInput::Conversation(Conversation {
                     messages: vec![ConversationMessage {
                         role: ConversationRole::User,
                         content: "use cached prefix".to_owned(),
                         tool_call_id: None,
                     }],
                 }),
-                ..SemanticRequest::default()
+                ..ModelRequest::default()
             },
             OperationContext::new(RequestId::new(request_id)),
         )

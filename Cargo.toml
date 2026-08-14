@@ -2,13 +2,13 @@
 resolver = "3"
 members = [
     "crates/core",
-    "crates/semantics",
+    "crates/model-io",
+    "crates/parser",
     "crates/engine",
     "crates/state",
     "crates/planner",
     "crates/runtime",
     "crates/openai",
-    "crates/semantics-hf",
     "crates/engine-openai",
     "crates/state-nexuskv",
     "crates/server",

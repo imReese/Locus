@@ -77,7 +77,7 @@ matching token prefix.
             v
 +----------------------------------------------------------+
 | Locus                                                    |
-| protocol | model semantics | admission | global planner  |
+| protocol | model I/O       | admission | global planner  |
 | routing  | observability   | compute + state placement   |
 +----------------------------+-----------------------------+
              |               |
@@ -127,7 +127,7 @@ state integration disabled.
 - [Architecture](docs/design/architecture.md)
 - [Canonical engine protocol](docs/design/canonical-engine-protocol.md)
 - [Engine adapter contract](docs/design/engine-adapter-contract.md)
-- [Model semantics](docs/design/model-semantics.md)
+- [Model I/O](docs/design/model-io.md)
 - [State-aware scheduling](docs/design/state-aware-scheduling.md)
 - [OpenAI-compatible API](docs/design/openai-api.md)
 - [NexusKV bridge](docs/design/nexuskv-bridge.md)
@@ -140,19 +140,19 @@ The Rust 2024 workspace keeps the architecture boundaries small and explicit:
 
 - `locus-core`: canonical requests, execution facts, identities, reusable-state
   contracts, and operation context;
-- `locus-semantics`: model registry, normalization, profile-bound tagged
-  reasoning/tagged-JSON tool parsing, typed semantic events, tool-call
-  aggregation, and structured-output validation;
-- `locus-semantics-hf`: production tokenizer.json loading, bounded MiniJinja
-  chat-template rendering, detokenization, and content-derived semantic
-  fingerprints;
+- `locus-model-io`: model-facing request/event types, registry, normalization,
+  production `tokenizer.json` loading, bounded MiniJinja chat-template
+  rendering, detokenization, tool-call aggregation, structured-output
+  validation, and content-derived semantic fingerprints;
+- `locus-parser`: request-scoped reasoning and tagged-JSON tool-call parsers
+  with bounded streaming state;
 - `locus-engine`: engine adapter contract, registry, and deterministic fake;
 - `locus-state`: state-provider contract, null provider, and deterministic fake;
 - `locus-planner`: cost-based path selection, persistent bounded calibration,
   promotion evidence, and the side-effecting `PlanExecutor`;
 - `locus-runtime`: `InferenceService`, target discovery, state-candidate
   construction, shadow/replay and gated active planning, outcome observation,
-  semantic streaming, and cancellation;
+  model-event streaming, and cancellation;
 - `locus-openai`: Responses, Chat Completions, raw text/token Completions, model
   listing, health, SSE, and OpenAI-shaped errors;
 - `locus-engine-openai`: network adapters for SGLang and vLLM completion and
@@ -166,7 +166,7 @@ The Rust 2024 workspace keeps the architecture boundaries small and explicit:
 
 The byte tokenizer and simple template renderer remain deterministic reference
 components for unit and SDK fixture tests. Deployments use
-`locus-semantics-hf` with pinned tokenizer and template artifacts.
+`locus-model-io::hf` with pinned tokenizer and template artifacts.
 
 Run the same checks used by GitHub CI with:
 

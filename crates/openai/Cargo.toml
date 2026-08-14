@@ -13,7 +13,7 @@ futures.workspace = true
 locus-core = { path = "../core" }
 locus-planner = { path = "../planner" }
 locus-runtime = { path = "../runtime" }
-locus-semantics = { path = "../semantics" }
+locus-model-io = { path = "../model-io" }
 serde.workspace = true
 serde_json.workspace = true
 subtle.workspace = true

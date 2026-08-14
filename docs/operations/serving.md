@@ -3,9 +3,9 @@
 ## Status
 
 `locus-server` is the deployable Locus process. It loads a static model-catalog
-source from one JSON configuration, constructs production model semantics,
+source from one JSON configuration, constructs production model I/O profiles,
 registers SGLang or vLLM adapters and an optional NexusKV provider, applies
-ingress policy, and serves the OpenAI routes. Model semantics and live engine
+ingress policy, and serves the OpenAI routes. Model I/O profiles and live engine
 inventory are separate: a catalog profile may exist while no engine currently
 serves it. Invalid semantic artifacts and ambiguous identity mappings still fail
 startup.
@@ -85,7 +85,7 @@ SHA-256 at startup. Those digests become structured semantic-component
 fingerprints and feed the umbrella profile fingerprint. A label such as `main`
 or `latest` is not accepted as compatibility evidence by itself.
 
-For conversation requests the selected `ModelSemantics` renders the messages
+For conversation requests the selected `ModelIo` renders the messages
 and OpenAI-shaped function definitions once, then tokenizes that rendered prompt
 once. For `POST /v1/completions`, raw text is tokenized directly and a raw token
 array is preserved without invoking the chat template. The resulting canonical

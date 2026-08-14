@@ -12,12 +12,11 @@ use locus_core::{
     RuntimeIdentity, SemanticComponentIdentity, SemanticIdentity,
 };
 use locus_engine::{EngineRegistry, FakeEngineAdapter, FakeEngineOutput, FakeToolCall};
+use locus_model_io::{
+    BasicModelIo, ByteDecoder, ByteTokenizer, ModelProfile, ModelRegistry, SimpleTemplateRenderer,
+};
 use locus_openai::{ApiConfig, router, router_with_config};
 use locus_runtime::{DefaultInferenceService, InferenceService};
-use locus_semantics::{
-    BasicModelSemantics, ByteDecoder, ByteTokenizer, ModelProfile, ModelRegistry,
-    SimpleTemplateRenderer,
-};
 use locus_state::{NullStateProvider, StateProvider};
 use serde_json::{Value, json};
 use tower::ServiceExt;
@@ -62,7 +61,7 @@ fn service(output: FakeEngineOutput) -> (Arc<dyn InferenceService>, Arc<FakeEngi
     let (model, semantics_identity) = identities();
     let models = ModelRegistry::new();
     models
-        .register(Arc::new(BasicModelSemantics::new(
+        .register(Arc::new(BasicModelIo::new(
             ModelProfile {
                 public_aliases: vec!["locus-test".to_owned(), "locus-test-latest".to_owned()],
                 model: model.clone(),
@@ -502,7 +501,7 @@ async fn responses_sse_has_created_delta_done_and_completed_order() {
 }
 
 #[tokio::test]
-async fn function_reasoning_and_structured_output_share_the_semantic_pipeline() {
+async fn function_reasoning_and_structured_output_share_the_model_io_pipeline() {
     let (app, _) = app(FakeEngineOutput {
         token_deltas: Vec::new(),
         text_deltas: vec!["{\"answer\":\"ok\"}".to_owned()],

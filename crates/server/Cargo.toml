@@ -14,8 +14,8 @@ locus-engine-openai = { path = "../engine-openai" }
 locus-openai = { path = "../openai" }
 locus-planner = { path = "../planner" }
 locus-runtime = { path = "../runtime" }
-locus-semantics = { path = "../semantics" }
-locus-semantics-hf = { path = "../semantics-hf" }
+locus-model-io = { path = "../model-io" }
+locus-parser = { path = "../parser" }
 locus-state = { path = "../state" }
 locus-state-nexuskv = { path = "../state-nexuskv" }
 serde.workspace = true

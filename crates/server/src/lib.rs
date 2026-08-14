@@ -20,14 +20,12 @@ use locus_engine_openai::{
     RemoteEngineConfig, RemoteExecutionTarget, RemoteTelemetryConfig, SglangEngineAdapter,
     VllmEngineAdapter,
 };
+use locus_model_io::ModelRegistry;
+use locus_model_io::hf::{HuggingFaceProfileSpec, load_huggingface_model_io};
 use locus_openai::{ApiConfig, router_with_config};
+use locus_parser::{TaggedJsonToolParserSpec, TaggedReasoningParserSpec};
 use locus_planner::{CalibrationPolicy, PersistentCalibrator, PlacementMode};
 use locus_runtime::{DefaultInferenceService, InferenceService, PlacementControl};
-use locus_semantics::ModelRegistry;
-use locus_semantics_hf::{
-    HuggingFaceProfileSpec, TaggedJsonToolParserSpec, TaggedReasoningParserSpec,
-    load_huggingface_semantics,
-};
 use locus_state::{NullStateProvider, StateProvider};
 use locus_state_nexuskv::{NexusKvBridgeConfig, NexusKvStateProvider};
 use serde::Deserialize;
@@ -536,7 +534,7 @@ pub fn build_server(
             .tool_parser
             .as_ref()
             .map(ToolParserSettings::profile_spec);
-        models.register(load_huggingface_semantics(spec)?)?;
+        models.register(load_huggingface_model_io(spec)?)?;
         for alias in &model.aliases {
             model_by_alias.insert(alias.clone(), execution_identity.clone());
         }
@@ -886,9 +884,9 @@ pub enum ServerError {
     #[error("secret environment variable is not valid Unicode: {0}")]
     InvalidSecret(String),
     #[error(transparent)]
-    Semantics(#[from] locus_semantics_hf::HuggingFaceSemanticsError),
+    ModelIoProfile(#[from] locus_model_io::hf::HuggingFaceModelIoError),
     #[error(transparent)]
-    SemanticRegistry(#[from] locus_semantics::SemanticError),
+    ModelIoRegistry(#[from] locus_model_io::ModelIoError),
     #[error(transparent)]
     Engine(#[from] locus_engine::EngineError),
     #[error(transparent)]

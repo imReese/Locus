@@ -1,17 +1,18 @@
-# Model Semantics
+# Model I/O
 
 ## Status
 
-This document defines the model-semantic layer. The Rust implementation now
-contains `ModelRegistry`, `SemanticRequest`, `ModelSemantics`, an output-pipeline
-factory, typed `SemanticEvent`s, function-call aggregation, reasoning events,
-and JSON structured-output validation. `locus-semantics-hf` now loads an exact
-Hugging Face `tokenizer.json`, renders a pinned chat template with bounded
+This document defines the model I/O layer. The Rust implementation now
+contains `ModelRegistry`, `ModelRequest`, `ModelIo`, an output-pipeline
+factory, typed `ModelEvent`s, function-call aggregation, reasoning events,
+and JSON structured-output validation. Its `hf` module loads an exact Hugging
+Face `tokenizer.json`, renders a pinned chat template with bounded
 MiniJinja, decodes through the same tokenizer, and derives tokenizer/template
 identities from SHA-256 content digests. Production profiles can bind strict
-tagged-reasoning and tagged-JSON tool parsers; parser revisions, delimiters, and
-limits participate in output identities and the umbrella fingerprint.
-`SemanticInput` also carries raw text or caller-tokenized prompts for the legacy
+tagged-reasoning and tagged-JSON tool parsers from `locus-parser`; parser
+revisions, delimiters, and limits participate in output identities and the
+umbrella fingerprint.
+`ModelInput` also carries raw text or caller-tokenized prompts for the legacy
 Completions API. Those inputs bypass the chat template and use a distinct
 `locus-raw-prompt` input-semantic identity.
 `ByteTokenizer`, `ByteDecoder`, and `SimpleTemplateRenderer` remain deterministic
@@ -20,7 +21,7 @@ dialects remain future work.
 
 ## Purpose
 
-Model semantics turn an application request into engine-executable input and
+Model I/O turns an application request into engine-executable input and
 turn engine output into application-visible meaning. Centralizing these rules
 keeps behavior consistent when a request is placed on a different compatible
 engine.
@@ -97,34 +98,34 @@ Rust API:
 pub trait TokenizerProvider: Send + Sync {
     fn identity(&self) -> &TokenizerIdentity;
     fn encode(&self, input: &str, options: EncodeOptions)
-        -> Result<TokenSequence, SemanticError>;
+        -> Result<TokenSequence, ModelIoError>;
     fn decoder(&self, options: DecodeOptions)
-        -> Result<Box<dyn IncrementalDecoder>, SemanticError>;
+        -> Result<Box<dyn IncrementalDecoder>, ModelIoError>;
 }
 
 pub trait TemplateRenderer: Send + Sync {
     fn identity(&self) -> &TemplateIdentity;
     fn render(&self, conversation: &Conversation, context: &TemplateContext)
-        -> Result<RenderedPrompt, SemanticError>;
+        -> Result<RenderedPrompt, ModelIoError>;
 }
 
-pub trait ModelSemantics: Send + Sync {
+pub trait ModelIo: Send + Sync {
     fn identity(&self) -> &SemanticIdentity;
-    fn normalize(&self, request: SemanticRequest)
-        -> Result<NormalizedRequest, SemanticError>;
+    fn normalize(&self, request: ModelRequest)
+        -> Result<NormalizedRequest, ModelIoError>;
     fn output_pipeline(&self, contract: &OutputContract)
-        -> Result<OutputPipeline, SemanticError>;
+        -> Result<OutputPipeline, ModelIoError>;
 }
 ```
 
 Reasoning and tool parsers are factories that create request-scoped,
 incremental parser state. Multimodal normalizers follow the same narrow-provider
-pattern. A composed `ModelSemantics` service coordinates them but does not hide
+pattern. A composed `ModelIo` service coordinates them but does not hide
 their identities from compatibility checks.
 
 ## Input normalization pipeline
 
-The semantic pipeline follows a deterministic order:
+The model I/O pipeline follows a deterministic order:
 
 1. **Protocol-independent validation.** Check the input mode, conversation
    roles, tool schemas, media counts, generation limits, and mutually exclusive
@@ -151,8 +152,8 @@ source or private deployment data.
 
 ## Raw prompts
 
-`SemanticInput::Prompt` represents either text or one token-ID sequence. Text is
-encoded directly with the pinned tokenizer. Token IDs cross the semantic layer
+`ModelInput::Prompt` represents either text or one token-ID sequence. Text is
+encoded directly with the pinned tokenizer. Token IDs cross the model I/O layer
 unchanged and are labeled with that tokenizer fingerprint. Neither form invokes
 `TemplateRenderer`, adds chat roles, or emits a generation marker.
 
@@ -258,14 +259,14 @@ engine finish fact -----------------------> semantic finish normalization
                                           -> northbound protocol adapter
 ```
 
-Engines report execution facts. `ModelSemantics` derives application meaning.
+Engines report execution facts. `ModelIo` derives application meaning.
 An `EngineFinishReason` contains facts such as stop, length, cancellation,
 error, or a namespaced runtime-specific reason. A separate
-`SemanticFinishReason` may identify a tool call, content filtering, reasoning
+`ModelFinishReason` may identify a tool call, content filtering, reasoning
 outcome, or another northbound meaning after the output pipeline has observed
 the complete semantic context.
 
-An engine may optionally provide structured semantic events through an
+An engine may optionally provide structured model events through an
 explicit capability. Locus consumes them only when the model profile and
 adapter declare compatible semantics; adapters do not infer application finish
 reasons by default.

@@ -19,7 +19,7 @@ axum.workspace = true
 futures.workspace = true
 locus-engine = { path = "../engine" }
 locus-runtime = { path = "../runtime" }
-locus-semantics = { path = "../semantics" }
+locus-model-io = { path = "../model-io" }
 tokio.workspace = true
 
 [lints]

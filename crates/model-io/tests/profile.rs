@@ -4,15 +4,12 @@ use ahash::AHashMap;
 use locus_core::{
     EngineEvent, EngineFinishReason, InputItemValue, ModelExecutionIdentity, RequestId, Usage,
 };
-use locus_semantics::{
-    Conversation, ConversationMessage, ConversationRole, PromptInput, ReasoningEffort,
-    SemanticEvent, SemanticFinishReason, SemanticInput, SemanticRequest, ToolChoice,
-    ToolDefinition,
+use locus_model_io::hf::{HuggingFaceProfileSpec, load_huggingface_model_io};
+use locus_model_io::{
+    Conversation, ConversationMessage, ConversationRole, ModelEvent, ModelFinishReason, ModelInput,
+    ModelRequest, PromptInput, ReasoningEffort, ToolChoice, ToolDefinition,
 };
-use locus_semantics_hf::{
-    HuggingFaceProfileSpec, TaggedJsonToolParserSpec, TaggedReasoningParserSpec,
-    load_huggingface_semantics,
-};
+use locus_parser::{TaggedJsonToolParserSpec, TaggedReasoningParserSpec};
 use serde_json::json;
 use tempfile::tempdir;
 use tokenizers::Tokenizer;
@@ -80,19 +77,19 @@ fn tool() -> ToolDefinition {
 #[test]
 fn production_profile_renders_and_tokenizes_once_with_content_identities() {
     let (_directory, spec) = write_fixture();
-    let semantics = load_huggingface_semantics(spec).expect("load profile");
-    let normalized = semantics
+    let model_io = load_huggingface_model_io(spec).expect("load profile");
+    let normalized = model_io
         .normalize(
-            &SemanticRequest {
+            &ModelRequest {
                 model: "fixture".to_owned(),
-                input: SemanticInput::Conversation(Conversation {
+                input: ModelInput::Conversation(Conversation {
                     messages: vec![ConversationMessage {
                         role: ConversationRole::User,
                         content: "hello".to_owned(),
                         tool_call_id: None,
                     }],
                 }),
-                ..SemanticRequest::default()
+                ..ModelRequest::default()
             },
             RequestId::new("request-1"),
         )
@@ -132,17 +129,17 @@ fn production_profile_renders_and_tokenizes_once_with_content_identities() {
 #[test]
 fn raw_text_and_token_prompts_bypass_the_chat_template_with_distinct_identity() {
     let (_directory, spec) = write_fixture();
-    let semantics = load_huggingface_semantics(spec).expect("load profile");
-    let text = semantics
+    let model_io = load_huggingface_model_io(spec).expect("load profile");
+    let text = model_io
         .normalize(
-            &SemanticRequest {
+            &ModelRequest {
                 model: "fixture".to_owned(),
-                input: SemanticInput::Prompt(PromptInput::Text("hello".to_owned())),
+                input: ModelInput::Prompt(PromptInput::Text("hello".to_owned())),
                 sampling: locus_core::SamplingParameters {
                     stop_sequences: vec!["END".to_owned()],
                     ..locus_core::SamplingParameters::default()
                 },
-                ..SemanticRequest::default()
+                ..ModelRequest::default()
             },
             RequestId::new("request-raw-text"),
         )
@@ -173,12 +170,12 @@ fn raw_text_and_token_prompts_bypass_the_chat_template_with_distinct_identity() 
         vec!["END".to_owned()]
     );
 
-    let tokens = semantics
+    let tokens = model_io
         .normalize(
-            &SemanticRequest {
+            &ModelRequest {
                 model: "fixture".to_owned(),
-                input: SemanticInput::Prompt(PromptInput::TokenIds(vec![91, 92])),
-                ..SemanticRequest::default()
+                input: ModelInput::Prompt(PromptInput::TokenIds(vec![91, 92])),
+                ..ModelRequest::default()
             },
             RequestId::new("request-raw-tokens"),
         )
@@ -210,12 +207,12 @@ fn profile_bound_parsers_render_tools_and_emit_typed_events_from_fragmented_text
         end_delimiter: "</tool_call>".to_owned(),
         max_buffered_bytes: 4096,
     });
-    let semantics = load_huggingface_semantics(spec).expect("load parser profile");
-    let normalized = semantics
+    let model_io = load_huggingface_model_io(spec).expect("load parser profile");
+    let normalized = model_io
         .normalize(
-            &SemanticRequest {
+            &ModelRequest {
                 model: "fixture".to_owned(),
-                input: SemanticInput::Conversation(Conversation {
+                input: ModelInput::Conversation(Conversation {
                     messages: vec![ConversationMessage {
                         role: ConversationRole::User,
                         content: "hello".to_owned(),
@@ -225,7 +222,7 @@ fn profile_bound_parsers_render_tools_and_emit_typed_events_from_fragmented_text
                 tools: vec![tool()],
                 tool_choice: ToolChoice::Required,
                 reasoning_effort: Some(ReasoningEffort::High),
-                ..SemanticRequest::default()
+                ..ModelRequest::default()
             },
             RequestId::new("request-parser"),
         )
@@ -260,7 +257,7 @@ fn profile_bound_parsers_render_tools_and_emit_typed_events_from_fragmented_text
     assert!(!normalized.canonical.requirements.requires_reasoning_deltas);
     assert!(!normalized.canonical.requirements.requires_tool_calls);
 
-    let mut pipeline = semantics
+    let mut pipeline = model_io
         .output_pipeline(&normalized.output_contract)
         .expect("output pipeline");
     let request_id = RequestId::new("request-parser");
@@ -298,28 +295,28 @@ fn profile_bound_parsers_render_tools_and_emit_typed_events_from_fragmented_text
     let reasoning = events
         .iter()
         .filter_map(|event| match event {
-            SemanticEvent::ReasoningDelta { text, .. } => Some(text.as_str()),
+            ModelEvent::ReasoningDelta { text, .. } => Some(text.as_str()),
             _ => None,
         })
         .collect::<String>();
     assert_eq!(reasoning, "checked constraints");
     assert!(!events.iter().any(
-        |event| matches!(event, SemanticEvent::TextDelta { text, .. } if text.contains("think") || text.contains("tool_call"))
+        |event| matches!(event, ModelEvent::TextDelta { text, .. } if text.contains("think") || text.contains("tool_call"))
     ));
     assert!(events.iter().any(|event| matches!(
         event,
-        SemanticEvent::ToolCallStarted { call_id, name, .. }
+        ModelEvent::ToolCallStarted { call_id, name, .. }
             if call_id == "call_request-parser_0" && name == "weather"
     )));
     assert!(events.iter().any(|event| matches!(
         event,
-        SemanticEvent::ToolCallCompleted { arguments, .. }
+        ModelEvent::ToolCallCompleted { arguments, .. }
             if arguments == "{\"city\":\"Beijing\"}"
     )));
     assert!(matches!(
         events.last(),
-        Some(SemanticEvent::Finished {
-            reason: SemanticFinishReason::ToolCall,
+        Some(ModelEvent::Finished {
+            reason: ModelFinishReason::ToolCall,
             ..
         })
     ));
@@ -339,8 +336,8 @@ fn parser_configuration_changes_output_and_umbrella_fingerprints() {
         .as_mut()
         .expect("reasoning parser")
         .end_delimiter = "</reasoning>".to_owned();
-    let first = load_huggingface_semantics(first).expect("first profile");
-    let second = load_huggingface_semantics(second).expect("second profile");
+    let first = load_huggingface_model_io(first).expect("first profile");
+    let second = load_huggingface_model_io(second).expect("second profile");
     assert_ne!(
         first
             .profile()
@@ -369,7 +366,7 @@ fn parser_configuration_changes_output_and_umbrella_fingerprints() {
 fn malformed_template_is_rejected_at_profile_load() {
     let (_directory, spec) = write_fixture();
     std::fs::write(&spec.chat_template, "{% if messages %}").expect("write bad template");
-    let error = match load_huggingface_semantics(spec) {
+    let error = match load_huggingface_model_io(spec) {
         Ok(_) => panic!("malformed template must fail"),
         Err(error) => error,
     };
@@ -381,7 +378,7 @@ fn reserved_template_context_is_rejected() {
     let (_directory, mut spec) = write_fixture();
     spec.template_context
         .insert("messages".to_owned(), json!([]));
-    let error = match load_huggingface_semantics(spec) {
+    let error = match load_huggingface_model_io(spec) {
         Ok(_) => panic!("reserved context must fail"),
         Err(error) => error,
     };

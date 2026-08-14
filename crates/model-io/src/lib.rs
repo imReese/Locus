@@ -6,14 +6,13 @@ use locus_core::{
     InputItem, InputItemId, InputItemValue, ModelExecutionIdentity, RequestId, SamplingParameters,
     SemanticComponentIdentity, SemanticIdentity, TokenSequence, TypedMetadata, Usage,
 };
+use locus_parser::{
+    ParserError, ReasoningSegment, TaggedJsonToolParserDefinition, TaggedJsonToolParserState,
+    TaggedReasoningParserDefinition, TaggedReasoningParserState, ToolSegment,
+};
 use thiserror::Error;
 
-mod output_parser;
-
-use output_parser::{
-    ReasoningSegment, TaggedJsonToolParserState, TaggedReasoningParserState, ToolSegment,
-};
-pub use output_parser::{TaggedJsonToolParserDefinition, TaggedReasoningParserDefinition};
+pub mod hf;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ModelProfile {
@@ -63,12 +62,12 @@ pub enum PromptInput {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum SemanticInput {
+pub enum ModelInput {
     Conversation(Conversation),
     Prompt(PromptInput),
 }
 
-impl Default for SemanticInput {
+impl Default for ModelInput {
     fn default() -> Self {
         Self::Conversation(Conversation::default())
     }
@@ -123,9 +122,9 @@ impl ReasoningEffort {
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
-pub struct SemanticRequest {
+pub struct ModelRequest {
     pub model: String,
-    pub input: SemanticInput,
+    pub input: ModelInput,
     pub sampling: SamplingParameters,
     pub tools: Vec<ToolDefinition>,
     pub tool_choice: ToolChoice,
@@ -143,7 +142,7 @@ pub struct OutputContract {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct NormalizedSemanticRequest {
+pub struct NormalizedModelRequest {
     pub canonical: CanonicalRequest,
     pub output_contract: OutputContract,
 }
@@ -151,21 +150,21 @@ pub struct NormalizedSemanticRequest {
 pub trait TokenizerProvider: Send + Sync {
     fn identity(&self) -> &SemanticComponentIdentity;
 
-    fn encode(&self, input: &str) -> Result<TokenSequence, SemanticError>;
+    fn encode(&self, input: &str) -> Result<TokenSequence, ModelIoError>;
 }
 
 pub trait TokenDecoder: Send + Sync {
-    fn decode(&self, token_ids: &[u32]) -> Result<String, SemanticError>;
+    fn decode(&self, token_ids: &[u32]) -> Result<String, ModelIoError>;
 }
 
 pub trait TemplateRenderer: Send + Sync {
     fn identity(&self) -> &SemanticComponentIdentity;
 
-    fn render(&self, request: &SemanticRequest) -> Result<String, SemanticError>;
+    fn render(&self, request: &ModelRequest) -> Result<String, ModelIoError>;
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum SemanticFinishReason {
+pub enum ModelFinishReason {
     Stop,
     Length,
     ToolCall,
@@ -176,7 +175,7 @@ pub enum SemanticFinishReason {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum SemanticEvent {
+pub enum ModelEvent {
     Accepted {
         request_id: RequestId,
     },
@@ -210,28 +209,28 @@ pub enum SemanticEvent {
     },
     Finished {
         request_id: RequestId,
-        reason: SemanticFinishReason,
+        reason: ModelFinishReason,
         usage: Usage,
     },
 }
 
-pub trait SemanticOutputPipeline: Send {
-    fn process(&mut self, event: EngineEvent) -> Result<Vec<SemanticEvent>, SemanticError>;
+pub trait ModelOutputPipeline: Send {
+    fn process(&mut self, event: EngineEvent) -> Result<Vec<ModelEvent>, ModelIoError>;
 }
 
-pub trait ModelSemantics: Send + Sync {
+pub trait ModelIo: Send + Sync {
     fn profile(&self) -> &ModelProfile;
 
     fn normalize(
         &self,
-        request: &SemanticRequest,
+        request: &ModelRequest,
         request_id: RequestId,
-    ) -> Result<NormalizedSemanticRequest, SemanticError>;
+    ) -> Result<NormalizedModelRequest, ModelIoError>;
 
     fn output_pipeline(
         &self,
         contract: &OutputContract,
-    ) -> Result<Box<dyn SemanticOutputPipeline>, SemanticError>;
+    ) -> Result<Box<dyn ModelOutputPipeline>, ModelIoError>;
 }
 
 /// Resolves public model names to immutable semantic profiles.
@@ -240,9 +239,9 @@ pub trait ModelSemantics: Send + Sync {
 /// normalize a model does not imply that an execution target is currently
 /// available for it.
 pub trait ModelCatalog: Send + Sync {
-    fn resolve(&self, alias: &str) -> Result<Arc<dyn ModelSemantics>, SemanticError>;
+    fn resolve(&self, alias: &str) -> Result<Arc<dyn ModelIo>, ModelIoError>;
 
-    fn profiles(&self) -> Result<Vec<ModelProfile>, SemanticError>;
+    fn profiles(&self) -> Result<Vec<ModelProfile>, ModelIoError>;
 }
 
 #[derive(Clone, Default)]
@@ -252,7 +251,7 @@ pub struct ModelRegistry {
 
 #[derive(Default)]
 struct ModelRegistryInner {
-    aliases: BTreeMap<String, Arc<dyn ModelSemantics>>,
+    aliases: BTreeMap<String, Arc<dyn ModelIo>>,
     profiles: BTreeMap<String, ModelProfile>,
 }
 
@@ -262,46 +261,46 @@ impl ModelRegistry {
         Self::default()
     }
 
-    pub fn register(&self, semantics: Arc<dyn ModelSemantics>) -> Result<(), SemanticError> {
-        let profile = semantics.profile().clone();
+    pub fn register(&self, model_io: Arc<dyn ModelIo>) -> Result<(), ModelIoError> {
+        let profile = model_io.profile().clone();
         let primary = profile
             .public_aliases
             .first()
-            .ok_or_else(|| SemanticError::InvalidInput("model has no public alias".to_owned()))?
+            .ok_or_else(|| ModelIoError::InvalidInput("model has no public alias".to_owned()))?
             .clone();
         let mut inner = self
             .inner
             .write()
-            .map_err(|_| SemanticError::Processing("model registry lock poisoned".to_owned()))?;
+            .map_err(|_| ModelIoError::Processing("model registry lock poisoned".to_owned()))?;
         for alias in &profile.public_aliases {
             if inner.aliases.contains_key(alias) {
-                return Err(SemanticError::InvalidInput(format!(
+                return Err(ModelIoError::InvalidInput(format!(
                     "model alias is already registered: {alias}"
                 )));
             }
         }
         for alias in &profile.public_aliases {
-            inner.aliases.insert(alias.clone(), Arc::clone(&semantics));
+            inner.aliases.insert(alias.clone(), Arc::clone(&model_io));
         }
         inner.profiles.insert(primary, profile);
         Ok(())
     }
 
-    pub fn resolve(&self, alias: &str) -> Result<Arc<dyn ModelSemantics>, SemanticError> {
+    pub fn resolve(&self, alias: &str) -> Result<Arc<dyn ModelIo>, ModelIoError> {
         self.inner
             .read()
-            .map_err(|_| SemanticError::Processing("model registry lock poisoned".to_owned()))?
+            .map_err(|_| ModelIoError::Processing("model registry lock poisoned".to_owned()))?
             .aliases
             .get(alias)
             .cloned()
-            .ok_or_else(|| SemanticError::ModelNotFound(alias.to_owned()))
+            .ok_or_else(|| ModelIoError::ModelNotFound(alias.to_owned()))
     }
 
-    pub fn profiles(&self) -> Result<Vec<ModelProfile>, SemanticError> {
+    pub fn profiles(&self) -> Result<Vec<ModelProfile>, ModelIoError> {
         Ok(self
             .inner
             .read()
-            .map_err(|_| SemanticError::Processing("model registry lock poisoned".to_owned()))?
+            .map_err(|_| ModelIoError::Processing("model registry lock poisoned".to_owned()))?
             .profiles
             .values()
             .cloned()
@@ -310,16 +309,16 @@ impl ModelRegistry {
 }
 
 impl ModelCatalog for ModelRegistry {
-    fn resolve(&self, alias: &str) -> Result<Arc<dyn ModelSemantics>, SemanticError> {
+    fn resolve(&self, alias: &str) -> Result<Arc<dyn ModelIo>, ModelIoError> {
         Self::resolve(self, alias)
     }
 
-    fn profiles(&self) -> Result<Vec<ModelProfile>, SemanticError> {
+    fn profiles(&self) -> Result<Vec<ModelProfile>, ModelIoError> {
         Self::profiles(self)
     }
 }
 
-pub struct BasicModelSemantics {
+pub struct BasicModelIo {
     profile: ModelProfile,
     tokenizer: Arc<dyn TokenizerProvider>,
     template: Arc<dyn TemplateRenderer>,
@@ -328,7 +327,7 @@ pub struct BasicModelSemantics {
     tool_parser: Option<TaggedJsonToolParserDefinition>,
 }
 
-impl BasicModelSemantics {
+impl BasicModelIo {
     #[must_use]
     pub fn new(
         profile: ModelProfile,
@@ -350,7 +349,7 @@ impl BasicModelSemantics {
         mut self,
         reasoning_parser: Option<TaggedReasoningParserDefinition>,
         tool_parser: Option<TaggedJsonToolParserDefinition>,
-    ) -> Result<Self, SemanticError> {
+    ) -> Result<Self, ModelIoError> {
         validate_parser_identity(
             "reasoning",
             self.profile
@@ -379,30 +378,30 @@ fn validate_parser_identity(
     kind: &str,
     profile: Option<&SemanticComponentIdentity>,
     parser: Option<&SemanticComponentIdentity>,
-) -> Result<(), SemanticError> {
+) -> Result<(), ModelIoError> {
     if profile != parser {
-        return Err(SemanticError::InvalidInput(format!(
+        return Err(ModelIoError::InvalidInput(format!(
             "{kind} parser definition does not match the model profile identity"
         )));
     }
     Ok(())
 }
 
-impl ModelSemantics for BasicModelSemantics {
+impl ModelIo for BasicModelIo {
     fn profile(&self) -> &ModelProfile {
         &self.profile
     }
 
     fn normalize(
         &self,
-        request: &SemanticRequest,
+        request: &ModelRequest,
         request_id: RequestId,
-    ) -> Result<NormalizedSemanticRequest, SemanticError> {
+    ) -> Result<NormalizedModelRequest, ModelIoError> {
         validate_tool_contract(request)?;
         let (tokens, semantic_identity) = match &request.input {
-            SemanticInput::Conversation(conversation) => {
+            ModelInput::Conversation(conversation) => {
                 if conversation.messages.is_empty() {
-                    return Err(SemanticError::InvalidInput(
+                    return Err(ModelIoError::InvalidInput(
                         "conversation must contain at least one message".to_owned(),
                     ));
                 }
@@ -412,7 +411,7 @@ impl ModelSemantics for BasicModelSemantics {
                     self.profile.semantic_identity.clone(),
                 )
             }
-            SemanticInput::Prompt(prompt) => {
+            ModelInput::Prompt(prompt) => {
                 validate_prompt_contract(request)?;
                 let tokens = match prompt {
                     PromptInput::Text(text) => self.tokenizer.encode(text)?,
@@ -447,7 +446,7 @@ impl ModelSemantics for BasicModelSemantics {
         requirements.requires_tool_calls = !request.tools.is_empty() && self.tool_parser.is_none();
         requirements.requires_structured_output =
             !matches!(request.response_format, ResponseFormat::Text);
-        Ok(NormalizedSemanticRequest {
+        Ok(NormalizedModelRequest {
             canonical: CanonicalRequest {
                 id: request_id,
                 model: self.profile.model.clone(),
@@ -463,7 +462,7 @@ impl ModelSemantics for BasicModelSemantics {
     fn output_pipeline(
         &self,
         contract: &OutputContract,
-    ) -> Result<Box<dyn SemanticOutputPipeline>, SemanticError> {
+    ) -> Result<Box<dyn ModelOutputPipeline>, ModelIoError> {
         Ok(Box::new(BasicOutputPipeline {
             decoder: Arc::clone(&self.decoder),
             contract: contract.clone(),
@@ -483,21 +482,21 @@ impl ModelSemantics for BasicModelSemantics {
     }
 }
 
-fn validate_prompt_contract(request: &SemanticRequest) -> Result<(), SemanticError> {
+fn validate_prompt_contract(request: &ModelRequest) -> Result<(), ModelIoError> {
     if !request.tools.is_empty()
         || !matches!(request.tool_choice, ToolChoice::Auto | ToolChoice::None)
     {
-        return Err(SemanticError::Unsupported(
+        return Err(ModelIoError::Unsupported(
             "raw prompts do not support function tools".to_owned(),
         ));
     }
     if !matches!(request.response_format, ResponseFormat::Text) {
-        return Err(SemanticError::Unsupported(
+        return Err(ModelIoError::Unsupported(
             "raw prompts do not support structured output".to_owned(),
         ));
     }
     if request.reasoning_effort.is_some() {
-        return Err(SemanticError::Unsupported(
+        return Err(ModelIoError::Unsupported(
             "raw prompts do not support reasoning controls".to_owned(),
         ));
     }
@@ -515,7 +514,7 @@ fn raw_prompt_semantic_identity(profile: &SemanticIdentity) -> SemanticIdentity 
     identity
 }
 
-fn contract_annotations(request: &SemanticRequest) -> Result<Vec<TypedMetadata>, SemanticError> {
+fn contract_annotations(request: &ModelRequest) -> Result<Vec<TypedMetadata>, ModelIoError> {
     let mut annotations = Vec::new();
     let mut contract = BTreeMap::new();
     contract.insert(
@@ -541,7 +540,7 @@ fn contract_annotations(request: &SemanticRequest) -> Result<Vec<TypedMetadata>,
             strict,
         } => {
             serde_json::from_str::<serde_json::Value>(schema).map_err(|error| {
-                SemanticError::InvalidInput(format!("invalid JSON schema: {error}"))
+                ModelIoError::InvalidInput(format!("invalid JSON schema: {error}"))
             })?;
             contract.insert("response_format".to_owned(), "json_schema".to_owned());
             contract.insert("json_schema_name".to_owned(), name.clone());
@@ -561,7 +560,7 @@ fn contract_annotations(request: &SemanticRequest) -> Result<Vec<TypedMetadata>,
     });
     for tool in &request.tools {
         serde_json::from_str::<serde_json::Value>(&tool.parameters_schema).map_err(|error| {
-            SemanticError::InvalidInput(format!(
+            ModelIoError::InvalidInput(format!(
                 "invalid parameters schema for tool {}: {error}",
                 tool.name
             ))
@@ -581,41 +580,41 @@ fn contract_annotations(request: &SemanticRequest) -> Result<Vec<TypedMetadata>,
     Ok(annotations)
 }
 
-fn validate_tool_contract(request: &SemanticRequest) -> Result<(), SemanticError> {
+fn validate_tool_contract(request: &ModelRequest) -> Result<(), ModelIoError> {
     let mut names = std::collections::BTreeSet::new();
     for tool in &request.tools {
         if tool.name.trim().is_empty() {
-            return Err(SemanticError::InvalidInput(
+            return Err(ModelIoError::InvalidInput(
                 "tool name must not be empty".to_owned(),
             ));
         }
         let schema = serde_json::from_str::<serde_json::Value>(&tool.parameters_schema).map_err(
             |error| {
-                SemanticError::InvalidInput(format!(
+                ModelIoError::InvalidInput(format!(
                     "invalid parameters schema for tool {}: {error}",
                     tool.name
                 ))
             },
         )?;
         if !schema.is_object() {
-            return Err(SemanticError::InvalidInput(format!(
+            return Err(ModelIoError::InvalidInput(format!(
                 "parameters schema for tool {} must be a JSON object",
                 tool.name
             )));
         }
         if !names.insert(tool.name.as_str()) {
-            return Err(SemanticError::InvalidInput(format!(
+            return Err(ModelIoError::InvalidInput(format!(
                 "duplicate tool name: {}",
                 tool.name
             )));
         }
     }
     match &request.tool_choice {
-        ToolChoice::Required if request.tools.is_empty() => Err(SemanticError::InvalidInput(
+        ToolChoice::Required if request.tools.is_empty() => Err(ModelIoError::InvalidInput(
             "tool_choice required needs at least one tool".to_owned(),
         )),
         ToolChoice::Function(name) if !names.contains(name.as_str()) => {
-            Err(SemanticError::InvalidInput(format!(
+            Err(ModelIoError::InvalidInput(format!(
                 "tool_choice references an unknown function: {name}"
             )))
         }
@@ -634,10 +633,10 @@ struct BasicOutputPipeline {
     next_tool_index: usize,
 }
 
-impl SemanticOutputPipeline for BasicOutputPipeline {
-    fn process(&mut self, event: EngineEvent) -> Result<Vec<SemanticEvent>, SemanticError> {
+impl ModelOutputPipeline for BasicOutputPipeline {
+    fn process(&mut self, event: EngineEvent) -> Result<Vec<ModelEvent>, ModelIoError> {
         let semantic = match event {
-            EngineEvent::Accepted { request_id } => vec![SemanticEvent::Accepted { request_id }],
+            EngineEvent::Accepted { request_id } => vec![ModelEvent::Accepted { request_id }],
             EngineEvent::TokenDelta {
                 request_id,
                 token_ids,
@@ -653,12 +652,12 @@ impl SemanticOutputPipeline for BasicOutputPipeline {
                 request_id, text, ..
             } => {
                 if self.reasoning_parser.is_some() {
-                    return Err(SemanticError::Processing(
+                    return Err(ModelIoError::Processing(
                         "engine emitted native reasoning while a profile parser is selected"
                             .to_owned(),
                     ));
                 }
-                vec![SemanticEvent::ReasoningDelta { request_id, text }]
+                vec![ModelEvent::ReasoningDelta { request_id, text }]
             }
             EngineEvent::ToolCallStarted {
                 request_id,
@@ -667,7 +666,7 @@ impl SemanticOutputPipeline for BasicOutputPipeline {
                 ..
             } => {
                 if self.tool_parser.is_some() {
-                    return Err(SemanticError::Processing(
+                    return Err(ModelIoError::Processing(
                         "engine emitted a native tool call while a profile parser is selected"
                             .to_owned(),
                     ));
@@ -689,7 +688,7 @@ impl SemanticOutputPipeline for BasicOutputPipeline {
                 request_id,
                 usage,
                 final_update,
-            } => vec![SemanticEvent::Usage {
+            } => vec![ModelEvent::Usage {
                 request_id,
                 usage,
                 final_update,
@@ -706,18 +705,18 @@ impl SemanticOutputPipeline for BasicOutputPipeline {
                     EngineFinishReason::RuntimeSpecific { value, .. } if value == "tool_calls"
                 );
                 if runtime_reported_tool_call && !self.saw_tool_call {
-                    return Err(SemanticError::Processing(
+                    return Err(ModelIoError::Processing(
                         "engine reported tool_calls without a completed tool call".to_owned(),
                     ));
                 }
                 let reason = if self.saw_tool_call
                     && (reason == EngineFinishReason::Stop || runtime_reported_tool_call)
                 {
-                    SemanticFinishReason::ToolCall
+                    ModelFinishReason::ToolCall
                 } else {
                     interpret_finish(reason)
                 };
-                events.push(SemanticEvent::Finished {
+                events.push(ModelEvent::Finished {
                     request_id,
                     reason,
                     usage,
@@ -734,7 +733,7 @@ impl BasicOutputPipeline {
         &mut self,
         request_id: RequestId,
         text: String,
-    ) -> Result<Vec<SemanticEvent>, SemanticError> {
+    ) -> Result<Vec<ModelEvent>, ModelIoError> {
         let segments = if let Some(parser) = self.reasoning_parser.as_mut() {
             parser.push(&text)?
         } else {
@@ -747,12 +746,12 @@ impl BasicOutputPipeline {
         &mut self,
         request_id: &RequestId,
         segments: Vec<ReasoningSegment>,
-    ) -> Result<Vec<SemanticEvent>, SemanticError> {
+    ) -> Result<Vec<ModelEvent>, ModelIoError> {
         let mut events = Vec::new();
         for segment in segments {
             match segment {
                 ReasoningSegment::Reasoning(text) => {
-                    events.push(SemanticEvent::ReasoningDelta {
+                    events.push(ModelEvent::ReasoningDelta {
                         request_id: request_id.clone(),
                         text,
                     });
@@ -769,7 +768,7 @@ impl BasicOutputPipeline {
         &mut self,
         request_id: &RequestId,
         text: &str,
-    ) -> Result<Vec<SemanticEvent>, SemanticError> {
+    ) -> Result<Vec<ModelEvent>, ModelIoError> {
         let segments = if let Some(parser) = self.tool_parser.as_mut() {
             parser.push(text)?
         } else {
@@ -780,7 +779,7 @@ impl BasicOutputPipeline {
             match segment {
                 ToolSegment::Text(text) => {
                     self.text.push_str(&text);
-                    events.push(SemanticEvent::TextDelta {
+                    events.push(ModelEvent::TextDelta {
                         request_id: request_id.clone(),
                         text,
                     });
@@ -806,7 +805,7 @@ impl BasicOutputPipeline {
         request_id: RequestId,
         call_id: String,
         name: String,
-    ) -> Result<SemanticEvent, SemanticError> {
+    ) -> Result<ModelEvent, ModelIoError> {
         let requested = self.contract.tools.iter().any(|tool| tool.name == name);
         let selected = match &self.contract.tool_choice {
             ToolChoice::None => false,
@@ -814,18 +813,18 @@ impl BasicOutputPipeline {
             ToolChoice::Auto | ToolChoice::Required => requested,
         };
         if !requested || !selected {
-            return Err(SemanticError::Processing(format!(
+            return Err(ModelIoError::Processing(format!(
                 "engine emitted an unrequested tool call: {name}"
             )));
         }
         if self.tool_arguments.contains_key(&call_id) {
-            return Err(SemanticError::Processing(format!(
+            return Err(ModelIoError::Processing(format!(
                 "engine emitted duplicate tool call id: {call_id}"
             )));
         }
         self.saw_tool_call = true;
         self.tool_arguments.insert(call_id.clone(), String::new());
-        Ok(SemanticEvent::ToolCallStarted {
+        Ok(ModelEvent::ToolCallStarted {
             request_id,
             call_id,
             name,
@@ -837,14 +836,14 @@ impl BasicOutputPipeline {
         request_id: RequestId,
         call_id: String,
         delta: String,
-    ) -> Result<SemanticEvent, SemanticError> {
+    ) -> Result<ModelEvent, ModelIoError> {
         let arguments = self.tool_arguments.get_mut(&call_id).ok_or_else(|| {
-            SemanticError::Processing(format!(
+            ModelIoError::Processing(format!(
                 "tool arguments arrived before the call was started: {call_id}"
             ))
         })?;
         arguments.push_str(&delta);
-        Ok(SemanticEvent::ToolCallArgumentsDelta {
+        Ok(ModelEvent::ToolCallArgumentsDelta {
             request_id,
             call_id,
             delta,
@@ -855,33 +854,30 @@ impl BasicOutputPipeline {
         &mut self,
         request_id: RequestId,
         call_id: String,
-    ) -> Result<SemanticEvent, SemanticError> {
+    ) -> Result<ModelEvent, ModelIoError> {
         let arguments = self.tool_arguments.remove(&call_id).ok_or_else(|| {
-            SemanticError::Processing(format!(
+            ModelIoError::Processing(format!(
                 "tool call completed before it was started: {call_id}"
             ))
         })?;
         let value = serde_json::from_str::<serde_json::Value>(&arguments).map_err(|error| {
-            SemanticError::Processing(format!(
+            ModelIoError::Processing(format!(
                 "tool call {call_id} produced invalid JSON arguments: {error}"
             ))
         })?;
         if !value.is_object() {
-            return Err(SemanticError::Processing(format!(
+            return Err(ModelIoError::Processing(format!(
                 "tool call {call_id} arguments must be a JSON object"
             )));
         }
-        Ok(SemanticEvent::ToolCallCompleted {
+        Ok(ModelEvent::ToolCallCompleted {
             request_id,
             call_id,
             arguments,
         })
     }
 
-    fn finish_parsers(
-        &mut self,
-        request_id: &RequestId,
-    ) -> Result<Vec<SemanticEvent>, SemanticError> {
+    fn finish_parsers(&mut self, request_id: &RequestId) -> Result<Vec<ModelEvent>, ModelIoError> {
         let reasoning = if let Some(parser) = self.reasoning_parser.as_mut() {
             parser.finish()?
         } else {
@@ -897,13 +893,13 @@ impl BasicOutputPipeline {
             match segment {
                 ToolSegment::Text(text) => {
                     self.text.push_str(&text);
-                    events.push(SemanticEvent::TextDelta {
+                    events.push(ModelEvent::TextDelta {
                         request_id: request_id.clone(),
                         text,
                     });
                 }
                 ToolSegment::Call { .. } => {
-                    return Err(SemanticError::Processing(
+                    return Err(ModelIoError::Processing(
                         "tool parser committed a call after finalization".to_owned(),
                     ));
                 }
@@ -912,22 +908,22 @@ impl BasicOutputPipeline {
         Ok(events)
     }
 
-    fn validate_completed_output(&self) -> Result<(), SemanticError> {
+    fn validate_completed_output(&self) -> Result<(), ModelIoError> {
         if matches!(
             self.contract.response_format,
             ResponseFormat::JsonObject | ResponseFormat::JsonSchema { .. }
         ) {
             let value = serde_json::from_str::<serde_json::Value>(&self.text).map_err(|error| {
-                SemanticError::Processing(format!("structured output is not valid JSON: {error}"))
+                ModelIoError::Processing(format!("structured output is not valid JSON: {error}"))
             })?;
             if !value.is_object() {
-                return Err(SemanticError::Processing(
+                return Err(ModelIoError::Processing(
                     "structured output must be a JSON object".to_owned(),
                 ));
             }
         }
         if !self.tool_arguments.is_empty() {
-            return Err(SemanticError::Processing(
+            return Err(ModelIoError::Processing(
                 "engine finished with incomplete tool calls".to_owned(),
             ));
         }
@@ -936,7 +932,7 @@ impl BasicOutputPipeline {
             ToolChoice::Required | ToolChoice::Function(_)
         ) && !self.saw_tool_call
         {
-            return Err(SemanticError::Processing(
+            return Err(ModelIoError::Processing(
                 "engine finished without the required tool call".to_owned(),
             ));
         }
@@ -944,14 +940,14 @@ impl BasicOutputPipeline {
     }
 }
 
-fn interpret_finish(reason: EngineFinishReason) -> SemanticFinishReason {
+fn interpret_finish(reason: EngineFinishReason) -> ModelFinishReason {
     match reason {
-        EngineFinishReason::Stop => SemanticFinishReason::Stop,
-        EngineFinishReason::Length => SemanticFinishReason::Length,
-        EngineFinishReason::Cancelled => SemanticFinishReason::Cancelled,
-        EngineFinishReason::Error => SemanticFinishReason::Error,
+        EngineFinishReason::Stop => ModelFinishReason::Stop,
+        EngineFinishReason::Length => ModelFinishReason::Length,
+        EngineFinishReason::Cancelled => ModelFinishReason::Cancelled,
+        EngineFinishReason::Error => ModelFinishReason::Error,
         EngineFinishReason::RuntimeSpecific { namespace, value } => {
-            SemanticFinishReason::Namespaced { namespace, value }
+            ModelFinishReason::Namespaced { namespace, value }
         }
     }
 }
@@ -973,7 +969,7 @@ impl TokenizerProvider for ByteTokenizer {
         &self.identity
     }
 
-    fn encode(&self, input: &str) -> Result<TokenSequence, SemanticError> {
+    fn encode(&self, input: &str) -> Result<TokenSequence, ModelIoError> {
         Ok(TokenSequence {
             token_ids: input
                 .as_bytes()
@@ -989,17 +985,17 @@ impl TokenizerProvider for ByteTokenizer {
 pub struct ByteDecoder;
 
 impl TokenDecoder for ByteDecoder {
-    fn decode(&self, token_ids: &[u32]) -> Result<String, SemanticError> {
+    fn decode(&self, token_ids: &[u32]) -> Result<String, ModelIoError> {
         let bytes = token_ids
             .iter()
             .map(|token| {
                 u8::try_from(*token).map_err(|_| {
-                    SemanticError::Processing(format!("token {token} is not a byte token"))
+                    ModelIoError::Processing(format!("token {token} is not a byte token"))
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
         String::from_utf8(bytes).map_err(|error| {
-            SemanticError::Processing(format!("token delta is not valid UTF-8: {error}"))
+            ModelIoError::Processing(format!("token delta is not valid UTF-8: {error}"))
         })
     }
 }
@@ -1021,16 +1017,16 @@ impl TemplateRenderer for SimpleTemplateRenderer {
         &self.identity
     }
 
-    fn render(&self, request: &SemanticRequest) -> Result<String, SemanticError> {
-        let SemanticInput::Conversation(conversation) = &request.input else {
-            return Err(SemanticError::InvalidInput(
+    fn render(&self, request: &ModelRequest) -> Result<String, ModelIoError> {
+        let ModelInput::Conversation(conversation) = &request.input else {
+            return Err(ModelIoError::InvalidInput(
                 "chat template requires conversation input".to_owned(),
             ));
         };
         let mut rendered = String::new();
         for message in &conversation.messages {
             if message.content.is_empty() {
-                return Err(SemanticError::InvalidInput(format!(
+                return Err(ModelIoError::InvalidInput(format!(
                     "{} message content must not be empty",
                     message.role.as_str()
                 )));
@@ -1047,15 +1043,24 @@ impl TemplateRenderer for SimpleTemplateRenderer {
 }
 
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
-pub enum SemanticError {
+pub enum ModelIoError {
     #[error("model was not found: {0}")]
     ModelNotFound(String),
-    #[error("invalid semantic input: {0}")]
+    #[error("invalid model input: {0}")]
     InvalidInput(String),
-    #[error("semantic capability is unsupported: {0}")]
+    #[error("model I/O capability is unsupported: {0}")]
     Unsupported(String),
-    #[error("semantic processing failed: {0}")]
+    #[error("model I/O processing failed: {0}")]
     Processing(String),
+}
+
+impl From<ParserError> for ModelIoError {
+    fn from(error: ParserError) -> Self {
+        match error {
+            ParserError::InvalidConfig(message) => Self::InvalidInput(message),
+            ParserError::Processing(message) => Self::Processing(message),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1116,7 +1121,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             &events[0],
-            SemanticEvent::ToolCallCompleted { arguments, .. }
+            ModelEvent::ToolCallCompleted { arguments, .. }
                 if arguments == "{\"city\":\"Beijing\"}"
         ));
     }

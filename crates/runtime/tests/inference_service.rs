@@ -9,17 +9,16 @@ use locus_core::{
     ParallelLayout, RequestId, RuntimeIdentity, SemanticComponentIdentity, SemanticIdentity,
 };
 use locus_engine::{EngineRegistry, FakeEngineAdapter, FakeEngineOutput};
+use locus_model_io::{
+    BasicModelIo, ByteDecoder, ByteTokenizer, Conversation, ConversationMessage, ConversationRole,
+    ModelEvent, ModelProfile, ModelRegistry, ModelRequest, SimpleTemplateRenderer,
+};
 use locus_planner::{
     ACTIVE_CONFIRMATION, CalibrationKey, CalibrationObservation, CalibrationPolicy,
     PersistentCalibrator, PlacementMode,
 };
 use locus_runtime::{
     DefaultInferenceService, InferenceService, PlacementConfigurationError, PlacementControl,
-};
-use locus_semantics::{
-    BasicModelSemantics, ByteDecoder, ByteTokenizer, Conversation, ConversationMessage,
-    ConversationRole, ModelProfile, ModelRegistry, SemanticEvent, SemanticRequest,
-    SimpleTemplateRenderer,
 };
 use locus_state::{NullStateProvider, StateProvider};
 
@@ -63,7 +62,7 @@ fn service(output: FakeEngineOutput) -> (DefaultInferenceService, Arc<FakeEngine
     let (model, semantic_identity) = model_and_semantics();
     let models = ModelRegistry::new();
     models
-        .register(Arc::new(BasicModelSemantics::new(
+        .register(Arc::new(BasicModelIo::new(
             ModelProfile {
                 public_aliases: vec!["test-model".to_owned()],
                 model: model.clone(),
@@ -133,22 +132,22 @@ fn service(output: FakeEngineOutput) -> (DefaultInferenceService, Arc<FakeEngine
     )
 }
 
-fn request() -> SemanticRequest {
-    SemanticRequest {
+fn request() -> ModelRequest {
+    ModelRequest {
         model: "test-model".to_owned(),
-        input: locus_semantics::SemanticInput::Conversation(Conversation {
+        input: locus_model_io::ModelInput::Conversation(Conversation {
             messages: vec![ConversationMessage {
                 role: ConversationRole::User,
                 content: "hello".to_owned(),
                 tool_call_id: None,
             }],
         }),
-        ..SemanticRequest::default()
+        ..ModelRequest::default()
     }
 }
 
 #[tokio::test]
-async fn inference_runs_through_semantics_planner_and_executor() {
+async fn inference_runs_through_model_io_planner_and_executor() {
     let (service, adapter) = service(FakeEngineOutput {
         token_deltas: Vec::new(),
         text_deltas: vec!["hel".to_owned(), "lo".to_owned()],
@@ -160,23 +159,17 @@ async fn inference_runs_through_semantics_planner_and_executor() {
         .expect("start inference")
         .try_collect::<Vec<_>>()
         .await
-        .expect("collect semantic events");
+        .expect("collect model events");
     let text = events
         .iter()
         .filter_map(|event| match event {
-            SemanticEvent::TextDelta { text, .. } => Some(text.as_str()),
+            ModelEvent::TextDelta { text, .. } => Some(text.as_str()),
             _ => None,
         })
         .collect::<String>();
     assert_eq!(text, "hello");
-    assert!(matches!(
-        events.first(),
-        Some(SemanticEvent::Accepted { .. })
-    ));
-    assert!(matches!(
-        events.last(),
-        Some(SemanticEvent::Finished { .. })
-    ));
+    assert!(matches!(events.first(), Some(ModelEvent::Accepted { .. })));
+    assert!(matches!(events.last(), Some(ModelEvent::Finished { .. })));
     assert_eq!(adapter.call_counts().execute, 1);
     assert_eq!(
         service.models().await.expect("models")[0].public_aliases[0],
@@ -185,7 +178,7 @@ async fn inference_runs_through_semantics_planner_and_executor() {
 }
 
 #[tokio::test]
-async fn dropping_semantic_stream_propagates_cancellation_to_engine() {
+async fn dropping_model_event_stream_propagates_cancellation_to_engine() {
     let (service, adapter) = service(FakeEngineOutput::default());
     let stream = service
         .infer(
@@ -265,7 +258,7 @@ async fn qualified_active_placement_selects_the_calibrated_target() {
     let (model, semantic_identity) = model_and_semantics();
     let models = ModelRegistry::new();
     models
-        .register(Arc::new(BasicModelSemantics::new(
+        .register(Arc::new(BasicModelIo::new(
             ModelProfile {
                 public_aliases: vec!["test-model".to_owned()],
                 model: model.clone(),

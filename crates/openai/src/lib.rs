@@ -17,12 +17,12 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use futures::StreamExt;
 use locus_core::{OperationContext, RequestId, SamplingParameters, Usage};
-use locus_runtime::{InferenceError, InferenceService, SemanticEventStream};
-use locus_semantics::{
-    Conversation, ConversationMessage, ConversationRole, PromptInput, ReasoningEffort,
-    ResponseFormat, SemanticError, SemanticEvent, SemanticFinishReason, SemanticInput,
-    SemanticRequest, ToolChoice, ToolDefinition,
+use locus_model_io::{
+    Conversation, ConversationMessage, ConversationRole, ModelEvent, ModelFinishReason, ModelInput,
+    ModelIoError, ModelRequest, PromptInput, ReasoningEffort, ResponseFormat, ToolChoice,
+    ToolDefinition,
 };
+use locus_runtime::{InferenceError, InferenceService, ModelEventStream};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use subtle::ConstantTimeEq;
@@ -353,7 +353,7 @@ struct ReasoningConfig {
 }
 
 impl ResponsesRequest {
-    fn into_semantic(self) -> Result<SemanticRequest, ApiError> {
+    fn into_semantic(self) -> Result<ModelRequest, ApiError> {
         if self
             .reasoning
             .as_ref()
@@ -386,9 +386,9 @@ impl ResponsesRequest {
                 }
             }
         }
-        Ok(SemanticRequest {
+        Ok(ModelRequest {
             model: self.model,
-            input: SemanticInput::Conversation(Conversation { messages }),
+            input: ModelInput::Conversation(Conversation { messages }),
             sampling: SamplingParameters {
                 max_output_tokens: self.max_output_tokens,
                 temperature: self.temperature,
@@ -515,7 +515,7 @@ async fn responses(
 }
 
 async fn collect_response(
-    mut stream: SemanticEventStream,
+    mut stream: ModelEventStream,
     request_id: String,
     model: String,
 ) -> Response {
@@ -529,7 +529,7 @@ async fn collect_response(
     Json(output.response_value(&request_id, &model)).into_response()
 }
 
-fn responses_sse(stream: SemanticEventStream, request_id: String, model: String) -> Response {
+fn responses_sse(stream: ModelEventStream, request_id: String, model: String) -> Response {
     let event_stream = async_stream::stream! {
         let mut stream = stream;
         let mut output = OutputAccumulator::default();
@@ -549,13 +549,13 @@ fn responses_sse(stream: SemanticEventStream, request_id: String, model: String)
                 }
             };
             match &event {
-                SemanticEvent::Accepted { .. } => {
+                ModelEvent::Accepted { .. } => {
                     yield Ok(sse_event("response.created", json!({
                         "type": "response.created",
                         "response": response_shell(&request_id, &model, "in_progress")
                     })));
                 }
-                SemanticEvent::TextDelta { text, .. } => {
+                ModelEvent::TextDelta { text, .. } => {
                     if !text_started {
                         text_started = true;
                         let output_index = next_output_index;
@@ -576,7 +576,7 @@ fn responses_sse(stream: SemanticEventStream, request_id: String, model: String)
                         "output_index": text_output_index, "content_index": 0, "delta": text
                     })));
                 }
-                SemanticEvent::ReasoningDelta { text, .. } => {
+                ModelEvent::ReasoningDelta { text, .. } => {
                     if !reasoning_started {
                         reasoning_started = true;
                         let output_index = next_output_index;
@@ -592,7 +592,7 @@ fn responses_sse(stream: SemanticEventStream, request_id: String, model: String)
                         "item_id": reasoning_id(&request_id), "delta": text
                     })));
                 }
-                SemanticEvent::ToolCallStarted { call_id, name, .. } => {
+                ModelEvent::ToolCallStarted { call_id, name, .. } => {
                     let index = next_output_index;
                     next_output_index += 1;
                     tool_output_indices.insert(call_id.clone(), index);
@@ -602,19 +602,19 @@ fn responses_sse(stream: SemanticEventStream, request_id: String, model: String)
                             "name": name, "arguments": "", "status": "in_progress"}
                     })));
                 }
-                SemanticEvent::ToolCallArgumentsDelta { call_id, delta, .. } => {
+                ModelEvent::ToolCallArgumentsDelta { call_id, delta, .. } => {
                     yield Ok(sse_event("response.function_call_arguments.delta", json!({
                         "type": "response.function_call_arguments.delta", "item_id": call_id,
                         "output_index": tool_output_indices.get(call_id), "delta": delta
                     })));
                 }
-                SemanticEvent::ToolCallCompleted { call_id, arguments, .. } => {
+                ModelEvent::ToolCallCompleted { call_id, arguments, .. } => {
                     yield Ok(sse_event("response.function_call_arguments.done", json!({
                         "type": "response.function_call_arguments.done", "item_id": call_id,
                         "output_index": tool_output_indices.get(call_id), "arguments": arguments
                     })));
                 }
-                SemanticEvent::Finished { .. } => {
+                ModelEvent::Finished { .. } => {
                     if text_started {
                         yield Ok(sse_event("response.output_text.done", json!({
                             "type": "response.output_text.done", "item_id": message_id(&request_id),
@@ -641,10 +641,10 @@ fn responses_sse(stream: SemanticEventStream, request_id: String, model: String)
                         })));
                     }
                 }
-                SemanticEvent::Usage { .. } => {}
+                ModelEvent::Usage { .. } => {}
             }
             output.apply(&event);
-            if matches!(event, SemanticEvent::ToolCallCompleted { .. }) {
+            if matches!(event, ModelEvent::ToolCallCompleted { .. }) {
                 if let Some(tool) = output.tools.last() {
                     yield Ok(sse_event("response.output_item.done", json!({
                         "type": "response.output_item.done", "output_index": tool_output_indices.get(&tool.call_id),
@@ -652,7 +652,7 @@ fn responses_sse(stream: SemanticEventStream, request_id: String, model: String)
                     })));
                 }
             }
-            if matches!(event, SemanticEvent::Finished { .. }) {
+            if matches!(event, ModelEvent::Finished { .. }) {
                 yield Ok(sse_event("response.completed", json!({
                     "type": "response.completed", "response": output.response_value(&request_id, &model)
                 })));
@@ -676,7 +676,7 @@ struct OutputAccumulator {
     tools: Vec<ToolOutput>,
     output_order: Vec<OutputItemKey>,
     usage: Usage,
-    finish: Option<SemanticFinishReason>,
+    finish: Option<ModelFinishReason>,
 }
 
 enum OutputItemKey {
@@ -701,21 +701,21 @@ impl ToolOutput {
 }
 
 impl OutputAccumulator {
-    fn apply(&mut self, event: &SemanticEvent) {
+    fn apply(&mut self, event: &ModelEvent) {
         match event {
-            SemanticEvent::TextDelta { text, .. } => {
+            ModelEvent::TextDelta { text, .. } => {
                 if self.text.is_empty() {
                     self.output_order.push(OutputItemKey::Text);
                 }
                 self.text.push_str(text);
             }
-            SemanticEvent::ReasoningDelta { text, .. } => {
+            ModelEvent::ReasoningDelta { text, .. } => {
                 if self.reasoning.is_empty() {
                     self.output_order.push(OutputItemKey::Reasoning);
                 }
                 self.reasoning.push_str(text);
             }
-            SemanticEvent::ToolCallStarted { call_id, name, .. } => {
+            ModelEvent::ToolCallStarted { call_id, name, .. } => {
                 self.output_order.push(OutputItemKey::Tool(call_id.clone()));
                 self.tools.push(ToolOutput {
                     call_id: call_id.clone(),
@@ -723,29 +723,29 @@ impl OutputAccumulator {
                     arguments: String::new(),
                 });
             }
-            SemanticEvent::ToolCallArgumentsDelta { call_id, delta, .. } => {
+            ModelEvent::ToolCallArgumentsDelta { call_id, delta, .. } => {
                 if let Some(tool) = self.tools.iter_mut().find(|tool| &tool.call_id == call_id) {
                     tool.arguments.push_str(delta);
                 }
             }
-            SemanticEvent::ToolCallCompleted {
+            ModelEvent::ToolCallCompleted {
                 call_id, arguments, ..
             } => {
                 if let Some(tool) = self.tools.iter_mut().find(|tool| &tool.call_id == call_id) {
                     tool.arguments.clone_from(arguments);
                 }
             }
-            SemanticEvent::Usage { usage, .. } => self.usage = usage.clone(),
-            SemanticEvent::Finished { reason, usage, .. } => {
+            ModelEvent::Usage { usage, .. } => self.usage = usage.clone(),
+            ModelEvent::Finished { reason, usage, .. } => {
                 self.finish = Some(reason.clone());
                 self.usage = usage.clone();
             }
-            SemanticEvent::Accepted { .. } => {}
+            ModelEvent::Accepted { .. } => {}
         }
     }
 
     fn response_value(&self, request_id: &str, model: &str) -> Value {
-        let status = if matches!(self.finish, Some(SemanticFinishReason::Length)) {
+        let status = if matches!(self.finish, Some(ModelFinishReason::Length)) {
             "incomplete"
         } else {
             "completed"
@@ -878,7 +878,7 @@ struct CompletionStreamOptions {
 }
 
 impl CompletionRequest {
-    fn into_semantic(self) -> Result<SemanticRequest, ApiError> {
+    fn into_semantic(self) -> Result<ModelRequest, ApiError> {
         if self.n.is_some_and(|n| n != 1) {
             return Err(ApiError::invalid("n", "n must be 1"));
         }
@@ -933,9 +933,9 @@ impl CompletionRequest {
                 "stop sequences must not be empty",
             ));
         }
-        Ok(SemanticRequest {
+        Ok(ModelRequest {
             model: self.model,
-            input: SemanticInput::Prompt(input),
+            input: ModelInput::Prompt(input),
             sampling: SamplingParameters {
                 max_output_tokens: self.max_tokens,
                 temperature: self.temperature,
@@ -984,7 +984,7 @@ async fn completions(
 }
 
 async fn collect_completion(
-    mut stream: SemanticEventStream,
+    mut stream: ModelEventStream,
     request_id: String,
     model: String,
 ) -> Response {
@@ -1013,7 +1013,7 @@ async fn collect_completion(
 }
 
 fn completion_sse(
-    stream: SemanticEventStream,
+    stream: ModelEventStream,
     request_id: String,
     model: String,
     include_usage: bool,
@@ -1030,7 +1030,7 @@ fn completion_sse(
                 }
             };
             match &event {
-                SemanticEvent::TextDelta { text, .. } => {
+                ModelEvent::TextDelta { text, .. } => {
                     yield Ok(completion_chunk(
                         &request_id,
                         &model,
@@ -1043,7 +1043,7 @@ fn completion_sse(
                         Value::Null,
                     ));
                 }
-                SemanticEvent::Finished { reason, .. } => {
+                ModelEvent::Finished { reason, .. } => {
                     yield Ok(completion_chunk(
                         &request_id,
                         &model,
@@ -1056,15 +1056,15 @@ fn completion_sse(
                         Value::Null,
                     ));
                 }
-                SemanticEvent::Accepted { .. }
-                | SemanticEvent::ReasoningDelta { .. }
-                | SemanticEvent::ToolCallStarted { .. }
-                | SemanticEvent::ToolCallArgumentsDelta { .. }
-                | SemanticEvent::ToolCallCompleted { .. }
-                | SemanticEvent::Usage { .. } => {}
+                ModelEvent::Accepted { .. }
+                | ModelEvent::ReasoningDelta { .. }
+                | ModelEvent::ToolCallStarted { .. }
+                | ModelEvent::ToolCallArgumentsDelta { .. }
+                | ModelEvent::ToolCallCompleted { .. }
+                | ModelEvent::Usage { .. } => {}
             }
             output.apply(&event);
-            if matches!(event, SemanticEvent::Finished { .. }) {
+            if matches!(event, ModelEvent::Finished { .. }) {
                 if include_usage {
                     yield Ok(completion_chunk(
                         &request_id,
@@ -1106,11 +1106,11 @@ fn completion_usage_value(usage: &Usage) -> Value {
     })
 }
 
-fn completion_finish_reason(reason: Option<&SemanticFinishReason>) -> &'static str {
+fn completion_finish_reason(reason: Option<&ModelFinishReason>) -> &'static str {
     match reason {
-        Some(SemanticFinishReason::Length) => "length",
-        Some(SemanticFinishReason::ContentFilter) => "content_filter",
-        Some(SemanticFinishReason::Cancelled | SemanticFinishReason::Error) => "error",
+        Some(ModelFinishReason::Length) => "length",
+        Some(ModelFinishReason::ContentFilter) => "content_filter",
+        Some(ModelFinishReason::Cancelled | ModelFinishReason::Error) => "error",
         _ => "stop",
     }
 }
@@ -1188,7 +1188,7 @@ struct ChatJsonSchema {
 }
 
 impl ChatRequest {
-    fn into_semantic(self) -> Result<SemanticRequest, ApiError> {
+    fn into_semantic(self) -> Result<ModelRequest, ApiError> {
         if self.max_tokens.is_some() && self.max_completion_tokens.is_some() {
             return Err(ApiError::invalid(
                 "max_tokens",
@@ -1234,9 +1234,9 @@ impl ChatRequest {
                 strict: json_schema.strict,
             },
         };
-        Ok(SemanticRequest {
+        Ok(ModelRequest {
             model: self.model,
-            input: SemanticInput::Conversation(Conversation { messages }),
+            input: ModelInput::Conversation(Conversation { messages }),
             sampling: SamplingParameters {
                 max_output_tokens: self.max_completion_tokens.or(self.max_tokens),
                 temperature: self.temperature,
@@ -1280,11 +1280,7 @@ async fn chat_completions(
     }
 }
 
-async fn collect_chat(
-    mut stream: SemanticEventStream,
-    request_id: String,
-    model: String,
-) -> Response {
+async fn collect_chat(mut stream: ModelEventStream, request_id: String, model: String) -> Response {
     let mut output = OutputAccumulator::default();
     while let Some(event) = stream.next().await {
         match event {
@@ -1316,7 +1312,7 @@ async fn collect_chat(
     })).into_response()
 }
 
-fn chat_sse(stream: SemanticEventStream, request_id: String, model: String) -> Response {
+fn chat_sse(stream: ModelEventStream, request_id: String, model: String) -> Response {
     let event_stream = async_stream::stream! {
         let mut stream = stream;
         let mut output = OutputAccumulator::default();
@@ -1329,39 +1325,39 @@ fn chat_sse(stream: SemanticEventStream, request_id: String, model: String) -> R
                     break;
                 }
             };
-            if !role_sent && matches!(event, SemanticEvent::Accepted { .. }) {
+            if !role_sent && matches!(event, ModelEvent::Accepted { .. }) {
                 role_sent = true;
                 yield Ok(chat_chunk(&request_id, &model, json!({"role": "assistant", "content": ""}), Value::Null));
             }
             match &event {
-                SemanticEvent::TextDelta { text, .. } => {
+                ModelEvent::TextDelta { text, .. } => {
                     yield Ok(chat_chunk(&request_id, &model, json!({"content": text}), Value::Null));
                 }
-                SemanticEvent::ReasoningDelta { text, .. } => {
+                ModelEvent::ReasoningDelta { text, .. } => {
                     yield Ok(chat_chunk(&request_id, &model, json!({"reasoning_content": text}), Value::Null));
                 }
-                SemanticEvent::ToolCallStarted { call_id, name, .. } => {
+                ModelEvent::ToolCallStarted { call_id, name, .. } => {
                     let index = output.tools.len();
                     yield Ok(chat_chunk(&request_id, &model, json!({"tool_calls": [{
                         "index": index, "id": call_id, "type": "function",
                         "function": {"name": name, "arguments": ""}
                     }]}), Value::Null));
                 }
-                SemanticEvent::ToolCallArgumentsDelta { call_id, delta, .. } => {
+                ModelEvent::ToolCallArgumentsDelta { call_id, delta, .. } => {
                     let index = output.tools.iter().position(|tool| &tool.call_id == call_id).unwrap_or(0);
                     yield Ok(chat_chunk(&request_id, &model, json!({"tool_calls": [{
                         "index": index, "function": {"arguments": delta}
                     }]}), Value::Null));
                 }
-                SemanticEvent::Finished { reason, .. } => {
+                ModelEvent::Finished { reason, .. } => {
                     yield Ok(chat_chunk(&request_id, &model, json!({}), json!(chat_finish_reason(Some(reason)))));
                 }
-                SemanticEvent::Accepted { .. }
-                | SemanticEvent::ToolCallCompleted { .. }
-                | SemanticEvent::Usage { .. } => {}
+                ModelEvent::Accepted { .. }
+                | ModelEvent::ToolCallCompleted { .. }
+                | ModelEvent::Usage { .. } => {}
             }
             output.apply(&event);
-            if matches!(event, SemanticEvent::Finished { .. }) {
+            if matches!(event, ModelEvent::Finished { .. }) {
                 yield Ok(Event::default().data("[DONE]"));
                 break;
             }
@@ -1379,12 +1375,12 @@ fn chat_chunk(request_id: &str, model: &str, delta: Value, finish_reason: Value)
     }).to_string())
 }
 
-fn chat_finish_reason(reason: Option<&SemanticFinishReason>) -> &'static str {
+fn chat_finish_reason(reason: Option<&ModelFinishReason>) -> &'static str {
     match reason {
-        Some(SemanticFinishReason::Length) => "length",
-        Some(SemanticFinishReason::ToolCall) => "tool_calls",
-        Some(SemanticFinishReason::ContentFilter) => "content_filter",
-        Some(SemanticFinishReason::Cancelled | SemanticFinishReason::Error) => "error",
+        Some(ModelFinishReason::Length) => "length",
+        Some(ModelFinishReason::ToolCall) => "tool_calls",
+        Some(ModelFinishReason::ContentFilter) => "content_filter",
+        Some(ModelFinishReason::Cancelled | ModelFinishReason::Error) => "error",
         _ => "stop",
     }
 }
@@ -1478,14 +1474,14 @@ impl IntoResponse for ApiError {
 
 fn api_error_from_inference(error: &InferenceError) -> ApiError {
     match error {
-        InferenceError::Semantic(SemanticError::ModelNotFound(model)) => ApiError::new(
+        InferenceError::ModelIo(ModelIoError::ModelNotFound(model)) => ApiError::new(
             StatusCode::NOT_FOUND,
             format!("model was not found: {model}"),
             "invalid_request_error",
             Some("model"),
             Some("model_not_found"),
         ),
-        InferenceError::Semantic(SemanticError::InvalidInput(message)) => ApiError::new(
+        InferenceError::ModelIo(ModelIoError::InvalidInput(message)) => ApiError::new(
             StatusCode::BAD_REQUEST,
             message,
             "invalid_request_error",

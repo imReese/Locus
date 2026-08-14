@@ -24,19 +24,19 @@ Inference engines should execute model workloads, not repeatedly implement
 application-facing semantics or global placement policy.
 
 Locus is an engine-neutral inference control plane for compute and model-state
-placement. It separates application protocols and model semantics from
+placement. It separates application protocols and model I/O from
 runtime-specific execution, understands execution capabilities and reusable
 state locality, and makes global placement decisions across compute and state.
 
 ## System boundaries
 
 ```text
-Northbound       API and model semantics
+Northbound       API and model I/O
                       |
                       v
 Locus            protocol adaptation
                   validation and normalization
-                  model semantics
+                  model I/O
                   admission and policy
                   global request + state planner
                   plan execution and orchestration
@@ -64,7 +64,7 @@ Pingora type. Integrations depend inward on Locus contracts.
 
 ### Engine-neutral boundary rationale
 
-Using one runtime API as the internal protocol would couple model semantics,
+Using one runtime API as the internal protocol would couple model I/O,
 placement, and errors to that engine. Locus therefore owns canonical request
 and execution-event types, while capability-based adapters translate at the
 edges. This adds translation and conformance-test work, but preserves portable
@@ -126,25 +126,25 @@ decision or allocate engine-local destination memory.
 
 ### Protocol adapters
 
-Protocol adapters translate an external API into an internal semantic request
-and translate normalized output events back to that API. An OpenAI-compatible
+Protocol adapters translate an external API into an internal `ModelRequest`
+and translate normalized `ModelEvent`s back to that API. An OpenAI-compatible
 adapter now implements Responses, Chat Completions, and raw-prompt Completions
 over the same `InferenceService`; it is not the definition of the internal
 model.
 
-### Model semantics
+### Model I/O
 
-`ModelSemantics` composes narrowly scoped providers:
+`ModelIo` composes narrowly scoped providers:
 
 - `TokenizerProvider`
 - `TemplateRenderer`
 - multimodal normalization
-- reasoning and tool-call parser factories
+- reasoning and tool-call parsers supplied by `locus-parser`
 - model-specific validation and defaulting
 
 Semantic components are versioned and selected from a deployment-controlled
 model profile. The same profile is used when evaluating state compatibility.
-See [Model semantics](model-semantics.md).
+See [Model I/O](model-io.md).
 
 ### Admission controller
 
@@ -264,7 +264,8 @@ regardless of concrete Rust module layout:
 | `SemanticIdentity` | Partition input, generation, and output semantics |
 | `TokenizerProvider` | Encode, decode, and expose tokenizer identity |
 | `TemplateRenderer` | Render typed conversations with a versioned template |
-| `ModelSemantics` | Compose model-specific normalization and parser behavior |
+| `ModelIo` | Compose model-specific normalization and parser behavior |
+| `locus-parser` | Parse bounded reasoning and tool-call output streams |
 | `InputBundle` | Carry ordered token, multimodal, metadata, and future inputs |
 | `CanonicalRequest` | Carry normalized engine-executable work |
 | `EngineEvent` | Report ordered engine execution facts |
@@ -295,7 +296,7 @@ types remain at the edges.
    Authentication remains a deployment concern.
 2. Validation checks protocol shape, deployment policy, and declared model
    support.
-3. The selected `ModelSemantics` profile renders conversation templates or
+3. The selected `ModelIo` profile renders conversation templates or
    explicitly bypasses them for a raw prompt, normalizes media, tokenizes input,
    canonicalizes sampling, and declares required output semantics.
 4. A future admission controller may add priority, deadline, and tenant
@@ -314,7 +315,7 @@ types remain at the edges.
 10. `PlanExecutor` submits the canonical request and optional committed
     attachment through the engine adapter.
 11. Engine execution facts flow through detokenization and incremental parsers,
-    which derive semantic events for the northbound adapter.
+    which derive model events for the northbound adapter.
 12. Completion, cancellation, or failure releases reservations and records the
     actual cost and outcome for future estimates.
 

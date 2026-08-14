@@ -13,7 +13,7 @@ futures.workspace = true
 locus-core = { path = "../core" }
 locus-engine = { path = "../engine" }
 locus-planner = { path = "../planner" }
-locus-semantics = { path = "../semantics" }
+locus-model-io = { path = "../model-io" }
 locus-state = { path = "../state" }
 thiserror.workspace = true
 tokio.workspace = true

@@ -258,8 +258,8 @@ Required behavior:
 `EngineFinishReason` reports execution facts such as `stop`, `length`,
 `cancelled`, `error`, or a namespaced runtime-specific reason. It does not
 contain `tool_call`, `tool_boundary`, reasoning, content-filter, or other
-application interpretations by default. `ModelSemantics` consumes token or
-text facts and derives a separate `SemanticFinishReason` for northbound
+application interpretations by default. `ModelIo` consumes token or
+text facts and derives a separate `ModelFinishReason` for northbound
 protocols.
 
 An adapter may expose a capability-gated structured runtime event when an

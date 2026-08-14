@@ -12,6 +12,9 @@ use locus_core::{
     RequestId, StateDescriptor, StateRequirement,
 };
 use locus_engine::{EngineAdapter, EngineError, EngineRegistry};
+use locus_model_io::{
+    ModelCatalog, ModelEvent, ModelIoError, ModelProfile, ModelRegistry, ModelRequest,
+};
 use locus_planner::{
     ACTIVE_CONFIRMATION, CalibrationError, CalibrationKey, CalibrationObservation,
     CalibrationPolicy, CostBasedPlanner, CostBreakdown, DefaultPlanExecutor, ExecutionEstimate,
@@ -20,13 +23,10 @@ use locus_planner::{
     RoutingPolicy, StateObservation, StatePathCandidate, plan_decision_fingerprint,
     plan_fingerprint,
 };
-use locus_semantics::{
-    ModelCatalog, ModelProfile, ModelRegistry, SemanticError, SemanticEvent, SemanticRequest,
-};
 use locus_state::{StateError, StateProvider};
 use thiserror::Error;
 
-pub type SemanticEventStream = BoxStream<'static, Result<SemanticEvent, InferenceError>>;
+pub type ModelEventStream = BoxStream<'static, Result<ModelEvent, InferenceError>>;
 
 const MAX_PLACEMENT_AUDIT_PATHS: usize = 256;
 
@@ -112,9 +112,9 @@ impl TargetDiscovery for EngineTargetDiscovery {
 pub trait InferenceService: Send + Sync {
     async fn infer(
         &self,
-        request: SemanticRequest,
+        request: ModelRequest,
         context: OperationContext,
-    ) -> Result<SemanticEventStream, InferenceError>;
+    ) -> Result<ModelEventStream, InferenceError>;
 
     async fn models(&self) -> Result<Vec<ModelProfile>, InferenceError>;
 
@@ -545,13 +545,13 @@ impl PlacementSelection {
 impl InferenceService for DefaultInferenceService {
     async fn infer(
         &self,
-        request: SemanticRequest,
+        request: ModelRequest,
         context: OperationContext,
-    ) -> Result<SemanticEventStream, InferenceError> {
+    ) -> Result<ModelEventStream, InferenceError> {
         context.ensure_active()?;
-        let semantics = self.catalog.resolve(&request.model)?;
-        let normalized = semantics.normalize(&request, context.request_id.clone())?;
-        let mut pipeline = semantics.output_pipeline(&normalized.output_contract)?;
+        let model_io = self.catalog.resolve(&request.model)?;
+        let normalized = model_io.normalize(&request, context.request_id.clone())?;
+        let mut pipeline = model_io.output_pipeline(&normalized.output_contract)?;
         let planning_input = self
             .planning_input(normalized.canonical.clone(), &context)
             .await?;
@@ -711,12 +711,12 @@ impl InferenceService for DefaultInferenceService {
         }
         let mut missing = Vec::new();
         for alias in &self.required_models {
-            let semantics = self.catalog.resolve(alias).map_err(|error| {
+            let model_io = self.catalog.resolve(alias).map_err(|error| {
                 InferenceError::Discovery(format!(
                     "required model {alias} has no semantic profile: {error}"
                 ))
             })?;
-            if !inventory.ready_models.contains(&semantics.profile().model) {
+            if !inventory.ready_models.contains(&model_io.profile().model) {
                 missing.push(alias.clone());
             }
         }
@@ -1096,7 +1096,7 @@ fn reuse_estimate(state: &StateDescriptor, request: &CanonicalRequest) -> Execut
 }
 
 struct CancelOnDropStream {
-    inner: SemanticEventStream,
+    inner: ModelEventStream,
     request_id: RequestId,
     adapter: Arc<dyn EngineAdapter>,
     completed: bool,
@@ -1104,7 +1104,7 @@ struct CancelOnDropStream {
 
 impl CancelOnDropStream {
     fn new(
-        inner: Pin<Box<dyn Stream<Item = Result<SemanticEvent, InferenceError>> + Send>>,
+        inner: Pin<Box<dyn Stream<Item = Result<ModelEvent, InferenceError>> + Send>>,
         request_id: RequestId,
         adapter: Arc<dyn EngineAdapter>,
     ) -> Self {
@@ -1118,13 +1118,13 @@ impl CancelOnDropStream {
 }
 
 impl Stream for CancelOnDropStream {
-    type Item = Result<SemanticEvent, InferenceError>;
+    type Item = Result<ModelEvent, InferenceError>;
 
     fn poll_next(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let result = self.inner.as_mut().poll_next(context);
         if matches!(
             &result,
-            Poll::Ready(None) | Poll::Ready(Some(Ok(SemanticEvent::Finished { .. })))
+            Poll::Ready(None) | Poll::Ready(Some(Ok(ModelEvent::Finished { .. })))
         ) {
             self.completed = true;
         }
@@ -1153,7 +1153,7 @@ pub enum InferenceError {
     #[error(transparent)]
     Context(#[from] locus_core::ContextError),
     #[error(transparent)]
-    Semantic(#[from] SemanticError),
+    ModelIo(#[from] ModelIoError),
     #[error(transparent)]
     Engine(#[from] EngineError),
     #[error(transparent)]

@@ -20,8 +20,8 @@ stream-close cancellation.
 - `GET /readyz`: gateway routability, explicit required-model gates, and target health
 
 Responses is the primary interface. Chat Completions and Completions are
-compatibility layers: all three translate into `SemanticRequest`, call the same
-`InferenceService`, and shape the same `SemanticEvent` stream. Completions uses
+compatibility layers: all three translate into `ModelRequest`, call the same
+`InferenceService`, and shape the same `ModelEvent` stream. Completions uses
 an explicit raw-prompt input mode, so text is tokenized directly and token IDs
 are preserved; neither form passes through the chat template. No HTTP handler
 constructs planner candidates or invokes an engine adapter directly.
