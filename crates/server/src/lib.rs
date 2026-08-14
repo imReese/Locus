@@ -17,7 +17,8 @@ use locus_core::{
 };
 use locus_engine::{EngineAdapter, EngineRegistry};
 use locus_engine_openai::{
-    RemoteEngineConfig, RemoteExecutionTarget, SglangEngineAdapter, VllmEngineAdapter,
+    RemoteEngineConfig, RemoteExecutionTarget, RemoteTelemetryConfig, SglangEngineAdapter,
+    VllmEngineAdapter,
 };
 use locus_openai::{ApiConfig, router_with_config};
 use locus_runtime::{DefaultInferenceService, InferenceService};
@@ -491,6 +492,7 @@ pub fn build_server(
             api_key: resolve_optional_secret(engine.api_key_env.as_deref())?,
             instance,
             targets,
+            telemetry: RemoteTelemetryConfig::default(),
         };
         let adapter: Arc<dyn EngineAdapter> = match engine.kind {
             EngineKind::Sglang => Arc::new(SglangEngineAdapter::new(remote)?),

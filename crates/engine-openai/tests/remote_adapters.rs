@@ -20,7 +20,8 @@ use locus_core::{
 };
 use locus_engine::EngineAdapter;
 use locus_engine_openai::{
-    RemoteEngineConfig, RemoteExecutionTarget, SglangEngineAdapter, VllmEngineAdapter,
+    RemoteEngineConfig, RemoteExecutionTarget, RemoteTelemetryConfig, SglangEngineAdapter,
+    VllmEngineAdapter,
 };
 use serde_json::{Value, json};
 
@@ -30,6 +31,7 @@ struct Capture {
     aborts: Arc<Mutex<Vec<Value>>>,
     health_calls: Arc<AtomicUsize>,
     models: Arc<Mutex<BTreeSet<String>>>,
+    metrics: Arc<Mutex<String>>,
 }
 
 async fn health(State(capture): State<Capture>) -> &'static str {
@@ -46,6 +48,10 @@ async fn models(State(capture): State<Capture>) -> Json<Value> {
         .map(|id| json!({"id": id, "object": "model"}))
         .collect::<Vec<_>>();
     Json(json!({"object": "list", "data": data}))
+}
+
+async fn metrics(State(capture): State<Capture>) -> String {
+    capture.metrics.lock().expect("metrics lock").clone()
 }
 
 async fn completions(State(capture): State<Capture>, Json(body): Json<Value>) -> Response<Body> {
@@ -77,8 +83,21 @@ async fn server() -> (String, Capture) {
         .lock()
         .expect("models lock")
         .insert("served-model".to_owned());
+    *capture.metrics.lock().expect("metrics lock") = concat!(
+        "sglang:num_running_reqs{model_name=\"served-model\"} 2\n",
+        "sglang:num_queue_reqs{model_name=\"served-model\"} 3\n",
+        "sglang:token_usage{model_name=\"served-model\"} 0.25\n",
+        "sglang:gen_throughput{model_name=\"served-model\"} 40\n",
+        "vllm:num_requests_running{model_name=\"served-model\"} 2\n",
+        "vllm:num_requests_waiting{model_name=\"served-model\"} 3\n",
+        "vllm:kv_cache_usage_perc{model_name=\"served-model\"} 0.25\n",
+        "vllm:prompt_tokens_total{model_name=\"served-model\"} 100\n",
+        "vllm:generation_tokens_total{model_name=\"served-model\"} 50\n",
+    )
+    .to_owned();
     let app = Router::new()
         .route("/health", get(health))
+        .route("/metrics", get(metrics))
         .route("/v1/models", get(models))
         .route("/v1/completions", post(completions))
         .route("/abort_request", post(abort))
@@ -166,6 +185,10 @@ fn config(base_url: String, kind: &str) -> RemoteEngineConfig {
                 capability_revision: "v1".to_owned(),
             },
         }],
+        telemetry: RemoteTelemetryConfig {
+            min_scrape_interval_millis: 1,
+            ..RemoteTelemetryConfig::default()
+        },
     }
 }
 
@@ -231,6 +254,13 @@ async fn assert_completion(
         .await
         .expect("snapshot");
     assert!(snapshot.ready);
+    assert_eq!(
+        snapshot.telemetry_status,
+        locus_core::TelemetryStatus::Fresh
+    );
+    assert_eq!(snapshot.running_requests, Some(2));
+    assert_eq!(snapshot.waiting_requests, Some(3));
+    assert_eq!(snapshot.kv_cache_usage_permyriad, Some(2_500));
     let events = adapter
         .execute(
             &target,
@@ -418,6 +448,134 @@ async fn execution_targets_follow_the_remote_model_inventory() {
         .expect("refreshed targets");
     assert_eq!(refreshed.len(), 1);
     assert_eq!(refreshed[0].model.model_revision, "model-v2");
+}
+
+#[tokio::test]
+async fn malformed_or_required_telemetry_is_not_fabricated_as_zero() {
+    let (base_url, capture) = server().await;
+    *capture.metrics.lock().expect("metrics lock") = "malformed metric".to_owned();
+    let adapter = SglangEngineAdapter::new(config(base_url.clone(), "sglang")).expect("adapter");
+    let target = adapter
+        .execution_targets(&OperationContext::new(RequestId::new("discover-malformed")))
+        .await
+        .expect("targets")
+        .remove(0);
+    let snapshot = adapter
+        .snapshot(
+            &target,
+            &OperationContext::new(RequestId::new("snapshot-malformed")),
+        )
+        .await
+        .expect("health-only snapshot");
+    assert!(snapshot.ready);
+    assert_eq!(
+        snapshot.telemetry_status,
+        locus_core::TelemetryStatus::Unavailable
+    );
+    assert_eq!(snapshot.running_requests, None);
+    assert_eq!(snapshot.waiting_requests, None);
+    assert_eq!(snapshot.estimated_queue_micros, None);
+    assert!(snapshot.degraded_reason.is_some());
+
+    let mut strict = config(base_url, "sglang");
+    strict.telemetry.require_fresh_metrics = true;
+    let strict_adapter = SglangEngineAdapter::new(strict).expect("strict adapter");
+    let strict_target = strict_adapter
+        .execution_targets(&OperationContext::new(RequestId::new("discover-strict")))
+        .await
+        .expect("targets")
+        .remove(0);
+    let strict_snapshot = strict_adapter
+        .snapshot(
+            &strict_target,
+            &OperationContext::new(RequestId::new("snapshot-strict")),
+        )
+        .await
+        .expect("strict snapshot");
+    assert!(!strict_snapshot.ready);
+}
+
+#[tokio::test]
+async fn failed_refresh_preserves_but_marks_expired_telemetry_stale() {
+    let (base_url, capture) = server().await;
+    let mut remote = config(base_url, "sglang");
+    remote.telemetry.valid_for_millis = 1;
+    let adapter = SglangEngineAdapter::new(remote).expect("adapter");
+    let target = adapter
+        .execution_targets(&OperationContext::new(RequestId::new("discover-stale")))
+        .await
+        .expect("targets")
+        .remove(0);
+    let fresh = adapter
+        .snapshot(
+            &target,
+            &OperationContext::new(RequestId::new("snapshot-fresh")),
+        )
+        .await
+        .expect("fresh snapshot");
+    assert_eq!(fresh.telemetry_status, locus_core::TelemetryStatus::Fresh);
+
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    *capture.metrics.lock().expect("metrics lock") = "broken".to_owned();
+    let stale = adapter
+        .snapshot(
+            &target,
+            &OperationContext::new(RequestId::new("snapshot-stale")),
+        )
+        .await
+        .expect("stale snapshot");
+    assert_eq!(stale.telemetry_status, locus_core::TelemetryStatus::Stale);
+    assert_eq!(stale.waiting_requests, Some(3));
+    assert_eq!(
+        stale.telemetry_confidence,
+        locus_core::TelemetryConfidence::Unknown
+    );
+}
+
+#[tokio::test]
+async fn vllm_counter_deltas_produce_version_tolerant_service_rates() {
+    let (base_url, capture) = server().await;
+    let adapter = VllmEngineAdapter::new(config(base_url, "vllm")).expect("adapter");
+    let target = adapter
+        .execution_targets(&OperationContext::new(RequestId::new("discover-rates")))
+        .await
+        .expect("targets")
+        .remove(0);
+    let first = adapter
+        .snapshot(
+            &target,
+            &OperationContext::new(RequestId::new("snapshot-rates-1")),
+        )
+        .await
+        .expect("first snapshot");
+    assert_eq!(first.prefill_tokens_per_second, None);
+    assert_eq!(first.decode_tokens_per_second, None);
+
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    *capture.metrics.lock().expect("metrics lock") = concat!(
+        "vllm_num_requests_running{model_name=\"served-model\"} 1\n",
+        "vllm_num_requests_waiting{model_name=\"served-model\"} 2\n",
+        "vllm_kv_cache_usage_perc{model_name=\"served-model\"} 0.5\n",
+        "vllm_prompt_tokens_total{model_name=\"served-model\"} 200\n",
+        "vllm_generation_tokens_total{model_name=\"served-model\"} 100\n",
+    )
+    .to_owned();
+    let second = adapter
+        .snapshot(
+            &target,
+            &OperationContext::new(RequestId::new("snapshot-rates-2")),
+        )
+        .await
+        .expect("second snapshot");
+    assert!(
+        second
+            .prefill_tokens_per_second
+            .is_some_and(|rate| rate > 0)
+    );
+    assert!(second.decode_tokens_per_second.is_some_and(|rate| rate > 0));
+    assert_eq!(second.running_requests, Some(1));
+    assert_eq!(second.waiting_requests, Some(2));
+    assert_eq!(second.kv_cache_usage_permyriad, Some(5_000));
 }
 
 #[test]

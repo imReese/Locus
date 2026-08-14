@@ -178,9 +178,19 @@ impl EngineAdapter for FakeEngineAdapter {
         Ok(EngineSnapshot {
             target_id: target.id.clone(),
             ready: true,
-            queue_depth: 0,
+            telemetry_status: locus_core::TelemetryStatus::Fresh,
+            telemetry_confidence: locus_core::TelemetryConfidence::High,
+            telemetry_source: "locus.fake.v1".to_owned(),
+            observed_at_unix_millis: 1,
+            valid_until_unix_millis: u64::MAX,
+            running_requests: Some(0),
+            waiting_requests: Some(0),
             estimated_queue_micros: Some(0),
+            kv_cache_usage_permyriad: Some(0),
+            prefill_tokens_per_second: Some(100_000),
+            decode_tokens_per_second: Some(50_000),
             observation_revision: 1,
+            degraded_reason: None,
         })
     }
 

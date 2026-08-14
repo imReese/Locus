@@ -1,4 +1,8 @@
-use std::collections::BTreeSet;
+mod metrics;
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Mutex;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use eventsource_stream::Eventsource;
@@ -6,13 +10,15 @@ use futures::StreamExt;
 use locus_core::{
     CanonicalRequest, EngineCapabilities, EngineEvent, EngineFinishReason, EngineInstance,
     EngineSnapshot, ExecutionTarget, InputItemValue, InputKind, OperationContext,
-    PreparedStateAttachment, RequestId, StateImportSpec, StateImportTarget, TransferReceipt, Usage,
+    PreparedStateAttachment, RequestId, StateImportSpec, StateImportTarget, TelemetryConfidence,
+    TelemetryStatus, TransferReceipt, Usage,
 };
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
 use locus_engine::{EngineAdapter, EngineError, EngineEventStream};
+use metrics::{PrometheusSample, parse_prometheus};
 
 #[derive(Clone, Debug)]
 pub struct RemoteEngineConfig {
@@ -20,6 +26,32 @@ pub struct RemoteEngineConfig {
     pub api_key: Option<String>,
     pub instance: EngineInstance,
     pub targets: Vec<RemoteExecutionTarget>,
+    pub telemetry: RemoteTelemetryConfig,
+}
+
+#[derive(Clone, Debug)]
+pub struct RemoteTelemetryConfig {
+    pub metrics_path: String,
+    pub request_timeout_millis: u64,
+    pub min_scrape_interval_millis: u64,
+    pub valid_for_millis: u64,
+    pub max_response_bytes: usize,
+    pub max_samples: usize,
+    pub require_fresh_metrics: bool,
+}
+
+impl Default for RemoteTelemetryConfig {
+    fn default() -> Self {
+        Self {
+            metrics_path: "/metrics".to_owned(),
+            request_timeout_millis: 2_000,
+            min_scrape_interval_millis: 500,
+            valid_for_millis: 5_000,
+            max_response_bytes: 2 * 1024 * 1024,
+            max_samples: 20_000,
+            require_fresh_metrics: false,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -36,10 +68,51 @@ enum RuntimeFlavor {
     Vllm,
 }
 
+impl RuntimeFlavor {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Sglang => "sglang",
+            Self::Vllm => "vllm",
+        }
+    }
+}
+
 struct RemoteCompletionAdapter {
     config: RemoteEngineConfig,
     flavor: RuntimeFlavor,
     client: Client,
+    telemetry: Mutex<TelemetryState>,
+}
+
+#[derive(Default)]
+struct TelemetryState {
+    revision: u64,
+    cache: Option<CachedTelemetry>,
+    counters: BTreeMap<String, CounterBaseline>,
+}
+
+#[derive(Clone)]
+struct CachedTelemetry {
+    observed_at_unix_millis: u64,
+    revision: u64,
+    targets: BTreeMap<String, TargetTelemetry>,
+}
+
+#[derive(Clone, Default)]
+struct TargetTelemetry {
+    running_requests: Option<u64>,
+    waiting_requests: Option<u64>,
+    estimated_queue_micros: Option<u64>,
+    kv_cache_usage_permyriad: Option<u16>,
+    prefill_tokens_per_second: Option<u64>,
+    decode_tokens_per_second: Option<u64>,
+}
+
+#[derive(Clone)]
+struct CounterBaseline {
+    observed_at_unix_millis: u64,
+    prompt_tokens: Option<f64>,
+    generation_tokens: Option<f64>,
 }
 
 impl RemoteCompletionAdapter {
@@ -52,6 +125,18 @@ impl RemoteCompletionAdapter {
         if config.targets.is_empty() {
             return Err(EngineError::Execution(
                 "remote engine must have at least one model candidate".to_owned(),
+            ));
+        }
+        if config.telemetry.metrics_path.trim().is_empty()
+            || config.telemetry.request_timeout_millis == 0
+            || config.telemetry.min_scrape_interval_millis == 0
+            || config.telemetry.valid_for_millis == 0
+            || config.telemetry.max_response_bytes == 0
+            || config.telemetry.max_samples == 0
+        {
+            return Err(EngineError::Execution(
+                "remote telemetry limits and metrics path must be non-empty and non-zero"
+                    .to_owned(),
             ));
         }
         let mut target_ids = BTreeSet::new();
@@ -84,11 +169,25 @@ impl RemoteCompletionAdapter {
             config,
             flavor,
             client: Client::new(),
+            telemetry: Mutex::new(TelemetryState::default()),
         })
     }
 
     fn endpoint(&self, path: &str) -> String {
         format!("{}{}", self.config.base_url.trim_end_matches('/'), path)
+    }
+
+    fn metrics_endpoint(&self) -> String {
+        if self.config.telemetry.metrics_path.starts_with("http://")
+            || self.config.telemetry.metrics_path.starts_with("https://")
+        {
+            self.config.telemetry.metrics_path.clone()
+        } else {
+            self.endpoint(&format!(
+                "/{}",
+                self.config.telemetry.metrics_path.trim_start_matches('/')
+            ))
+        }
     }
 
     fn target_config(
@@ -218,13 +317,129 @@ impl RemoteCompletionAdapter {
         Ok(targets)
     }
 
+    fn cached_telemetry(
+        &self,
+        served_model: &str,
+        now_unix_millis: u64,
+    ) -> Result<Option<(TargetTelemetry, u64, u64, TelemetryStatus)>, EngineError> {
+        let state = self
+            .telemetry
+            .lock()
+            .map_err(|_| EngineError::Execution("telemetry cache lock poisoned".to_owned()))?;
+        let Some(cache) = &state.cache else {
+            return Ok(None);
+        };
+        let Some(telemetry) = cache.targets.get(served_model).cloned() else {
+            return Ok(None);
+        };
+        let valid_until = cache
+            .observed_at_unix_millis
+            .saturating_add(self.config.telemetry.valid_for_millis);
+        let status =
+            if cache.observed_at_unix_millis <= now_unix_millis && now_unix_millis <= valid_until {
+                TelemetryStatus::Fresh
+            } else {
+                TelemetryStatus::Stale
+            };
+        Ok(Some((
+            telemetry,
+            cache.observed_at_unix_millis,
+            cache.revision,
+            status,
+        )))
+    }
+
+    async fn observe_telemetry(
+        &self,
+        served_model: &str,
+    ) -> Result<(TargetTelemetry, u64, u64), EngineError> {
+        let now_unix_millis = unix_millis()?;
+        if let Some((telemetry, observed_at, revision, _)) =
+            self.cached_telemetry(served_model, now_unix_millis)?
+            && now_unix_millis.saturating_sub(observed_at)
+                < self.config.telemetry.min_scrape_interval_millis
+        {
+            return Ok((telemetry, observed_at, revision));
+        }
+
+        let response =
+            self.authorized(self.client.get(self.metrics_endpoint()).timeout(
+                Duration::from_millis(self.config.telemetry.request_timeout_millis),
+            ))
+            .send()
+            .await
+            .map_err(|error| {
+                EngineError::Execution(format!("telemetry request failed: {error}"))
+            })?;
+        if !response.status().is_success() {
+            return Err(EngineError::Execution(format!(
+                "telemetry endpoint returned {}",
+                response.status()
+            )));
+        }
+        let bytes = response.bytes().await.map_err(|error| {
+            EngineError::Execution(format!("telemetry response read failed: {error}"))
+        })?;
+        if bytes.len() > self.config.telemetry.max_response_bytes {
+            return Err(EngineError::Execution(format!(
+                "telemetry response exceeds the {}-byte limit",
+                self.config.telemetry.max_response_bytes
+            )));
+        }
+        let text = std::str::from_utf8(&bytes).map_err(|error| {
+            EngineError::Execution(format!("telemetry response is not UTF-8: {error}"))
+        })?;
+        let samples = parse_prometheus(text, self.config.telemetry.max_samples)
+            .map_err(|error| EngineError::Execution(format!("invalid telemetry: {error}")))?;
+        let observed_at_unix_millis = unix_millis()?;
+        let mut state = self
+            .telemetry
+            .lock()
+            .map_err(|_| EngineError::Execution("telemetry cache lock poisoned".to_owned()))?;
+        state.revision = state.revision.saturating_add(1);
+        let revision = state.revision;
+        let mut targets = BTreeMap::new();
+        for candidate in &self.config.targets {
+            let counters = metric_counters(self.flavor, &samples, &candidate.served_model);
+            let previous = state.counters.get(&candidate.served_model);
+            let telemetry = target_telemetry(
+                self.flavor,
+                &samples,
+                &candidate.served_model,
+                previous,
+                &counters,
+                observed_at_unix_millis,
+            );
+            state.counters.insert(
+                candidate.served_model.clone(),
+                CounterBaseline {
+                    observed_at_unix_millis,
+                    prompt_tokens: counters.prompt_tokens,
+                    generation_tokens: counters.generation_tokens,
+                },
+            );
+            targets.insert(candidate.served_model.clone(), telemetry);
+        }
+        let result = targets.get(served_model).cloned().ok_or_else(|| {
+            EngineError::Execution(format!(
+                "telemetry has no configured candidate for {served_model}"
+            ))
+        })?;
+        state.cache = Some(CachedTelemetry {
+            observed_at_unix_millis,
+            revision,
+            targets,
+        });
+        Ok((result, observed_at_unix_millis, revision))
+    }
+
     async fn snapshot(
         &self,
         target: &ExecutionTarget,
         context: &OperationContext,
     ) -> Result<EngineSnapshot, EngineError> {
         context.ensure_active()?;
-        self.target_config(target)?;
+        let served_model = self.target_config(target)?.served_model.clone();
         let health_endpoint = self
             .config
             .instance
@@ -236,12 +451,57 @@ impl RemoteCompletionAdapter {
             .send()
             .await
             .map_err(|error| EngineError::Execution(format!("health request failed: {error}")))?;
+        let health_ready = response.status().is_success();
+        let now_unix_millis = unix_millis()?;
+        let (telemetry, observed_at_unix_millis, observation_revision, telemetry_status, reason) =
+            match self.observe_telemetry(&served_model).await {
+                Ok((telemetry, observed_at, revision)) => (
+                    telemetry,
+                    observed_at,
+                    revision,
+                    TelemetryStatus::Fresh,
+                    None,
+                ),
+                Err(error) => match self.cached_telemetry(&served_model, now_unix_millis)? {
+                    Some((telemetry, observed_at, revision, status)) => (
+                        telemetry,
+                        observed_at,
+                        revision,
+                        status,
+                        Some(error.to_string()),
+                    ),
+                    None => (
+                        TargetTelemetry::default(),
+                        now_unix_millis,
+                        0,
+                        TelemetryStatus::Unavailable,
+                        Some(error.to_string()),
+                    ),
+                },
+            };
+        let fresh = telemetry_status == TelemetryStatus::Fresh;
+        let confidence = telemetry.confidence();
         Ok(EngineSnapshot {
             target_id: target.id.clone(),
-            ready: response.status().is_success(),
-            queue_depth: 0,
-            estimated_queue_micros: None,
-            observation_revision: 1,
+            ready: health_ready && (!self.config.telemetry.require_fresh_metrics || fresh),
+            telemetry_status,
+            telemetry_confidence: if fresh {
+                confidence
+            } else {
+                TelemetryConfidence::Unknown
+            },
+            telemetry_source: format!("prometheus:{}", self.flavor.as_str()),
+            observed_at_unix_millis,
+            valid_until_unix_millis: observed_at_unix_millis
+                .saturating_add(self.config.telemetry.valid_for_millis),
+            running_requests: telemetry.running_requests,
+            waiting_requests: telemetry.waiting_requests,
+            estimated_queue_micros: telemetry.estimated_queue_micros,
+            kv_cache_usage_permyriad: telemetry.kv_cache_usage_permyriad,
+            prefill_tokens_per_second: telemetry.prefill_tokens_per_second,
+            decode_tokens_per_second: telemetry.decode_tokens_per_second,
+            observation_revision,
+            degraded_reason: reason,
         })
     }
 
@@ -363,6 +623,224 @@ impl RemoteCompletionAdapter {
         // completion endpoint has no separate public cancellation endpoint to call here.
         Ok(())
     }
+}
+
+impl TargetTelemetry {
+    fn confidence(&self) -> TelemetryConfidence {
+        let scheduler = self.running_requests.is_some() && self.waiting_requests.is_some();
+        let rates =
+            self.prefill_tokens_per_second.is_some() || self.decode_tokens_per_second.is_some();
+        if scheduler && rates {
+            TelemetryConfidence::High
+        } else if scheduler {
+            TelemetryConfidence::Medium
+        } else if rates || self.kv_cache_usage_permyriad.is_some() {
+            TelemetryConfidence::Low
+        } else {
+            TelemetryConfidence::Unknown
+        }
+    }
+}
+
+struct MetricCounters {
+    prompt_tokens: Option<f64>,
+    generation_tokens: Option<f64>,
+}
+
+fn unix_millis() -> Result<u64, EngineError> {
+    let duration = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| {
+            EngineError::Execution(format!("system clock precedes Unix epoch: {error}"))
+        })?;
+    u64::try_from(duration.as_millis())
+        .map_err(|_| EngineError::Execution("system clock exceeds telemetry range".to_owned()))
+}
+
+fn target_telemetry(
+    flavor: RuntimeFlavor,
+    samples: &[PrometheusSample],
+    served_model: &str,
+    previous: Option<&CounterBaseline>,
+    counters: &MetricCounters,
+    observed_at_unix_millis: u64,
+) -> TargetTelemetry {
+    let (running_names, waiting_names, kv_names, direct_decode_names) = match flavor {
+        RuntimeFlavor::Sglang => (
+            &["sglang:num_running_reqs", "sglang_num_running_reqs"][..],
+            &["sglang:num_queue_reqs", "sglang_num_queue_reqs"][..],
+            &[
+                "sglang:token_usage",
+                "sglang_token_usage",
+                "sglang:full_token_usage",
+                "sglang_full_token_usage",
+            ][..],
+            &["sglang:gen_throughput", "sglang_gen_throughput"][..],
+        ),
+        RuntimeFlavor::Vllm => (
+            &["vllm:num_requests_running", "vllm_num_requests_running"][..],
+            &["vllm:num_requests_waiting", "vllm_num_requests_waiting"][..],
+            &[
+                "vllm:kv_cache_usage_perc",
+                "vllm_kv_cache_usage_perc",
+                "vllm:gpu_cache_usage_perc",
+                "vllm_gpu_cache_usage_perc",
+            ][..],
+            &[][..],
+        ),
+    };
+    let direct_queue_seconds = metric_max(
+        samples,
+        &[
+            "locus:estimated_queue_seconds",
+            "sglang:estimated_queue_time_seconds",
+            "vllm:estimated_queue_time_seconds",
+        ],
+        served_model,
+    );
+    let elapsed_millis = previous
+        .map(|baseline| observed_at_unix_millis.saturating_sub(baseline.observed_at_unix_millis));
+    let prefill_rate = counter_rate(
+        counters.prompt_tokens,
+        previous.and_then(|baseline| baseline.prompt_tokens),
+        elapsed_millis,
+    );
+    let decode_rate = metric_sum(samples, direct_decode_names, served_model)
+        .and_then(nonnegative_u64)
+        .or_else(|| {
+            counter_rate(
+                counters.generation_tokens,
+                previous.and_then(|baseline| baseline.generation_tokens),
+                elapsed_millis,
+            )
+        });
+    TargetTelemetry {
+        running_requests: metric_sum(samples, running_names, served_model)
+            .and_then(nonnegative_u64),
+        waiting_requests: metric_sum(samples, waiting_names, served_model)
+            .and_then(nonnegative_u64),
+        estimated_queue_micros: direct_queue_seconds.and_then(seconds_to_micros),
+        kv_cache_usage_permyriad: metric_max(samples, kv_names, served_model)
+            .and_then(ratio_to_permyriad),
+        prefill_tokens_per_second: prefill_rate,
+        decode_tokens_per_second: decode_rate,
+    }
+}
+
+fn metric_counters(
+    flavor: RuntimeFlavor,
+    samples: &[PrometheusSample],
+    served_model: &str,
+) -> MetricCounters {
+    let (prompt_names, generation_names) = match flavor {
+        RuntimeFlavor::Sglang => (
+            &[
+                "sglang:prompt_tokens_total",
+                "sglang_prompt_tokens_total",
+                "sglang:input_tokens_total",
+                "sglang_input_tokens_total",
+            ][..],
+            &[
+                "sglang:generation_tokens_total",
+                "sglang_generation_tokens_total",
+                "sglang:output_tokens_total",
+                "sglang_output_tokens_total",
+            ][..],
+        ),
+        RuntimeFlavor::Vllm => (
+            &[
+                "vllm:prompt_tokens_total",
+                "vllm_prompt_tokens_total",
+                "vllm:prompt_tokens",
+                "vllm_prompt_tokens",
+            ][..],
+            &[
+                "vllm:generation_tokens_total",
+                "vllm_generation_tokens_total",
+                "vllm:generation_tokens",
+                "vllm_generation_tokens",
+            ][..],
+        ),
+    };
+    MetricCounters {
+        prompt_tokens: metric_sum(samples, prompt_names, served_model),
+        generation_tokens: metric_sum(samples, generation_names, served_model),
+    }
+}
+
+fn metric_sum(samples: &[PrometheusSample], names: &[&str], served_model: &str) -> Option<f64> {
+    for name in names {
+        let matching = samples
+            .iter()
+            .filter(|sample| sample.name == *name && sample_matches_model(sample, served_model))
+            .map(|sample| sample.value)
+            .filter(|value| value.is_finite() && *value >= 0.0)
+            .collect::<Vec<_>>();
+        if !matching.is_empty() {
+            return Some(matching.into_iter().sum());
+        }
+    }
+    None
+}
+
+fn metric_max(samples: &[PrometheusSample], names: &[&str], served_model: &str) -> Option<f64> {
+    for name in names {
+        let maximum = samples
+            .iter()
+            .filter(|sample| sample.name == *name && sample_matches_model(sample, served_model))
+            .map(|sample| sample.value)
+            .filter(|value| value.is_finite() && *value >= 0.0)
+            .reduce(f64::max);
+        if maximum.is_some() {
+            return maximum;
+        }
+    }
+    None
+}
+
+fn sample_matches_model(sample: &PrometheusSample, served_model: &str) -> bool {
+    let mut observed_model_label = false;
+    for key in ["model_name", "model", "served_model_name"] {
+        if let Some(value) = sample.labels.get(key) {
+            observed_model_label = true;
+            if value == served_model {
+                return true;
+            }
+        }
+    }
+    !observed_model_label
+}
+
+fn nonnegative_u64(value: f64) -> Option<u64> {
+    if !value.is_finite() || value < 0.0 || value > u64::MAX as f64 {
+        None
+    } else {
+        Some(value.round() as u64)
+    }
+}
+
+fn seconds_to_micros(value: f64) -> Option<u64> {
+    nonnegative_u64(value * 1_000_000.0)
+}
+
+fn ratio_to_permyriad(value: f64) -> Option<u16> {
+    if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+        None
+    } else {
+        Some((value * 10_000.0).round() as u16)
+    }
+}
+
+fn counter_rate(
+    current: Option<f64>,
+    previous: Option<f64>,
+    elapsed_millis: Option<u64>,
+) -> Option<u64> {
+    let (current, previous, elapsed_millis) = (current?, previous?, elapsed_millis?);
+    if !current.is_finite() || !previous.is_finite() || current < previous || elapsed_millis == 0 {
+        return None;
+    }
+    nonnegative_u64((current - previous) * 1_000.0 / elapsed_millis as f64)
 }
 
 fn apply_output_contract(

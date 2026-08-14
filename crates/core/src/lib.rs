@@ -7,7 +7,7 @@ mod state;
 pub use context::{CancellationToken, ContextError, OperationContext};
 pub use execution::{
     CanonicalRequest, CapabilityRequirements, EngineCapabilities, EngineEvent, EngineFinishReason,
-    EngineSnapshot, SamplingParameters, Usage,
+    EngineSnapshot, SamplingParameters, TelemetryConfidence, TelemetryStatus, Usage,
 };
 pub use identity::{
     AttachmentId, EngineInstance, EngineInstanceId, EngineInstanceRef, ExecutionRole,

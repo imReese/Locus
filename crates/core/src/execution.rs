@@ -76,9 +76,44 @@ impl EngineCapabilities {
 pub struct EngineSnapshot {
     pub target_id: ExecutionTargetId,
     pub ready: bool,
-    pub queue_depth: u64,
+    pub telemetry_status: TelemetryStatus,
+    pub telemetry_confidence: TelemetryConfidence,
+    pub telemetry_source: String,
+    pub observed_at_unix_millis: u64,
+    pub valid_until_unix_millis: u64,
+    pub running_requests: Option<u64>,
+    pub waiting_requests: Option<u64>,
     pub estimated_queue_micros: Option<u64>,
+    /// KV-cache pressure in ten-thousandths, where 10_000 means 100%.
+    pub kv_cache_usage_permyriad: Option<u16>,
+    pub prefill_tokens_per_second: Option<u64>,
+    pub decode_tokens_per_second: Option<u64>,
     pub observation_revision: u64,
+    pub degraded_reason: Option<String>,
+}
+
+impl EngineSnapshot {
+    #[must_use]
+    pub fn telemetry_is_fresh_at(&self, now_unix_millis: u64) -> bool {
+        self.telemetry_status == TelemetryStatus::Fresh
+            && self.observed_at_unix_millis <= now_unix_millis
+            && now_unix_millis <= self.valid_until_unix_millis
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TelemetryStatus {
+    Fresh,
+    Stale,
+    Unavailable,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum TelemetryConfidence {
+    Unknown,
+    Low,
+    Medium,
+    High,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
