@@ -14,7 +14,7 @@ use locus_core::{
 use locus_engine::{EngineAdapter, EngineError, EngineRegistry};
 use locus_planner::{
     ACTIVE_CONFIRMATION, CalibrationError, CalibrationKey, CalibrationObservation,
-    CalibrationPolicy, CostBasedPlanner, DefaultPlanExecutor, ExecutionEstimate,
+    CalibrationPolicy, CostBasedPlanner, CostBreakdown, DefaultPlanExecutor, ExecutionEstimate,
     MaterializationObservation, PersistentCalibrator, PlacementMode, PlacementPlan,
     PlanExecutionError, PlanExecutor, Planner, PlanningCandidate, PlanningError, PlanningInput,
     RoutingPolicy, StateObservation, StatePathCandidate, plan_decision_fingerprint,
@@ -27,6 +27,8 @@ use locus_state::{StateError, StateProvider};
 use thiserror::Error;
 
 pub type SemanticEventStream = BoxStream<'static, Result<SemanticEvent, InferenceError>>;
+
+const MAX_PLACEMENT_AUDIT_PATHS: usize = 256;
 
 #[derive(Clone, Debug)]
 pub struct DiscoveredTarget {
@@ -424,6 +426,8 @@ impl DefaultInferenceService {
                 ));
             }
         };
+        trace_planning_paths(input, "legacy");
+        trace_planning_paths(&application.input, "calibrated");
         let replay = self.planner.plan(&application.input).await;
         let replay_consistent = replay
             .as_ref()
@@ -461,7 +465,12 @@ impl DefaultInferenceService {
         }
 
         if self.placement.mode == PlacementMode::Shadow {
-            return Ok(PlacementSelection::legacy(legacy_plan, "shadow_mode"));
+            return Ok(PlacementSelection {
+                plan: legacy_plan,
+                source: "shadow_mode",
+                calibration_revision: application.revision,
+                promotion_reasons: Vec::new(),
+            });
         }
         let evidence = application
             .evidence
@@ -549,6 +558,7 @@ impl InferenceService for DefaultInferenceService {
         let selection = self.select_plan(&planning_input).await?;
         let plan = selection.plan;
         let adapter = self.engines.adapter_for(&plan.target)?;
+        let selected_target_id = plan.target.id.to_string();
         let observation_key = CalibrationKey::from_target(&plan.target);
         let waiting_requests = planning_input
             .candidates
@@ -561,6 +571,11 @@ impl InferenceService for DefaultInferenceService {
                     .then_some(candidate.snapshot.waiting_requests)
                     .flatten()
             });
+        let selected_snapshot = planning_input
+            .candidates
+            .iter()
+            .find(|candidate| candidate.target.id == plan.target.id)
+            .map(|candidate| &candidate.snapshot);
         tracing::info!(
             placement_mode = ?self.placement.mode,
             placement_source = selection.source,
@@ -569,6 +584,12 @@ impl InferenceService for DefaultInferenceService {
             engine_generation = plan.target.engine.generation,
             calibration_revision = selection.calibration_revision,
             promotion_blockers = selection.promotion_reasons.len(),
+            promotion_reasons = %selection.promotion_reasons.join(","),
+            telemetry_status = ?selected_snapshot.map(|snapshot| snapshot.telemetry_status),
+            telemetry_confidence = ?selected_snapshot.map(|snapshot| snapshot.telemetry_confidence),
+            telemetry_source = selected_snapshot.map_or("missing", |snapshot| snapshot.telemetry_source.as_str()),
+            telemetry_revision = selected_snapshot.map_or(0, |snapshot| snapshot.observation_revision),
+            telemetry_valid_until_unix_millis = selected_snapshot.map_or(0, |snapshot| snapshot.valid_until_unix_millis),
             queue_micros = plan.predicted_cost.queue_micros,
             prefill_micros = plan.predicted_cost.unmatched_prefill_micros,
             materialization_micros = plan.predicted_cost.state_materialization_micros,
@@ -629,6 +650,22 @@ impl InferenceService for DefaultInferenceService {
                         materialization,
                         completed,
                     };
+                    tracing::info!(
+                        target_id = %selected_target_id,
+                        engine_id = %observation_key.engine_id,
+                        engine_generation = observation_key.engine_generation,
+                        completed,
+                        fallback_used = execution_metadata.fallback_used,
+                        executed_path = ?execution_metadata.executed_path,
+                        waiting_requests = ?waiting_requests,
+                        input_tokens = usage.input_tokens,
+                        output_tokens = usage.output_tokens,
+                        time_to_first_token_micros = ?time_to_first_token_micros,
+                        generation_micros = ?generation_micros,
+                        materialization_micros = ?execution_metadata.materialization.as_ref().map(|timing| timing.actual_micros),
+                        topology_micros = ?execution_metadata.topology_micros,
+                        "placement outcome"
+                    );
                     let observation_calibrator = calibrator.clone();
                     match tokio::task::spawn_blocking(move || {
                         observation_calibrator.record_observation(&observation)
@@ -806,6 +843,211 @@ fn is_output_event(event: &EngineEvent) -> bool {
             | EngineEvent::ToolCallArgumentsDelta { .. }
             | EngineEvent::ToolCallCompleted { .. }
     )
+}
+
+struct PathAudit {
+    target_id: String,
+    engine_id: String,
+    path_kind: &'static str,
+    state_kind: Option<String>,
+    provider: Option<String>,
+    feasible: bool,
+    exclusions: Vec<&'static str>,
+    cost: CostBreakdown,
+    stable_key: String,
+    rank: Option<usize>,
+    telemetry_status: locus_core::TelemetryStatus,
+    telemetry_confidence: locus_core::TelemetryConfidence,
+    telemetry_source: String,
+    telemetry_revision: u64,
+    telemetry_valid_until_unix_millis: u64,
+}
+
+fn trace_planning_paths(input: &PlanningInput, variant: &'static str) {
+    let mut audits = Vec::new();
+    for candidate in &input.candidates {
+        let candidate_exclusions = candidate_exclusions(input, candidate);
+        let queue_micros = candidate
+            .snapshot
+            .estimated_queue_micros
+            .unwrap_or(u64::MAX);
+        audits.push(PathAudit {
+            target_id: candidate.target.id.to_string(),
+            engine_id: candidate.target.engine.id.to_string(),
+            path_kind: "cold",
+            state_kind: None,
+            provider: None,
+            feasible: candidate_exclusions.is_empty(),
+            exclusions: candidate_exclusions.clone(),
+            cost: audit_cost(queue_micros, &candidate.cold_estimate, 0),
+            stable_key: format!("{}:0:cold", candidate.target.id),
+            rank: None,
+            telemetry_status: candidate.snapshot.telemetry_status,
+            telemetry_confidence: candidate.snapshot.telemetry_confidence,
+            telemetry_source: candidate.snapshot.telemetry_source.clone(),
+            telemetry_revision: candidate.snapshot.observation_revision,
+            telemetry_valid_until_unix_millis: candidate.snapshot.valid_until_unix_millis,
+        });
+        for state_path in &candidate.state_paths {
+            let mut exclusions = candidate_exclusions.clone();
+            exclusions.extend(state_path_exclusions(input, candidate, state_path));
+            let materialization_micros = state_path
+                .materialization_estimate_micros
+                .unwrap_or(state_path.option.estimated_transfer_micros);
+            audits.push(PathAudit {
+                target_id: candidate.target.id.to_string(),
+                engine_id: candidate.target.engine.id.to_string(),
+                path_kind: "reuse",
+                state_kind: Some(state_path.state.kind.as_str().to_owned()),
+                provider: Some(state_path.option.provider.as_str().to_owned()),
+                feasible: exclusions.is_empty(),
+                exclusions,
+                cost: audit_cost(queue_micros, &state_path.estimate, materialization_micros),
+                stable_key: format!(
+                    "{}:1:{}:{}",
+                    candidate.target.id, state_path.state.id, state_path.option.id
+                ),
+                rank: None,
+                telemetry_status: candidate.snapshot.telemetry_status,
+                telemetry_confidence: candidate.snapshot.telemetry_confidence,
+                telemetry_source: candidate.snapshot.telemetry_source.clone(),
+                telemetry_revision: candidate.snapshot.observation_revision,
+                telemetry_valid_until_unix_millis: candidate.snapshot.valid_until_unix_millis,
+            });
+        }
+    }
+    let mut feasible = audits
+        .iter()
+        .enumerate()
+        .filter(|(_, audit)| audit.feasible)
+        .map(|(index, audit)| (index, audit.cost.total_micros(), audit.stable_key.clone()))
+        .collect::<Vec<_>>();
+    feasible.sort_by(|left, right| (left.1, &left.2).cmp(&(right.1, &right.2)));
+    for (rank, (index, _, _)) in feasible.into_iter().enumerate() {
+        audits[index].rank = Some(rank + 1);
+    }
+    let total_paths = audits.len();
+    for audit in audits.iter().take(MAX_PLACEMENT_AUDIT_PATHS) {
+        tracing::debug!(
+            decision_variant = variant,
+            target_id = %audit.target_id,
+            engine_id = %audit.engine_id,
+            path_kind = audit.path_kind,
+            state_kind = audit.state_kind.as_deref().unwrap_or("none"),
+            provider = audit.provider.as_deref().unwrap_or("none"),
+            feasible = audit.feasible,
+            exclusion_reasons = %audit.exclusions.join(","),
+            rank = ?audit.rank,
+            queue_micros = audit.cost.queue_micros,
+            prefill_micros = audit.cost.unmatched_prefill_micros,
+            materialization_micros = audit.cost.state_materialization_micros,
+            decode_micros = audit.cost.decode_micros,
+            topology_micros = audit.cost.topology_micros,
+            policy_micros = audit.cost.policy_micros,
+            total_micros = audit.cost.total_micros(),
+            telemetry_status = ?audit.telemetry_status,
+            telemetry_confidence = ?audit.telemetry_confidence,
+            telemetry_source = %audit.telemetry_source,
+            telemetry_revision = audit.telemetry_revision,
+            telemetry_valid_until_unix_millis = audit.telemetry_valid_until_unix_millis,
+            "placement candidate"
+        );
+    }
+    if total_paths > MAX_PLACEMENT_AUDIT_PATHS {
+        tracing::warn!(
+            decision_variant = variant,
+            total_paths,
+            logged_paths = MAX_PLACEMENT_AUDIT_PATHS,
+            "placement candidate audit was truncated"
+        );
+    }
+}
+
+fn candidate_exclusions(input: &PlanningInput, candidate: &PlanningCandidate) -> Vec<&'static str> {
+    let mut reasons = Vec::new();
+    if candidate.target.model != input.request.model {
+        reasons.push("model_identity_mismatch");
+    }
+    if candidate.snapshot.target_id != candidate.target.id {
+        reasons.push("snapshot_target_mismatch");
+    }
+    if !candidate.snapshot.ready {
+        reasons.push("target_not_ready");
+    }
+    if !candidate
+        .capabilities
+        .satisfies(&input.request.requirements)
+    {
+        reasons.push("capability_mismatch");
+    }
+    reasons
+}
+
+fn state_path_exclusions(
+    input: &PlanningInput,
+    candidate: &PlanningCandidate,
+    state_path: &StatePathCandidate,
+) -> Vec<&'static str> {
+    let mut reasons = Vec::new();
+    if input
+        .state_observation
+        .unavailable_providers
+        .contains_key(&state_path.option.provider)
+    {
+        reasons.push("state_provider_unavailable");
+    }
+    if !state_path.compatibility.is_compatible() {
+        reasons.push("state_incompatible");
+    }
+    if state_path.state.provider != state_path.option.provider {
+        reasons.push("state_provider_mismatch");
+    }
+    if state_path.state.id != state_path.option.source_state {
+        reasons.push("source_state_mismatch");
+    }
+    if state_path.state.kind != state_path.option.state_kind {
+        reasons.push("state_kind_mismatch");
+    }
+    if state_path.state.model != input.request.model {
+        reasons.push("state_model_mismatch");
+    }
+    if state_path.option.target_id != candidate.target.id {
+        reasons.push("state_target_mismatch");
+    }
+    if state_path.option.target_engine != candidate.target.engine {
+        reasons.push("state_engine_generation_mismatch");
+    }
+    if !candidate
+        .capabilities
+        .supported_state_kinds
+        .contains(&state_path.state.kind)
+    {
+        reasons.push("state_kind_unsupported");
+    }
+    if state_path
+        .state
+        .relevant_input_semantics
+        .as_ref()
+        .is_some_and(|identity| identity != &input.request.semantic_identity.input)
+    {
+        reasons.push("state_input_semantics_mismatch");
+    }
+    reasons
+}
+
+fn audit_cost(
+    queue_micros: u64,
+    estimate: &ExecutionEstimate,
+    materialization_micros: u64,
+) -> CostBreakdown {
+    CostBreakdown {
+        queue_micros,
+        unmatched_prefill_micros: estimate.unmatched_prefill_micros,
+        state_materialization_micros: materialization_micros,
+        decode_micros: estimate.decode_micros,
+        topology_micros: estimate.topology_micros,
+        policy_micros: estimate.policy_micros,
+    }
 }
 
 fn elapsed_between_micros(started: Instant, finished: Instant) -> u64 {

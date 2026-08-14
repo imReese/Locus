@@ -318,6 +318,15 @@ token IDs, tool arguments, bearer tokens, or provider handles. Set `RUST_LOG` to
 override the configured default filter. JSON logs are appropriate for a log
 collector; compact logs are convenient locally.
 
+At info level, placement records the selected target, legacy/shadow/active
+source, promotion blockers, freshness/confidence, full selected cost breakdown,
+fallback, and redacted observed timing. Enable `locus_runtime=debug` to emit the
+bounded legacy and calibrated path audit: deterministic rank, hard-constraint
+exclusion reason codes, state kind/provider ID, each cost term, and telemetry
+revision/TTL. At most 256 path records per decision variant are emitted; a
+truncation warning reports larger candidate sets. Neither level includes prompt
+content, raw token IDs, generated content, opaque state handles, or credentials.
+
 SIGINT initiates graceful shutdown: the listener stops accepting new work and
 Axum drains in-flight connections. Deadline policy, per-tenant admission,
 Prometheus export from Locus itself, and a deployment manifest remain separate
