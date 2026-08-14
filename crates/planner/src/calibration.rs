@@ -38,6 +38,9 @@ pub struct CalibrationPolicy {
     pub max_unit_micros: u64,
     pub max_materialization_ratio_bps: u64,
     pub persistence_flush_every_updates: u64,
+    pub max_records: usize,
+    pub max_materialization_paths_per_record: usize,
+    pub max_state_bytes: usize,
 }
 
 impl Default for CalibrationPolicy {
@@ -57,6 +60,9 @@ impl Default for CalibrationPolicy {
             max_unit_micros: 60_000_000,
             max_materialization_ratio_bps: 100_000,
             persistence_flush_every_updates: 16,
+            max_records: 4_096,
+            max_materialization_paths_per_record: 256,
+            max_state_bytes: 32 * 1024 * 1024,
         }
     }
 }
@@ -78,6 +84,9 @@ impl CalibrationPolicy {
             || self.max_unit_micros == 0
             || self.max_materialization_ratio_bps < self.conservative_materialization_ratio_bps
             || self.persistence_flush_every_updates == 0
+            || self.max_records == 0
+            || self.max_materialization_paths_per_record == 0
+            || self.max_state_bytes == 0
         {
             return Err(CalibrationError::InvalidPolicy);
         }
@@ -198,7 +207,7 @@ impl PersistentCalibrator {
     ) -> Result<Self, CalibrationError> {
         policy.validate()?;
         let state = match state_path.as_deref() {
-            Some(path) if path.exists() => load_state(path)?,
+            Some(path) if path.exists() => load_state(path, &policy)?,
             _ => CalibrationState::default(),
         };
         Ok(Self {
@@ -334,11 +343,24 @@ impl PersistentCalibrator {
         if !observation.completed {
             return Ok(());
         }
+        let has_sample = observation.time_to_first_token_micros.is_some_and(|_| {
+            observation.input_tokens > 0 && observation.waiting_requests.is_some()
+        }) || observation
+            .generation_micros
+            .is_some_and(|_| observation.output_tokens > 0)
+            || observation.topology_micros.is_some()
+            || observation
+                .materialization
+                .as_ref()
+                .is_some_and(|materialization| materialization.estimated_micros > 0);
+        if !has_sample {
+            return Ok(());
+        }
         let mut state = self.lock_state()?;
-        let record = state
-            .records
-            .entry(observation.key.stable_id())
-            .or_default();
+        let stable_id = observation.key.stable_id();
+        ensure_record_capacity(&mut state, &stable_id, self.policy.max_records);
+        let next_revision = state.revision.saturating_add(1);
+        let record = state.records.entry(stable_id).or_default();
         let mut changed = false;
         if let Some(ttft) = observation.time_to_first_token_micros
             && observation.input_tokens > 0
@@ -390,11 +412,19 @@ impl PersistentCalibrator {
         if let Some(materialization) = &observation.materialization
             && materialization.estimated_micros > 0
         {
+            let stable_id = materialization.stable_id();
+            if !record.materialization_ratio_bps.contains_key(&stable_id)
+                && record.materialization_ratio_bps.len()
+                    >= self.policy.max_materialization_paths_per_record
+                && let Some(oldest) = record.materialization_ratio_bps.keys().next().cloned()
+            {
+                record.materialization_ratio_bps.remove(&oldest);
+            }
             let ratio_bps = materialization.actual_micros.saturating_mul(10_000)
                 / materialization.estimated_micros;
             record
                 .materialization_ratio_bps
-                .entry(materialization.stable_id())
+                .entry(stable_id)
                 .or_default()
                 .update(
                     ratio_bps,
@@ -404,7 +434,8 @@ impl PersistentCalibrator {
             changed = true;
         }
         if changed {
-            state.revision = state.revision.saturating_add(1);
+            record.last_updated_revision = next_revision;
+            state.revision = next_revision;
             self.commit_update_locked(&state)?;
         }
         Ok(())
@@ -567,7 +598,19 @@ impl PersistentCalibrator {
         let Some(path) = &self.state_path else {
             return Ok(());
         };
-        if let Err(error) = persist_state(path, state) {
+        let bytes = serde_json::to_vec_pretty(state).map_err(|error| {
+            self.persistence_healthy.store(false, Ordering::Release);
+            CalibrationError::Serialize(error)
+        })?;
+        if bytes.len() > self.policy.max_state_bytes {
+            self.persistence_healthy.store(false, Ordering::Release);
+            return Err(CalibrationError::Limit(format!(
+                "serialized state is {} bytes; limit is {} bytes",
+                bytes.len(),
+                self.policy.max_state_bytes
+            )));
+        }
+        if let Err(error) = persist_state(path, &bytes) {
             self.persistence_healthy.store(false, Ordering::Release);
             return Err(error);
         }
@@ -605,7 +648,9 @@ impl Default for CalibrationState {
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
 struct CalibrationRecord {
+    last_updated_revision: u64,
     queue_micros_per_waiting_request: MetricEstimate,
     prefill_micros_per_token: MetricEstimate,
     decode_micros_per_token: MetricEstimate,
@@ -659,6 +704,20 @@ fn weighted_average(previous: u64, sample: u64, alpha_bps: u64) -> u64 {
         .saturating_add(u128::from(sample).saturating_mul(u128::from(alpha_bps)))
         / 10_000;
     u64::try_from(total).unwrap_or(u64::MAX)
+}
+
+fn ensure_record_capacity(state: &mut CalibrationState, incoming: &str, maximum: usize) {
+    if state.records.contains_key(incoming) || state.records.len() < maximum {
+        return;
+    }
+    let oldest = state
+        .records
+        .iter()
+        .min_by_key(|(key, record)| (record.last_updated_revision, *key))
+        .map(|(key, _)| key.clone());
+    if let Some(oldest) = oldest {
+        state.records.remove(&oldest);
+    }
 }
 
 fn queue_estimate(
@@ -765,7 +824,22 @@ pub fn plan_decision_fingerprint(plan: &PlacementPlan) -> String {
     format!("{}|{}", plan.target.id, path)
 }
 
-fn load_state(path: &Path) -> Result<CalibrationState, CalibrationError> {
+fn load_state(
+    path: &Path,
+    policy: &CalibrationPolicy,
+) -> Result<CalibrationState, CalibrationError> {
+    let size = fs::metadata(path)
+        .map_err(|source| CalibrationError::Read {
+            path: path.to_path_buf(),
+            source,
+        })?
+        .len();
+    if size > u64::try_from(policy.max_state_bytes).unwrap_or(u64::MAX) {
+        return Err(CalibrationError::Limit(format!(
+            "state file is {size} bytes; limit is {} bytes",
+            policy.max_state_bytes
+        )));
+    }
     let bytes = fs::read(path).map_err(|source| CalibrationError::Read {
         path: path.to_path_buf(),
         source,
@@ -782,10 +856,25 @@ fn load_state(path: &Path) -> Result<CalibrationState, CalibrationError> {
             actual: state.schema_version,
         });
     }
+    if state.records.len() > policy.max_records {
+        return Err(CalibrationError::Limit(format!(
+            "state has {} records; limit is {}",
+            state.records.len(),
+            policy.max_records
+        )));
+    }
+    if state.records.values().any(|record| {
+        record.materialization_ratio_bps.len() > policy.max_materialization_paths_per_record
+    }) {
+        return Err(CalibrationError::Limit(format!(
+            "state exceeds the {} materialization paths per record limit",
+            policy.max_materialization_paths_per_record
+        )));
+    }
     Ok(state)
 }
 
-fn persist_state(path: &Path, state: &CalibrationState) -> Result<(), CalibrationError> {
+fn persist_state(path: &Path, bytes: &[u8]) -> Result<(), CalibrationError> {
     if let Some(parent) = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -796,7 +885,6 @@ fn persist_state(path: &Path, state: &CalibrationState) -> Result<(), Calibratio
         })?;
     }
     let temporary = path.with_extension("locus-calibration.tmp");
-    let bytes = serde_json::to_vec_pretty(state).map_err(CalibrationError::Serialize)?;
     fs::write(&temporary, bytes).map_err(|source| CalibrationError::Write {
         path: temporary.clone(),
         source,
@@ -853,4 +941,6 @@ pub enum CalibrationError {
         #[source]
         source: std::io::Error,
     },
+    #[error("calibration state limit exceeded: {0}")]
+    Limit(String),
 }

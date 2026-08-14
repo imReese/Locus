@@ -66,7 +66,10 @@
       "max_mape_bps": 2500,
       "min_shadow_decisions": 128,
       "min_shadow_agreement_bps": 9500,
-      "persistence_flush_every_updates": 16
+      "persistence_flush_every_updates": 16,
+      "max_records": 4096,
+      "max_materialization_paths_per_record": 256,
+      "max_state_bytes": 33554432
     }
   },
   "observability": {

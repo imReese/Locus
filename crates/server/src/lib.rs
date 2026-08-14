@@ -379,6 +379,9 @@ pub struct CalibrationSettings {
     pub max_unit_micros: u64,
     pub max_materialization_ratio_bps: u64,
     pub persistence_flush_every_updates: u64,
+    pub max_records: usize,
+    pub max_materialization_paths_per_record: usize,
+    pub max_state_bytes: usize,
 }
 
 impl Default for CalibrationSettings {
@@ -405,6 +408,9 @@ impl From<CalibrationPolicy> for CalibrationSettings {
             max_unit_micros: policy.max_unit_micros,
             max_materialization_ratio_bps: policy.max_materialization_ratio_bps,
             persistence_flush_every_updates: policy.persistence_flush_every_updates,
+            max_records: policy.max_records,
+            max_materialization_paths_per_record: policy.max_materialization_paths_per_record,
+            max_state_bytes: policy.max_state_bytes,
         }
     }
 }
@@ -427,6 +433,9 @@ impl CalibrationSettings {
             max_unit_micros: self.max_unit_micros,
             max_materialization_ratio_bps: self.max_materialization_ratio_bps,
             persistence_flush_every_updates: self.persistence_flush_every_updates,
+            max_records: self.max_records,
+            max_materialization_paths_per_record: self.max_materialization_paths_per_record,
+            max_state_bytes: self.max_state_bytes,
         }
     }
 }

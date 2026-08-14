@@ -226,16 +226,21 @@ provider handles, and credentials are never persisted.
       "max_mape_bps": 2500,
       "min_shadow_decisions": 128,
       "min_shadow_agreement_bps": 9500,
-      "persistence_flush_every_updates": 16
+      "persistence_flush_every_updates": 16,
+      "max_records": 4096,
+      "max_materialization_paths_per_record": 256,
+      "max_state_bytes": 33554432
     }
   }
 }
 ```
 
-The state file is schema-versioned and replaced atomically after a bounded
-number of updates. The last incomplete batch may be lost on an abrupt process
-exit; this can only remove evidence and cause demotion. Before any active
-decision is admitted, pending evidence is synchronously made durable.
+The state file is schema-versioned, byte-bounded, and replaced atomically after
+a bounded number of updates. Engine/model records and materialization paths
+have hard cardinality limits with deterministic eviction. The last incomplete
+batch may be lost on an abrupt process exit; this can only remove evidence and
+cause demotion. Before any active decision is admitted, pending evidence is
+synchronously made durable.
 
 Active mode is fail-closed. It requires a persistent state path and the exact
 operator acknowledgement below:

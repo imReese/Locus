@@ -1007,6 +1007,76 @@ fn unknown_calibration_schema_fails_closed() {
     assert!(error.to_string().contains("schema mismatch"));
 }
 
+#[test]
+fn calibration_state_cardinality_is_bounded() {
+    let policy = CalibrationPolicy {
+        max_records: 1,
+        max_materialization_paths_per_record: 1,
+        ..CalibrationPolicy::default()
+    };
+    let calibrator = PersistentCalibrator::load(policy, None).expect("calibrator");
+    let (_, target_a) = engine_and_target("bounded-a");
+    let (_, target_b) = engine_and_target("bounded-b");
+    for target in [&target_a, &target_b] {
+        calibrator
+            .record_observation(&CalibrationObservation {
+                key: CalibrationKey::from_target(target),
+                waiting_requests: Some(0),
+                input_tokens: 1,
+                output_tokens: 0,
+                time_to_first_token_micros: Some(10),
+                generation_micros: None,
+                topology_micros: None,
+                materialization: None,
+                completed: true,
+            })
+            .expect("record bounded observation");
+    }
+    let state = calibrator.state_json().expect("state JSON");
+    assert!(!state.contains("engine-bounded-a"));
+    assert!(state.contains("engine-bounded-b"));
+
+    for provider in ["provider-a", "provider-b"] {
+        calibrator
+            .record_observation(&CalibrationObservation {
+                key: CalibrationKey::from_target(&target_b),
+                waiting_requests: None,
+                input_tokens: 0,
+                output_tokens: 0,
+                time_to_first_token_micros: None,
+                generation_micros: None,
+                topology_micros: None,
+                materialization: Some(MaterializationObservation {
+                    provider: provider.to_owned(),
+                    state_kind: "kv".to_owned(),
+                    target_id: target_b.id.to_string(),
+                    estimated_micros: 10,
+                    actual_micros: 10,
+                }),
+                completed: true,
+            })
+            .expect("record bounded materialization");
+    }
+    let state = calibrator.state_json().expect("state JSON");
+    assert!(!state.contains("provider-a"));
+    assert!(state.contains("provider-b"));
+}
+
+#[test]
+fn oversized_calibration_state_fails_before_parsing() {
+    let temporary = tempfile::tempdir().expect("temporary directory");
+    let path = temporary.path().join("calibration.json");
+    fs::write(&path, "x".repeat(128)).expect("write oversized state");
+    let policy = CalibrationPolicy {
+        max_state_bytes: 64,
+        ..CalibrationPolicy::default()
+    };
+    let error = PersistentCalibrator::load(policy, Some(path))
+        .err()
+        .expect("oversized state must fail");
+    assert!(error.to_string().contains("state file is 128 bytes"));
+}
+
 #[tokio::test]
 async fn planner_performs_no_state_provider_mutation() {
     let request = token_request("pure-planner");
