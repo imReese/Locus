@@ -22,8 +22,9 @@ API gateway or reverse proxy.
 > [!IMPORTANT]
 > Locus now contains a deployable end-to-end control-plane slice: a configured
 > server process, content-addressed Hugging Face tokenizer/chat-template
-> profiles, OpenAI Responses and Chat Completions, SGLang/vLLM completion
-> adapters, and an optional NexusKV bridge. CI validates the official OpenAI
+> profiles, OpenAI Responses, Chat Completions, and raw-prompt Completions,
+> SGLang/vLLM completion adapters, and an optional NexusKV bridge. CI validates
+> the official OpenAI
 > Python SDK against a real local HTTP server and runs Locus against a separate
 > NexusKV bridge process. Live GPU serving and NexusKV physical transfer remain
 > opt-in validations and are not claimed by CI.
@@ -151,8 +152,8 @@ The Rust 2024 workspace keeps the architecture boundaries small and explicit:
   `PlanExecutor`;
 - `locus-runtime`: `InferenceService`, target discovery, state-candidate
   construction, planning, semantic streaming, and cancellation;
-- `locus-openai`: Responses, Chat Completions, model listing, health, SSE, and
-  OpenAI-shaped errors;
+- `locus-openai`: Responses, Chat Completions, raw text/token Completions, model
+  listing, health, SSE, and OpenAI-shaped errors;
 - `locus-engine-openai`: network adapters for SGLang and vLLM completion
   endpoints;
 - `locus-state-nexuskv`: optional, versioned HTTP bridge from NexusKV match and
@@ -195,12 +196,13 @@ that define the core architecture. Wire formats and Rust APIs remain pre-1.0.
 
 ## Validation boundaries
 
-- OpenAI Responses/Chat and adapter streaming are exercised through in-process
-  HTTP/SSE conformance tests.
-- Official `openai` Python SDK 2.53.0 E2E covers Responses and Chat JSON/SSE,
-  profile-parsed reasoning/tool calls, structured output, errors,
-  authentication, and client-disconnect cancellation against a real local
-  Locus HTTP fixture in GitHub CI.
+- OpenAI Responses/Chat/Completions and adapter streaming are exercised through
+  in-process HTTP/SSE conformance tests.
+- Official `openai` Python SDK 2.53.0 E2E covers Responses, Chat, and raw-prompt
+  Completions JSON/SSE, text and token prompts, stop sequences, profile-parsed
+  reasoning/tool calls, structured output, errors, authentication, and
+  client-disconnect cancellation against a real local Locus HTTP fixture in
+  GitHub CI.
 - SGLang and vLLM requests send canonical token IDs to `/v1/completions`; tests
   cover request IDs, profile-parser-gated tool prompt transport,
   structured-output mapping, usage, finish events, and the SGLang abort path. A

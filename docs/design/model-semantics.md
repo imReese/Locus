@@ -11,6 +11,9 @@ MiniJinja, decodes through the same tokenizer, and derives tokenizer/template
 identities from SHA-256 content digests. Production profiles can bind strict
 tagged-reasoning and tagged-JSON tool parsers; parser revisions, delimiters, and
 limits participate in output identities and the umbrella fingerprint.
+`SemanticInput` also carries raw text or caller-tokenized prompts for the legacy
+Completions API. Those inputs bypass the chat template and use a distinct
+`locus-raw-prompt` input-semantic identity.
 `ByteTokenizer`, `ByteDecoder`, and `SimpleTemplateRenderer` remain deterministic
 reference components. Multimodal normalization and additional model output
 dialects remain future work.
@@ -25,6 +28,7 @@ engine.
 The layer includes:
 
 - structured request validation and defaulting;
+- explicit conversation versus raw-prompt input semantics;
 - chat-template selection and rendering;
 - tokenization and detokenization;
 - multimodal input normalization;
@@ -122,15 +126,18 @@ their identities from compatibility checks.
 
 The semantic pipeline follows a deterministic order:
 
-1. **Protocol-independent validation.** Check conversation roles, tool schemas,
-   media counts, generation limits, and mutually exclusive options.
+1. **Protocol-independent validation.** Check the input mode, conversation
+   roles, tool schemas, media counts, generation limits, and mutually exclusive
+   options.
 2. **Profile resolution.** Pin the immutable model and semantic profile.
-3. **Template rendering.** Render structured conversation data, tool
-   definitions, and declared template variables.
+3. **Template selection.** Render structured conversation data, tool
+   definitions, and declared variables, or select the explicit raw-prompt
+   bypass identity.
 4. **Multimodal normalization.** Validate and canonicalize media references,
    bind them to template placeholders, and produce typed input items.
-5. **Tokenization.** Encode rendered textual segments with the pinned tokenizer
-   and preserve segment identities.
+5. **Tokenization.** Encode rendered conversation or raw prompt text with the
+   pinned tokenizer. Preserve caller-supplied token IDs under that same
+   tokenizer identity without rendering or re-tokenizing them.
 6. **Sampling normalization.** Resolve aliases and defaults, validate ranges,
    and express required engine capabilities.
 7. **Input assembly.** Construct an ordered canonical `InputBundle` containing
@@ -141,6 +148,20 @@ The semantic pipeline follows a deterministic order:
 
 Errors point to the stage and offending public field without exposing template
 source or private deployment data.
+
+## Raw prompts
+
+`SemanticInput::Prompt` represents either text or one token-ID sequence. Text is
+encoded directly with the pinned tokenizer. Token IDs cross the semantic layer
+unchanged and are labeled with that tokenizer fingerprint. Neither form invokes
+`TemplateRenderer`, adds chat roles, or emits a generation marker.
+
+The canonical input replaces the profile's chat-template component with the
+fixed `locus-raw-prompt` revision and does not reuse the chat profile's umbrella
+fingerprint. This prevents reusable-state evidence from claiming that a chat
+template participated in a raw prompt. Raw prompts currently reject tools,
+reasoning controls, and structured-output contracts; those features remain on
+Responses and Chat Completions.
 
 ## Chat templates
 
@@ -219,6 +240,10 @@ placement. The normalizer distinguishes:
 - an explicitly requested value;
 - an engine-defaulted value allowed by policy.
 
+The implemented remote completion adapters forward canonical `max_tokens`,
+temperature, top-p, seed, and non-empty stop-sequence lists. A supplied stop is
+not silently discarded or enforced only in the northbound response shaper.
+
 It also derives capability requirements. An adapter cannot reinterpret a field
 because its engine uses a similar name. Unsupported exact semantics result in
 policy-approved degradation or pre-execution rejection.
@@ -228,9 +253,9 @@ policy-approved degradation or pre-execution rejection.
 Canonical engine events flow through request-scoped stages:
 
 ```text
-token events -> incremental decoder -> stop handling
-             -> reasoning/tool parser state -> semantic output events
-             -> northbound protocol adapter
+token events       -> incremental decoder -> reasoning/tool parser state
+engine finish fact -----------------------> semantic finish normalization
+                                          -> northbound protocol adapter
 ```
 
 Engines report execution facts. `ModelSemantics` derives application meaning.

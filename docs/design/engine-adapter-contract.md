@@ -7,7 +7,8 @@ validates import and execution lifecycles. The separate
 `locus-engine-openai` crate implements network adapters for SGLang and vLLM
 OpenAI-compatible `/v1/completions` endpoints without introducing their types
 into `locus-engine`. Mock HTTP/SSE tests cover pretokenized requests, text and
-usage events, finish reasons, structured-output fields, and SGLang aborts. No
+usage events, finish reasons, stop-sequence transport, structured-output fields,
+and SGLang aborts. No
 live runtime, GPU, latency, or native state-import result is claimed by CI. The
 opt-in `scripts/live_engine_conformance.py` harness checks a configured runtime's
 health, pretokenized completion SSE lifecycle, usage, finish reason, terminal

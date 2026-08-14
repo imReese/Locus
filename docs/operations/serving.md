@@ -80,11 +80,13 @@ SHA-256 at startup. Those digests become structured semantic-component
 fingerprints and feed the umbrella profile fingerprint. A label such as `main`
 or `latest` is not accepted as compatibility evidence by itself.
 
-For each request the selected `ModelSemantics` renders the conversation and
-OpenAI-shaped function definitions once, then tokenizes that rendered prompt
-once. The resulting canonical token IDs cross the engine boundary. The vLLM
-adapter explicitly sets `add_special_tokens: false`; neither adapter renders or
-tokenizes the conversation again.
+For conversation requests the selected `ModelSemantics` renders the messages
+and OpenAI-shaped function definitions once, then tokenizes that rendered prompt
+once. For `POST /v1/completions`, raw text is tokenized directly and a raw token
+array is preserved without invoking the chat template. The resulting canonical
+token IDs cross the engine boundary. The vLLM adapter explicitly sets
+`add_special_tokens: false`; neither adapter renders or tokenizes the prompt
+again. Canonical stop strings are forwarded to the runtime completion endpoint.
 
 Example parser configuration:
 
@@ -115,6 +117,27 @@ and are rejected during planning when the adapter cannot provide them.
 The current production template context supports text messages, function tool
 schemas, tool choice, and deployment values. Multimodal bindings and additional
 model-specific parser dialects are not implemented.
+
+## Raw Completions example
+
+The compatibility endpoint accepts one text prompt or one token-ID sequence:
+
+```bash
+curl http://127.0.0.1:8080/v1/completions \
+  -H "Authorization: Bearer $LOCUS_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "my-model",
+    "prompt": "Complete this raw prefix:",
+    "max_tokens": 64,
+    "stop": ["END"]
+  }'
+```
+
+Set `"stream": true` for `text_completion` SSE chunks and `[DONE]`. A numeric
+array such as `"prompt": [1, 2, 3]` is treated as already-tokenized input under
+the configured model tokenizer identity. Batched prompts and multiple choices
+are rejected rather than silently flattened.
 
 ## Probes
 

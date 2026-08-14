@@ -38,6 +38,12 @@ The automated SDK suite covers:
 - Responses SSE lifecycle and text deltas;
 - Chat Completions non-streaming JSON;
 - Chat Completions SSE chunks and terminal completion;
+- Completions non-streaming JSON with a raw text prompt and stop sequences;
+- Completions caller-supplied token IDs without chat-template rendering;
+- Completions SSE text, finish reason, final usage, and `[DONE]` parsed by the
+  official SDK;
+- strict Completions rejection before inference for unsupported multiple
+  choices;
 - Responses typed reasoning and function-call items produced by profile parsers;
 - Chat SSE reasoning content, indexed tool deltas, arguments, and `tool_calls`
   finish reason produced by the same parser fixture;
@@ -102,8 +108,9 @@ deployment secrets or private endpoint details with a result.
 ## Current boundary
 
 The official SDK fixture passed locally with `openai` 2.53.0 and is enforced by
-GitHub CI, including profile-parsed reasoning and tool calls. SGLang and vLLM
-adapter behavior is covered by deterministic mock HTTP/SSE tests; configured
+GitHub CI, including raw Completions and profile-parsed reasoning/tool calls.
+SGLang and vLLM adapter behavior is covered by deterministic mock HTTP/SSE
+tests; configured
 parser behavior uses a mock SGLang endpoint, not a live model. The cross-process
 NexusKV protocol path is also automated with protocol-only, zero-byte transfer
 evidence. No live GPU engine, native engine state import, physical NexusKV

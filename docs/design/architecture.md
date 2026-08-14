@@ -5,8 +5,9 @@
 This document defines the target architecture. The Rust workspace implements
 the core domain types, `ModelRegistry`, `InferenceService`, target discovery,
 semantic-event processing, a cost-based planner, and `PlanExecutor`. Edge
-crates implement OpenAI Responses/Chat, SGLang/vLLM completion adapters, and an
-optional NexusKV bridge. These integrations are mock-conformance-tested; live
+crates implement OpenAI Responses/Chat/raw Completions, SGLang/vLLM completion
+adapters, and an optional NexusKV bridge. These integrations are
+mock-conformance-tested; live
 GPU serving and physical state transfer remain unverified. A deployable server,
 production Hugging Face tokenizer/template profiles, global ingress limits,
 bearer authentication, dependency-aware readiness, structured tracing, and
@@ -125,8 +126,9 @@ decision or allocate engine-local destination memory.
 
 Protocol adapters translate an external API into an internal semantic request
 and translate normalized output events back to that API. An OpenAI-compatible
-adapter now implements Responses and Chat Completions over the same
-`InferenceService`; it is not the definition of the internal model.
+adapter now implements Responses, Chat Completions, and raw-prompt Completions
+over the same `InferenceService`; it is not the definition of the internal
+model.
 
 ### Model semantics
 
@@ -291,9 +293,9 @@ types remain at the edges.
    Authentication remains a deployment concern.
 2. Validation checks protocol shape, deployment policy, and declared model
    support.
-3. The selected `ModelSemantics` profile renders templates, normalizes media,
-   tokenizes input, canonicalizes sampling, and declares required output
-   semantics.
+3. The selected `ModelSemantics` profile renders conversation templates or
+   explicitly bypasses them for a raw prompt, normalizes media, tokenizes input,
+   canonicalizes sampling, and declares required output semantics.
 4. A future admission controller may add priority, deadline, and tenant
    constraints. The current service proceeds directly to discovery.
 5. The capability registry filters execution targets that cannot satisfy the
@@ -397,8 +399,8 @@ The following stages are implemented and tested:
    engines and state providers;
 3. the protocol-neutral `InferenceService`, model registry, target discovery,
    and semantic-event pipeline;
-4. OpenAI Responses and Chat Completions adapters with HTTP/SSE conformance
-   tests;
+4. OpenAI Responses, Chat Completions, and raw-prompt Completions adapters with
+   HTTP/SSE conformance tests;
 5. SGLang and vLLM OpenAI-compatible completion adapters in a separate edge
    crate;
 6. an optional NexusKV bridge through the complete state import handshake;
