@@ -173,7 +173,7 @@ async fn inference_runs_through_semantics_planner_and_executor() {
     ));
     assert_eq!(adapter.call_counts().execute, 1);
     assert_eq!(
-        service.models().expect("models")[0].public_aliases[0],
+        service.models().await.expect("models")[0].public_aliases[0],
         "test-model"
     );
 }

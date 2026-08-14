@@ -16,7 +16,9 @@ use locus_planner::{
     Planner, PlanningCandidate, PlanningError, PlanningInput, RoutingPolicy, StateObservation,
     StatePathCandidate,
 };
-use locus_semantics::{ModelProfile, ModelRegistry, SemanticError, SemanticEvent, SemanticRequest};
+use locus_semantics::{
+    ModelCatalog, ModelProfile, ModelRegistry, SemanticError, SemanticEvent, SemanticRequest,
+};
 use locus_state::{StateError, StateProvider};
 use thiserror::Error;
 
@@ -108,7 +110,7 @@ pub trait InferenceService: Send + Sync {
         context: OperationContext,
     ) -> Result<SemanticEventStream, InferenceError>;
 
-    fn models(&self) -> Result<Vec<ModelProfile>, InferenceError>;
+    async fn models(&self) -> Result<Vec<ModelProfile>, InferenceError>;
 
     async fn readiness(&self) -> Result<ReadinessReport, InferenceError>;
 }
@@ -116,18 +118,29 @@ pub trait InferenceService: Send + Sync {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReadinessReport {
     pub model_profiles: usize,
+    pub routable_models: usize,
+    pub required_models: usize,
     pub ready_targets: usize,
     pub observed_targets: usize,
 }
 
 pub struct DefaultInferenceService {
-    models: ModelRegistry,
+    catalog: Arc<dyn ModelCatalog>,
     discovery: Arc<dyn TargetDiscovery>,
     planner: Arc<dyn Planner>,
     executor: Arc<dyn PlanExecutor>,
     engines: EngineRegistry,
     state_provider: Arc<dyn StateProvider>,
     policy: RoutingPolicy,
+    required_models: BTreeSet<String>,
+}
+
+struct TargetInventory {
+    profiles: Vec<ModelProfile>,
+    ready_models: BTreeSet<locus_core::ModelExecutionIdentity>,
+    observed_targets: usize,
+    ready_targets: usize,
+    failures: Vec<String>,
 }
 
 impl DefaultInferenceService {
@@ -143,13 +156,14 @@ impl DefaultInferenceService {
             Arc::clone(&state_provider),
         ));
         Self {
-            models,
+            catalog: Arc::new(models),
             discovery,
             planner: Arc::new(CostBasedPlanner),
             executor,
             engines,
             state_provider,
             policy: RoutingPolicy::default(),
+            required_models: BTreeSet::new(),
         }
     }
 
@@ -164,14 +178,71 @@ impl DefaultInferenceService {
         policy: RoutingPolicy,
     ) -> Self {
         Self {
-            models,
+            catalog: Arc::new(models),
             discovery,
             planner,
             executor,
             engines,
             state_provider,
             policy,
+            required_models: BTreeSet::new(),
         }
+    }
+
+    #[must_use]
+    pub fn with_required_models(
+        mut self,
+        required_models: impl IntoIterator<Item = String>,
+    ) -> Self {
+        self.required_models = required_models.into_iter().collect();
+        self
+    }
+
+    async fn target_inventory(&self) -> Result<TargetInventory, InferenceError> {
+        let profiles = self.catalog.profiles()?;
+        let catalog_models = profiles
+            .iter()
+            .map(|profile| profile.model.clone())
+            .collect::<BTreeSet<_>>();
+        let context = OperationContext::new(RequestId::new("locus-model-inventory"));
+        let mut ready_models = BTreeSet::new();
+        let mut observed_targets = 0_usize;
+        let mut ready_targets = 0_usize;
+        let mut failures = Vec::new();
+        for adapter in self.engines.adapters()? {
+            let targets = match adapter.execution_targets(&context).await {
+                Ok(targets) => targets,
+                Err(error) => {
+                    failures.push(error.to_string());
+                    continue;
+                }
+            };
+            for target in targets {
+                observed_targets += 1;
+                if !catalog_models.contains(&target.model) {
+                    failures.push(format!(
+                        "target {} has no matching semantic profile",
+                        target.id
+                    ));
+                    continue;
+                }
+                match adapter.snapshot(&target, &context).await {
+                    Ok(snapshot) if snapshot.ready => {
+                        ready_targets += 1;
+                        ready_models.insert(target.model);
+                    }
+                    Ok(_) => failures.push(format!("target {} is not ready", target.id)),
+                    Err(error) => failures.push(error.to_string()),
+                }
+            }
+        }
+        Ok(TargetInventory {
+            profiles,
+            ready_models,
+            observed_targets,
+            ready_targets,
+            failures,
+        })
     }
 
     async fn planning_input(
@@ -278,7 +349,7 @@ impl InferenceService for DefaultInferenceService {
         context: OperationContext,
     ) -> Result<SemanticEventStream, InferenceError> {
         context.ensure_active()?;
-        let semantics = self.models.resolve(&request.model)?;
+        let semantics = self.catalog.resolve(&request.model)?;
         let normalized = semantics.normalize(&request, context.request_id.clone())?;
         let mut pipeline = semantics.output_pipeline(&normalized.output_contract)?;
         let planning_input = self
@@ -301,68 +372,65 @@ impl InferenceService for DefaultInferenceService {
         Ok(CancelOnDropStream::new(Box::pin(stream), planning_input.request.id, adapter).boxed())
     }
 
-    fn models(&self) -> Result<Vec<ModelProfile>, InferenceError> {
-        self.models.profiles().map_err(Into::into)
+    async fn models(&self) -> Result<Vec<ModelProfile>, InferenceError> {
+        let inventory = self.target_inventory().await?;
+        Ok(inventory
+            .profiles
+            .into_iter()
+            .filter(|profile| inventory.ready_models.contains(&profile.model))
+            .collect())
     }
 
     async fn readiness(&self) -> Result<ReadinessReport, InferenceError> {
-        let profiles = self.models.profiles()?;
-        if profiles.is_empty() {
+        let inventory = self.target_inventory().await?;
+        if inventory.profiles.is_empty() {
             return Err(InferenceError::Discovery(
                 "no model profiles are registered".to_owned(),
             ));
         }
-        let context = OperationContext::new(RequestId::new("locus-readiness"));
-        let mut ready_models = BTreeSet::new();
-        let mut observed_targets = 0_usize;
-        let mut ready_targets = 0_usize;
-        let mut failures = Vec::new();
-        for adapter in self.engines.adapters()? {
-            let targets = match adapter.execution_targets(&context).await {
-                Ok(targets) => targets,
-                Err(error) => {
-                    failures.push(error.to_string());
-                    continue;
-                }
-            };
-            for target in targets {
-                observed_targets += 1;
-                match adapter.snapshot(&target, &context).await {
-                    Ok(snapshot) if snapshot.ready => {
-                        ready_targets += 1;
-                        ready_models.insert(target.model);
-                    }
-                    Ok(_) => failures.push(format!("target {} is not ready", target.id)),
-                    Err(error) => failures.push(error.to_string()),
-                }
-            }
-        }
-        let missing = profiles
-            .iter()
-            .filter(|profile| !ready_models.contains(&profile.model))
-            .map(|profile| {
-                profile
-                    .public_aliases
-                    .first()
-                    .cloned()
-                    .unwrap_or_else(|| profile.model.model_revision.clone())
-            })
-            .collect::<Vec<_>>();
-        if !missing.is_empty() {
-            let evidence = if failures.is_empty() {
-                "no matching execution target was observed".to_owned()
+        if inventory.ready_models.is_empty() {
+            let evidence = if inventory.failures.is_empty() {
+                "no execution target matched a registered semantic profile".to_owned()
             } else {
-                failures.join("; ")
+                inventory.failures.join("; ")
             };
             return Err(InferenceError::Discovery(format!(
-                "models without a ready target: {}; {evidence}",
+                "no model has a ready execution target; {evidence}"
+            )));
+        }
+        let mut missing = Vec::new();
+        for alias in &self.required_models {
+            let semantics = self.catalog.resolve(alias).map_err(|error| {
+                InferenceError::Discovery(format!(
+                    "required model {alias} has no semantic profile: {error}"
+                ))
+            })?;
+            if !inventory.ready_models.contains(&semantics.profile().model) {
+                missing.push(alias.clone());
+            }
+        }
+        if !missing.is_empty() {
+            let evidence = if inventory.failures.is_empty() {
+                "no matching ready execution target was observed".to_owned()
+            } else {
+                inventory.failures.join("; ")
+            };
+            return Err(InferenceError::Discovery(format!(
+                "required models without a ready target: {}; {evidence}",
                 missing.join(", ")
             )));
         }
+        let routable_models = inventory
+            .profiles
+            .iter()
+            .filter(|profile| inventory.ready_models.contains(&profile.model))
+            .count();
         Ok(ReadinessReport {
-            model_profiles: profiles.len(),
-            ready_targets,
-            observed_targets,
+            model_profiles: inventory.profiles.len(),
+            routable_models,
+            required_models: self.required_models.len(),
+            ready_targets: inventory.ready_targets,
+            observed_targets: inventory.observed_targets,
         })
     }
 }

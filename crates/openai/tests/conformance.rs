@@ -305,6 +305,8 @@ async fn readiness_observes_registered_model_and_live_target() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(readiness["status"], "ready");
     assert_eq!(readiness["model_profiles"], 1);
+    assert_eq!(readiness["routable_models"], 1);
+    assert_eq!(readiness["required_models"], 0);
     assert_eq!(readiness["ready_targets"], 1);
     assert_eq!(readiness["observed_targets"], 1);
 }

@@ -133,6 +133,8 @@ async fn readiness(State(service): State<Arc<dyn InferenceService>>) -> Response
         Ok(report) => Json(json!({
             "status": "ready",
             "model_profiles": report.model_profiles,
+            "routable_models": report.routable_models,
+            "required_models": report.required_models,
             "ready_targets": report.ready_targets,
             "observed_targets": report.observed_targets,
         }))
@@ -213,7 +215,7 @@ pub enum ApiConfigError {
 }
 
 async fn models(State(service): State<Arc<dyn InferenceService>>) -> Response {
-    match service.models() {
+    match service.models().await {
         Ok(profiles) => {
             let data = profiles
                 .into_iter()
