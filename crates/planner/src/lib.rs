@@ -1,3 +1,4 @@
+mod calibration;
 mod executor;
 
 use std::collections::BTreeMap;
@@ -9,6 +10,12 @@ use locus_core::{
 };
 use thiserror::Error;
 
+pub use calibration::{
+    ACTIVE_CONFIRMATION, CalibrationApplication, CalibrationError, CalibrationKey,
+    CalibrationObservation, CalibrationPolicy, CandidateCalibrationEvidence,
+    MaterializationObservation, PersistentCalibrator, PlacementMode, PromotionStatus,
+    plan_fingerprint,
+};
 pub use executor::{DefaultPlanExecutor, PlanExecutionError, PlanExecutor};
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]

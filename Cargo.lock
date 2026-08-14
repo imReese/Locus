@@ -891,6 +891,9 @@ dependencies = [
  "locus-core",
  "locus-engine",
  "locus-state",
+ "serde",
+ "serde_json",
+ "tempfile",
  "thiserror",
  "tokio",
 ]

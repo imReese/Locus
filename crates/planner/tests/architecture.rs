@@ -17,9 +17,10 @@ use locus_core::{
 };
 use locus_engine::{EngineAdapter, EngineError, EngineRegistry, FakeEngineAdapter};
 use locus_planner::{
-    CostBasedPlanner, DefaultPlanExecutor, ExecutionEstimate, ExecutionPath, FallbackAction,
-    PlanExecutor, Planner, PlanningCandidate, PlanningInput, RoutingPolicy, StateObservation,
-    StatePathCandidate,
+    CalibrationKey, CalibrationObservation, CalibrationPolicy, CostBasedPlanner,
+    DefaultPlanExecutor, ExecutionEstimate, ExecutionPath, FallbackAction,
+    MaterializationObservation, PersistentCalibrator, PlanExecutor, Planner, PlanningCandidate,
+    PlanningInput, RoutingPolicy, StateObservation, StatePathCandidate, plan_fingerprint,
 };
 use locus_state::FakeStateProvider;
 
@@ -757,6 +758,253 @@ async fn observed_provider_outage_degrades_to_cold_when_policy_allows() {
     assert_eq!(provider.call_counts().materialize, 0);
     assert_eq!(engine.call_counts().prepare, 0);
     assert_eq!(engine.call_counts().execute, 1);
+}
+
+#[test]
+fn stale_telemetry_uses_explicit_conservative_costs() {
+    let (_, target) = engine_and_target("stale-calibration");
+    let mut input = planning_input(
+        token_request("stale-calibration"),
+        vec![candidate(
+            &target,
+            capabilities(InputKind::TokenSequence, false),
+            0,
+            0,
+            vec![],
+        )],
+    );
+    input.candidates[0].snapshot.telemetry_status = locus_core::TelemetryStatus::Stale;
+    input.candidates[0].snapshot.valid_until_unix_millis = 1;
+    let policy = CalibrationPolicy {
+        conservative_queue_micros: 7_000,
+        conservative_prefill_micros_per_token: 11,
+        conservative_decode_micros_per_token: 13,
+        ..CalibrationPolicy::default()
+    };
+    let calibrator = PersistentCalibrator::load(policy, None).expect("calibrator");
+
+    let application = calibrator.apply(&input, 2).expect("apply calibration");
+    let candidate = &application.input.candidates[0];
+    assert_eq!(candidate.snapshot.estimated_queue_micros, Some(7_000));
+    assert_eq!(candidate.cold_estimate.unmatched_prefill_micros, 44);
+    assert_eq!(candidate.cold_estimate.decode_micros, 208);
+    let evidence = application
+        .evidence
+        .get(target.id.as_str())
+        .expect("candidate evidence");
+    assert!(!evidence.snapshot_fresh);
+    assert!(evidence.queue_calibration_required);
+    assert!(evidence.used_conservative_queue);
+    assert!(evidence.used_conservative_prefill);
+    assert!(evidence.used_conservative_decode);
+}
+
+#[tokio::test]
+async fn qualified_calibration_survives_restart() {
+    let temporary = tempfile::tempdir().expect("temporary directory");
+    let state_path = temporary.path().join("calibration.json");
+    let policy = CalibrationPolicy {
+        min_samples_per_metric: 2,
+        min_shadow_decisions: 2,
+        min_shadow_agreement_bps: 10_000,
+        max_mape_bps: 10_000,
+        ..CalibrationPolicy::default()
+    };
+    let (_, target) = engine_and_target("persistent-calibration");
+    let input = planning_input(
+        token_request("persistent-calibration"),
+        vec![candidate(
+            &target,
+            capabilities(InputKind::TokenSequence, false),
+            0,
+            0,
+            vec![],
+        )],
+    );
+    let calibrator =
+        PersistentCalibrator::load(policy.clone(), Some(state_path.clone())).expect("calibrator");
+    let key = CalibrationKey::from_target(&target);
+    for _ in 0..2 {
+        calibrator
+            .record_observation(&CalibrationObservation {
+                key: key.clone(),
+                waiting_requests: Some(0),
+                input_tokens: 4,
+                output_tokens: 2,
+                time_to_first_token_micros: Some(400),
+                generation_micros: Some(2_000),
+                materialization: None,
+                completed: true,
+            })
+            .expect("record observation");
+        calibrator
+            .record_shadow_decision(true, "same", "same")
+            .expect("record shadow decision");
+    }
+
+    let application = calibrator.apply(&input, 1).expect("apply calibration");
+    let plan = CostBasedPlanner
+        .plan(&application.input)
+        .await
+        .expect("calibrated plan");
+    let evidence = application.evidence.get(target.id.as_str());
+    assert!(
+        calibrator
+            .promotion_status(&plan, evidence)
+            .expect("promotion status")
+            .qualified
+    );
+    assert!(state_path.exists());
+
+    let restarted = PersistentCalibrator::load(policy, Some(state_path)).expect("reload state");
+    let restarted_application = restarted.apply(&input, 1).expect("apply after restart");
+    let restarted_plan = CostBasedPlanner
+        .plan(&restarted_application.input)
+        .await
+        .expect("plan after restart");
+    assert_eq!(plan_fingerprint(&plan), plan_fingerprint(&restarted_plan));
+    assert!(
+        restarted
+            .promotion_status(
+                &restarted_plan,
+                restarted_application.evidence.get(target.id.as_str()),
+            )
+            .expect("promotion after restart")
+            .qualified
+    );
+}
+
+#[tokio::test]
+async fn prediction_error_blocks_active_promotion() {
+    let temporary = tempfile::tempdir().expect("temporary directory");
+    let policy = CalibrationPolicy {
+        ewma_alpha_bps: 10_000,
+        min_samples_per_metric: 2,
+        max_mape_bps: 1_000,
+        min_shadow_decisions: 2,
+        min_shadow_agreement_bps: 10_000,
+        ..CalibrationPolicy::default()
+    };
+    let (_, target) = engine_and_target("error-gate");
+    let input = planning_input(
+        token_request("error-gate"),
+        vec![candidate(
+            &target,
+            capabilities(InputKind::TokenSequence, false),
+            0,
+            0,
+            vec![],
+        )],
+    );
+    let calibrator =
+        PersistentCalibrator::load(policy, Some(temporary.path().join("calibration.json")))
+            .expect("calibrator");
+    for (ttft, generation) in [(400, 2_000), (4_000, 20_000)] {
+        calibrator
+            .record_observation(&CalibrationObservation {
+                key: CalibrationKey::from_target(&target),
+                waiting_requests: Some(0),
+                input_tokens: 4,
+                output_tokens: 2,
+                time_to_first_token_micros: Some(ttft),
+                generation_micros: Some(generation),
+                materialization: None,
+                completed: true,
+            })
+            .expect("record observation");
+        calibrator
+            .record_shadow_decision(true, "same", "same")
+            .expect("record shadow decision");
+    }
+    let application = calibrator.apply(&input, 1).expect("apply calibration");
+    let plan = CostBasedPlanner
+        .plan(&application.input)
+        .await
+        .expect("calibrated plan");
+    let status = calibrator
+        .promotion_status(&plan, application.evidence.get(target.id.as_str()))
+        .expect("promotion status");
+    assert!(!status.qualified);
+    assert!(status.reasons.iter().any(|reason| reason.contains("MAPE")));
+}
+
+#[test]
+fn materialization_calibration_is_scoped_to_target() {
+    let provider = ProviderId::new("calibrated-provider");
+    let (_, target) = engine_and_target("materialization-calibration");
+    let reusable = state_path(
+        &target,
+        &provider,
+        StateFixtureSpec {
+            id: "calibrated-state",
+            coverage: 2,
+            resume: 2,
+            transfer_micros: 100,
+            unmatched_prefill_micros: 0,
+            topology_micros: 0,
+            compatible: true,
+            locality: StateLocality::Local,
+        },
+    );
+    let input = planning_input(
+        token_request("materialization-calibration"),
+        vec![candidate(
+            &target,
+            capabilities(InputKind::TokenSequence, true),
+            0,
+            0,
+            vec![reusable],
+        )],
+    );
+    let calibrator =
+        PersistentCalibrator::load(CalibrationPolicy::default(), None).expect("calibrator");
+    let conservative = calibrator.apply(&input, 1).expect("conservative apply");
+    assert_eq!(
+        conservative.input.candidates[0].state_paths[0]
+            .option
+            .estimated_transfer_micros,
+        150
+    );
+    calibrator
+        .record_observation(&CalibrationObservation {
+            key: CalibrationKey::from_target(&target),
+            waiting_requests: None,
+            input_tokens: 0,
+            output_tokens: 0,
+            time_to_first_token_micros: None,
+            generation_micros: None,
+            materialization: Some(MaterializationObservation {
+                provider: provider.as_str().to_owned(),
+                state_kind: "kv".to_owned(),
+                target_id: target.id.to_string(),
+                estimated_micros: 100,
+                actual_micros: 200,
+            }),
+            completed: true,
+        })
+        .expect("record materialization");
+    let learned = calibrator.apply(&input, 1).expect("learned apply");
+    assert_eq!(
+        learned.input.candidates[0].state_paths[0]
+            .option
+            .estimated_transfer_micros,
+        200
+    );
+}
+
+#[test]
+fn unknown_calibration_schema_fails_closed() {
+    let temporary = tempfile::tempdir().expect("temporary directory");
+    let path = temporary.path().join("calibration.json");
+    fs::write(
+        &path,
+        r#"{"schema_version":"future","revision":0,"records":{},"shadow":{"decisions":0,"agreements":0,"replay_mismatches":0}}"#,
+    )
+    .expect("write incompatible state");
+    let error = PersistentCalibrator::load(CalibrationPolicy::default(), Some(path))
+        .err()
+        .expect("schema mismatch");
+    assert!(error.to_string().contains("schema mismatch"));
 }
 
 #[tokio::test]
