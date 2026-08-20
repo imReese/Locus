@@ -832,6 +832,7 @@ name = "locus-core"
 version = "0.1.0"
 dependencies = [
  "thiserror",
+ "tokio",
 ]
 
 [[package]]
@@ -842,6 +843,7 @@ dependencies = [
  "futures",
  "locus-core",
  "thiserror",
+ "tokio",
 ]
 
 [[package]]

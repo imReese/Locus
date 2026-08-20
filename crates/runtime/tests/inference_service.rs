@@ -1,24 +1,26 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use futures::TryStreamExt;
 use locus_core::{
-    EngineCapabilities, EngineInstance, EngineInstanceId, EngineInstanceRef, ExecutionRole,
-    ExecutionTarget, ExecutionTargetId, GenerationSemanticIdentity, InputKind,
+    ContextError, EngineCapabilities, EngineInstance, EngineInstanceId, EngineInstanceRef,
+    ExecutionRole, ExecutionTarget, ExecutionTargetId, GenerationSemanticIdentity, InputKind,
     InputSemanticIdentity, ModelExecutionIdentity, OperationContext, OutputSemanticIdentity,
     ParallelLayout, RequestId, RuntimeIdentity, SemanticComponentIdentity, SemanticIdentity,
 };
-use locus_engine::{EngineRegistry, FakeEngineAdapter, FakeEngineOutput};
+use locus_engine::{EngineLifecycle, EngineRegistry, FakeEngineAdapter, FakeEngineOutput};
 use locus_model_io::{
     BasicModelIo, ByteDecoder, ByteTokenizer, Conversation, ConversationMessage, ConversationRole,
     ModelEvent, ModelProfile, ModelRegistry, ModelRequest, SimpleTemplateRenderer,
 };
 use locus_planner::{
     ACTIVE_CONFIRMATION, CalibrationKey, CalibrationObservation, CalibrationPolicy,
-    PersistentCalibrator, PlacementMode,
+    PersistentCalibrator, PlacementMode, PlanExecutionError,
 };
 use locus_runtime::{
-    DefaultInferenceService, InferenceService, PlacementConfigurationError, PlacementControl,
+    DefaultInferenceService, InferenceError, InferenceService, PlacementConfigurationError,
+    PlacementControl,
 };
 use locus_store::{NullStateStore, StateStore};
 
@@ -59,6 +61,17 @@ fn model_and_semantics() -> (ModelExecutionIdentity, SemanticIdentity) {
 }
 
 fn service(output: FakeEngineOutput) -> (DefaultInferenceService, Arc<FakeEngineAdapter>) {
+    let (service, adapter, _) = service_with_registry(output);
+    (service, adapter)
+}
+
+fn service_with_registry(
+    output: FakeEngineOutput,
+) -> (
+    DefaultInferenceService,
+    Arc<FakeEngineAdapter>,
+    EngineRegistry,
+) {
     let (model, semantic_identity) = model_and_semantics();
     let models = ModelRegistry::new();
     models
@@ -127,8 +140,9 @@ fn service(output: FakeEngineOutput) -> (DefaultInferenceService, Arc<FakeEngine
     engines.register(adapter.clone()).expect("register engine");
     let store: Arc<dyn StateStore> = Arc::new(NullStateStore::default());
     (
-        DefaultInferenceService::new(models, engines, store),
+        DefaultInferenceService::new(models, engines.clone(), store),
         adapter,
+        engines,
     )
 }
 
@@ -189,6 +203,86 @@ async fn dropping_model_event_stream_propagates_cancellation_to_engine() {
         .expect("start inference");
     drop(stream);
     tokio::task::yield_now().await;
+    assert_eq!(adapter.call_counts().cancel, 1);
+}
+
+#[tokio::test]
+async fn deadline_cancels_a_live_engine_stream_and_maps_to_context_error() {
+    let (service, adapter) = service(FakeEngineOutput {
+        event_delay: Duration::from_millis(100),
+        ..FakeEngineOutput::default()
+    });
+    let context = OperationContext::new(RequestId::new("req-deadline"))
+        .with_deadline(Instant::now() + Duration::from_millis(25));
+    let error = service
+        .infer(request(), context)
+        .await
+        .expect("start inference")
+        .try_collect::<Vec<_>>()
+        .await
+        .expect_err("deadline must terminate stream");
+    assert!(matches!(
+        error,
+        InferenceError::Context(ContextError::DeadlineExceeded)
+    ));
+    tokio::task::yield_now().await;
+    assert_eq!(adapter.call_counts().cancel, 1);
+}
+
+#[tokio::test]
+async fn deadline_while_engine_stream_is_starting_cancels_engine() {
+    let (service, adapter) = service(FakeEngineOutput {
+        execute_delay: Duration::from_millis(100),
+        ..FakeEngineOutput::default()
+    });
+    let context = OperationContext::new(RequestId::new("deadline-during-execute"))
+        .with_deadline(Instant::now() + Duration::from_millis(20));
+
+    let error = match service.infer(request(), context).await {
+        Ok(_) => panic!("deadline must stop engine stream establishment"),
+        Err(error) => error,
+    };
+
+    assert!(matches!(
+        error,
+        InferenceError::Execution(PlanExecutionError::Context(ContextError::DeadlineExceeded))
+    ));
+    assert_eq!(adapter.call_counts().execute, 1);
+    assert_eq!(adapter.call_counts().cancel, 1);
+}
+
+#[tokio::test]
+async fn engine_drain_blocks_new_work_then_forces_and_releases_active_execution() {
+    let (service, adapter, engines) = service_with_registry(FakeEngineOutput {
+        event_delay: Duration::from_secs(1),
+        ..FakeEngineOutput::default()
+    });
+    let context = OperationContext::new(RequestId::new("req-drain"));
+    let cancellation = context.cancellation.clone();
+    let stream = service
+        .infer(request(), context)
+        .await
+        .expect("start inference");
+    assert_eq!(engines.active_executions().expect("active executions"), 1);
+
+    let report = engines
+        .drain_all(Duration::from_millis(1))
+        .await
+        .expect("drain engines");
+    assert!(!report.completed);
+    assert_eq!(report.forced_cancellations, 1);
+    assert!(cancellation.is_cancelled());
+    assert!(service.readiness().await.is_err());
+
+    drop(stream);
+    tokio::task::yield_now().await;
+    assert_eq!(engines.active_executions().expect("released execution"), 0);
+    assert_eq!(
+        engines
+            .lifecycle(&EngineInstanceId::new("engine-1"))
+            .expect("engine lifecycle"),
+        EngineLifecycle::Stopped
+    );
     assert_eq!(adapter.call_counts().cancel, 1);
 }
 

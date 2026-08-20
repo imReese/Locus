@@ -14,3 +14,4 @@ async-trait.workspace = true
 futures.workspace = true
 locus-core = { path = "../core" }
 thiserror.workspace = true
+tokio.workspace = true

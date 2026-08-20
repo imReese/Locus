@@ -1,7 +1,10 @@
 use std::env;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
-use locus_server::{ObservabilitySettings, build_server, load_config};
+use locus_engine::EngineRegistry;
+use locus_runtime::TrafficController;
+use locus_server::{ObservabilitySettings, ShutdownSettings, build_server, load_config};
 use thiserror::Error;
 use tokio::net::TcpListener;
 use tracing::info;
@@ -25,7 +28,11 @@ async fn run() -> Result<(), MainError> {
     let local_address = listener.local_addr()?;
     info!(listen = %local_address, "Locus serving started");
     axum::serve(listener, server.app)
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(shutdown_signal(
+            server.traffic,
+            server.engines,
+            server.shutdown,
+        ))
         .await?;
     info!("Locus serving stopped");
     Ok(())
@@ -63,9 +70,42 @@ fn init_observability(settings: &ObservabilitySettings) -> Result<(), MainError>
     Ok(())
 }
 
-async fn shutdown_signal() {
+async fn shutdown_signal(
+    traffic: TrafficController,
+    engines: EngineRegistry,
+    settings: ShutdownSettings,
+) {
     if let Err(error) = tokio::signal::ctrl_c().await {
         tracing::error!(%error, "failed to install shutdown signal handler");
+        return;
+    }
+    tracing::info!("shutdown signal received; beginning traffic drain");
+    let grace = Duration::from_millis(settings.drain_timeout_millis);
+    let traffic_report = traffic.drain(grace).await;
+    tracing::info!("traffic admission is quiesced; beginning engine drain");
+    let engine_report = engines.drain_all(grace).await;
+    let forced = traffic_report
+        .as_ref()
+        .is_ok_and(|report| !report.completed)
+        || engine_report.as_ref().is_ok_and(|report| !report.completed);
+    match &traffic_report {
+        Ok(report) => tracing::info!(
+            completed = report.completed,
+            forced_cancellations = report.forced_cancellations,
+            "traffic drain finished"
+        ),
+        Err(error) => tracing::error!(%error, "traffic drain failed"),
+    }
+    match &engine_report {
+        Ok(report) => tracing::info!(
+            completed = report.completed,
+            forced_cancellations = report.forced_cancellations,
+            "engine drain finished"
+        ),
+        Err(error) => tracing::error!(%error, "engine drain failed"),
+    }
+    if forced {
+        tokio::time::sleep(Duration::from_millis(settings.force_cancel_grace_millis)).await;
     }
 }
 

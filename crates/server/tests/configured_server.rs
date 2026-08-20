@@ -1,4 +1,5 @@
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use ahash::AHashMap;
 use axum::body::Body;
@@ -7,8 +8,11 @@ use axum::http::{Request, Response, StatusCode, header};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use http_body_util::BodyExt;
+use locus_core::EngineInstanceId;
+use locus_engine::EngineLifecycle;
 use locus_server::{
-    EngineModelSettings, PlacementModeSettings, ToolParserSettings, build_server, load_config,
+    EngineKind, EngineModelSettings, PlacementModeSettings, ServerConfig, ToolParserSettings,
+    build_server, load_config,
 };
 use serde_json::{Value, json};
 use tempfile::tempdir;
@@ -64,6 +68,20 @@ async fn engine_completion(
             "data: [DONE]\n\n"
         )))
         .expect("engine SSE response")
+}
+
+async fn send_fixture_response(app: Router) -> StatusCode {
+    app.oneshot(
+        Request::post("/v1/responses")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                json!({"model": "fixture", "input": "hello"}).to_string(),
+            ))
+            .expect("request"),
+    )
+    .await
+    .expect("inference response")
+    .status()
 }
 
 async fn parser_engine_completion(
@@ -655,6 +673,122 @@ async fn required_models_gate_readiness_explicitly() {
 }
 
 #[tokio::test]
+async fn traffic_drain_makes_readiness_false_and_rejects_new_inference() {
+    let (engine_url, _) = spawn_engine().await;
+    let (directory, config_path) = write_config();
+    let mut config = load_config(&config_path).expect("load config");
+    config.engines[0].base_url = engine_url;
+    let server = build_server(config, directory.path()).expect("build server");
+    server.traffic.begin_drain().expect("begin drain");
+
+    let readiness = server
+        .app
+        .clone()
+        .oneshot(
+            Request::get("/readyz")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("readiness response");
+    assert_eq!(readiness.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    let inference = server
+        .app
+        .oneshot(
+            Request::post("/v1/responses")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({"model": "fixture", "input": "hello"}).to_string(),
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("inference response");
+    assert_eq!(inference.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body: Value = serde_json::from_slice(
+        &inference
+            .into_body()
+            .collect()
+            .await
+            .expect("response body")
+            .to_bytes(),
+    )
+    .expect("response JSON");
+    assert_eq!(body["error"]["code"], "admission_unavailable");
+}
+
+#[tokio::test]
+async fn targeted_engine_drain_routes_the_next_request_to_the_second_runtime() {
+    let (first_url, first_capture) = spawn_engine().await;
+    let (second_url, second_capture) = spawn_engine().await;
+    let (directory, config_path) = write_config();
+    let mut config = load_config(&config_path).expect("load config");
+    config.engines[0].base_url = first_url;
+    let mut second = config.engines[0].clone();
+    second.id = "vllm-0".to_owned();
+    second.kind = EngineKind::Vllm;
+    second.base_url = second_url;
+    second.runtime_version = "test-vllm".to_owned();
+    second.target_id = Some("vllm-0/fixture".to_owned());
+    config.engines.push(second);
+    let server = build_server(config, directory.path()).expect("build dual-engine server");
+
+    assert_eq!(
+        send_fixture_response(server.app.clone()).await,
+        StatusCode::OK
+    );
+    let first_calls = first_capture
+        .completions
+        .lock()
+        .expect("first completions")
+        .len();
+    let second_calls = second_capture
+        .completions
+        .lock()
+        .expect("second completions")
+        .len();
+    let drained_id = match (first_calls, second_calls) {
+        (1, 0) => EngineInstanceId::new("sglang-0"),
+        (0, 1) => EngineInstanceId::new("vllm-0"),
+        counts => panic!("exactly one engine must receive the first request: {counts:?}"),
+    };
+
+    let report = server
+        .engines
+        .drain(&drained_id, Duration::ZERO)
+        .await
+        .expect("drain selected engine");
+    assert!(report.completed);
+    assert_eq!(report.forced_cancellations, 0);
+    assert_eq!(
+        server
+            .engines
+            .lifecycle(&drained_id)
+            .expect("drained lifecycle"),
+        EngineLifecycle::Stopped
+    );
+
+    assert_eq!(send_fixture_response(server.app).await, StatusCode::OK);
+    assert_eq!(
+        first_capture
+            .completions
+            .lock()
+            .expect("first completions")
+            .len(),
+        1
+    );
+    assert_eq!(
+        second_capture
+            .completions
+            .lock()
+            .expect("second completions")
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
 async fn explicit_mapping_translates_catalog_alias_to_upstream_model() {
     let (engine_url, capture) = spawn_engine_with_models(["upstream-fixture".to_owned()]).await;
     let (directory, config_path) = write_config();
@@ -740,4 +874,16 @@ fn zero_telemetry_limits_fail_startup() {
         Err(error) => error,
     };
     assert!(error.to_string().contains("telemetry limits"));
+}
+
+#[test]
+fn production_example_declares_one_model_and_two_real_engine_kinds() {
+    let config: ServerConfig =
+        serde_json::from_str(include_str!("../../../examples/locus-server.json"))
+            .expect("parse production example");
+
+    assert_eq!(config.models.len(), 1);
+    assert_eq!(config.engines.len(), 2);
+    assert_eq!(config.engines[0].kind, EngineKind::Sglang);
+    assert_eq!(config.engines[1].kind, EngineKind::Vllm);
 }

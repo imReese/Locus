@@ -14,7 +14,10 @@ bearer authentication, dependency-aware readiness, structured tracing, and
 official OpenAI SDK E2E are implemented. Live engine telemetry, persistent
 calibration, shadow evaluation, and gated active placement are implemented;
 their workload-specific live accuracy remains a deployment qualification.
-Per-tenant admission remains future work.
+Credential-bound tenant policy, token-weighted hierarchical admission,
+end-to-end deadline/cancellation, overload shedding, engine drain, and
+low-cardinality Prometheus export are implemented. The checked-in acceptance is
+deterministic; real dual-engine/GPU load remains an opt-in deployment gate.
 
 ## Thesis
 
@@ -292,15 +295,18 @@ types remain at the edges.
 
 ## Request lifecycle
 
-1. A northbound adapter parses and assigns an internal request identity.
-   Authentication remains a deployment concern.
+1. A northbound adapter authenticates a deployment credential, binds it to a
+   configured tenant policy, assigns an internal request identity plus a
+   tenant-clamped deadline, and reads the bounded request body under that
+   deadline before parsing it.
 2. Validation checks protocol shape, deployment policy, and declared model
    support.
 3. The selected `ModelIo` profile renders conversation templates or
    explicitly bypasses them for a raw prompt, normalizes media, tokenizes input,
    canonicalizes sampling, and declares required output semantics.
-4. A future admission controller may add priority, deadline, and tenant
-   constraints. The current service proceeds directly to discovery.
+4. Hierarchical admission charges normalized prompt plus reserved output
+   tokens, enforces global/class/tenant limits and overload policy, and holds
+   the resulting permit for the complete response stream.
 5. The capability registry filters execution targets that cannot satisfy the
    request.
 6. For eligible requests, the state store returns reusable-state candidates
@@ -416,7 +422,7 @@ The following stages are implemented and tested:
    shadow replay and fail-closed active promotion.
 
 The next production stages are additional model-specific parser dialects,
-multimodal normalization, per-tenant admission and fairness, telemetry export,
-repeated live-runtime calibration qualification, a deployed
-NexusKV bridge, physical state transfer, and topology/preload/replication
-policies. Engine-neutral boundary tests remain mandatory as integrations grow.
+multimodal normalization, repeated live-runtime and dual-engine traffic
+qualification, a deployed NexusKV bridge, physical state transfer, and
+topology/preload/replication policies. Engine-neutral boundary tests remain
+mandatory as integrations grow.

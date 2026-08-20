@@ -11,6 +11,7 @@ async-stream.workspace = true
 axum.workspace = true
 futures.workspace = true
 locus-core = { path = "../core" }
+locus-engine = { path = "../engine" }
 locus-planner = { path = "../planner" }
 locus-runtime = { path = "../runtime" }
 locus-model-io = { path = "../model-io" }
@@ -22,7 +23,6 @@ tokio.workspace = true
 
 [dev-dependencies]
 http-body-util.workspace = true
-locus-engine = { path = "../engine" }
 locus-store = { path = "../store" }
 tower.workspace = true
 

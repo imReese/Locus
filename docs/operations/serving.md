@@ -34,13 +34,15 @@ The top-level configuration contains:
 | Field | Purpose |
 | --- | --- |
 | `listen` | Socket address for the Locus HTTP server |
-| `api` | Bearer-secret environment variable and global ingress limits |
+| `api` | Request-body limit plus optional legacy single-tenant authentication |
+| `traffic` | Trusted tenant credentials, hierarchical admission, token/deadline limits, and overload shedding |
 | `models` | Static catalog source: public aliases plus immutable model and semantic artifacts |
 | `required_models` | Optional aliases that must be routable for readiness |
 | `engines` | SGLang/vLLM instances whose live model inventory is discovered at runtime |
 | `store` | Disabled or a versioned NexusKV store configuration |
 | `placement` | Shadow/active calibrated placement, durable state, gates, and conservative priors |
 | `observability` | Default tracing filter and compact/JSON log format |
+| `shutdown` | Engine/traffic drain grace and forced-cancellation grace |
 
 Unknown fields are rejected. Empty identities, zero parallel degrees, zero
 engine generations, duplicate engine/target IDs, unknown explicit profile
@@ -48,22 +50,41 @@ mappings, missing secrets, unreadable artifacts, invalid tokenizer JSON, and
 invalid templates all fail startup. A model profile without a currently loaded
 engine target does not fail startup.
 
-Secrets are named in configuration and read from the environment. The secret
-value itself does not belong in the JSON file:
+Secrets are named in configuration and read from the environment. Production
+credentials belong to a tenant policy, so the authenticated bearer token is the
+only source of tenant identity. A request body, metadata field, or
+`x-tenant-id` header cannot select a different policy:
 
 ```json
 {
-  "api": {
-    "bearer_token_env": "LOCUS_API_KEY",
-    "max_request_bytes": 2097152,
-    "max_concurrent_requests": 128
+  "traffic": {
+    "classes": [{
+      "id": "latency",
+      "weight": 4,
+      "max_active_requests": 48,
+      "max_active_tokens": 196608
+    }],
+    "tenants": [{
+      "id": "premium",
+      "service_class": "latency",
+      "weight": 4,
+      "max_active_requests": 32,
+      "max_active_tokens": 131072,
+      "max_queued_requests": 256,
+      "max_tokens_per_request": 32768,
+      "default_request_timeout_millis": 60000,
+      "max_request_timeout_millis": 120000,
+      "bearer_token_env": "LOCUS_PREMIUM_API_KEY"
+    }]
   }
 }
 ```
 
-Omitting `bearer_token_env` disables northbound authentication. This is useful
-for a protected development network but should be an explicit deployment
-choice. Engine and NexusKV API keys follow the same `*_env` pattern.
+For a custom `traffic` block, anonymous access is disabled unless
+`api.anonymous_tenant` explicitly names a configured tenant. The top-level
+`api.bearer_token_env` remains a compatibility form for the implicit legacy
+`default` tenant and cannot be combined with tenant credentials. Engine and
+NexusKV API keys follow the same `*_env` pattern.
 
 ## Model profiles
 
@@ -261,13 +282,69 @@ agreement, zero replay mismatches, and healthy persistence. Any failed gate or
 calibration error automatically executes the legacy plan; it does not fail the
 inference request or weaken hard constraints.
 
+## Production traffic control
+
+Admission runs after model normalization, not in an HTTP concurrency
+middleware. Locus therefore charges the exact normalized prompt-token count
+plus the requested output-token reservation (or `default_output_tokens` when
+the request omits it). A request must fit the global, service-class, and tenant
+active request/token caps. Oversized work fails before engine discovery and
+never waits forever for capacity it cannot obtain.
+
+Queued work is selected in two deterministic stages: the service class with the
+lowest token-normalized virtual runtime, then the tenant with the lowest
+token-normalized virtual runtime inside that class. Each dispatch increments
+virtual runtime by `reserved_tokens / configured_weight`. Tenant FIFO order is
+preserved. This makes weights meaningful for heterogeneous prompt/output sizes
+without allowing a warm-cache hit to bypass fairness.
+
+All queue lengths are bounded globally and per tenant. `QueueFull` and
+class-aware overload shedding return HTTP 429. A class may configure
+`shed_at_global_utilization_bps`; once active-token utilization reaches that
+threshold, new work in that class is rejected before occupying queue space.
+This is explicit load shedding: Locus does not silently reduce output tokens or
+change sampling semantics.
+
+The authenticated tenant policy supplies a default and maximum request
+deadline. A client may request a shorter deadline with
+`x-request-timeout-ms`; a longer value is clamped to the tenant maximum. The
+same `OperationContext` deadline and cancellation token cover admission,
+bounded request-body ingress and the post-parse validation checkpoint,
+discovery, store lookup/estimate/materialization, state-import operations,
+engine request establishment, calibration persistence, and every streamed
+engine event. Deadline expiry returns HTTP 408 with `deadline_exceeded`; client
+disconnect cancels the context, drops the downstream transport, and calls the
+adapter cancellation hook. State-import cleanup uses a separate bounded
+two-second cleanup context so an expired request cannot strand a prepared
+import.
+
+`GET /metrics` exports Locus-native Prometheus text. Its only labels are the
+configured `class` and `tenant` plus bounded enums such as `outcome` and
+`reason`; request IDs, model aliases, engine IDs, prompts, and error strings are
+never labels. Startup limits policy cardinality to 64 classes and 1,024 tenants.
+The export contains admission/rejection/termination counters,
+active and queued request/token gauges, queue-wait sum/count, drain state, and
+forced-cancellation count.
+
+The engine registry has explicit `ready -> draining -> stopped` lifecycle.
+Draining engines disappear from discovery and reject execution leases while
+existing streams retain their leases. `EngineRegistry::drain(engine_id, grace)`
+supports bounded maintenance drain of one runtime; it waits only for that
+engine's leases, cancels only those contexts at expiry, and leaves other
+runtimes routable. On SIGINT, Locus first drains traffic so
+requests admitted before the signal may still finish planning and acquire their
+engine lease. It rejects queued/new work and waits up to
+`shutdown.drain_timeout_millis`, cancelling remaining contexts at expiry. Locus
+then drains engine leases with the same bound and gives forced cancellations
+`force_cancel_grace_millis` to propagate before Axum finishes shutdown.
+
 ## Raw Completions example
 
 The compatibility endpoint accepts one text prompt or one token-ID sequence:
 
 ```bash
 curl http://127.0.0.1:8080/v1/completions \
-  -H "Authorization: Bearer $LOCUS_API_KEY" \
+  -H "Authorization: Bearer $LOCUS_PREMIUM_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "my-model",
@@ -299,6 +376,8 @@ listed alias must then have a ready target. Failure returns HTTP 503 with concis
 dependency evidence. The response reports total profiles, routable models,
 required models, observed targets, ready targets, placement mode, calibration
 revision, and calibration persistence health.
+During drain it returns HTTP 503 with `traffic_draining: true` even if engine
+health is otherwise green.
 
 The probes are intentionally outside bearer authentication so Kubernetes or
 another local orchestrator can call them. Do not expose them as a substitute for
@@ -306,11 +385,12 @@ an authenticated inference API.
 
 ## Ingress and observability
 
-Every `/v1/*` route is protected when a bearer secret is configured. Locus uses
-a constant-time token comparison after checking the candidate length. The body
-limit rejects oversized JSON with HTTP 413; the concurrency limit bounds active
-HTTP requests, including streaming requests. These are global safety limits,
-not per-tenant rate or fairness admission.
+Every `/v1/*` route is protected when tenant credentials are configured. Locus
+checks every configured credential with a constant-time comparison after the
+candidate-length check and injects the matched tenant as a trusted request
+extension. The body limit rejects oversized JSON with HTTP 413. Active and
+queued work—including streaming bodies—is then owned by the token-weighted
+runtime admission permit described above.
 
 Every request receives or preserves an `x-request-id`, and the response
 propagates it. The HTTP stack emits tracing spans without logging prompt bodies,
@@ -327,10 +407,9 @@ revision/TTL. At most 256 path records per decision variant are emitted; a
 truncation warning reports larger candidate sets. Neither level includes prompt
 content, raw token IDs, generated content, opaque state handles, or credentials.
 
-SIGINT initiates graceful shutdown: the listener stops accepting new work and
-Axum drains in-flight connections. Deadline policy, per-tenant admission,
-Prometheus export from Locus itself, and a deployment manifest remain separate
-follow-on work.
+SIGINT initiates the bounded traffic and engine-drain sequence described above.
+While the grace window runs, the process may still answer probes, but new
+inference admission returns HTTP 503 and readiness is false.
 
 ## Validation
 

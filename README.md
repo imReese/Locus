@@ -146,13 +146,16 @@ The Rust 2024 workspace keeps the architecture boundaries small and explicit:
   validation, and content-derived semantic fingerprints;
 - `locus-parser`: request-scoped reasoning and tagged-JSON tool-call parsers
   with bounded streaming state;
-- `locus-engine`: engine adapter contract, registry, and deterministic fake;
+- `locus-engine`: engine adapter contract, execution leases, drain lifecycle,
+  registry, and deterministic fake;
 - `locus-store`: state-store contract, null store, and deterministic fake;
 - `locus-planner`: cost-based path selection, persistent bounded calibration,
   promotion evidence, and the side-effecting `PlanExecutor`;
 - `locus-runtime`: `InferenceService`, target discovery, state-candidate
-  construction, shadow/replay and gated active planning, outcome observation,
-  model-event streaming, and cancellation;
+  construction, token-weighted hierarchical admission, tenant/deadline policy,
+  overload shedding, shadow/replay and gated active planning, outcome
+  observation, model-event streaming, cancellation, and low-cardinality
+  Prometheus export;
 - `locus-openai`: Responses, Chat Completions, raw text/token Completions, model
   listing, health, SSE, and OpenAI-shaped errors;
 - `locus-engine-openai`: network adapters for SGLang and vLLM completion and
@@ -160,9 +163,9 @@ The Rust 2024 workspace keeps the architecture boundaries small and explicit:
 - `locus-store-nexuskv`: optional, versioned HTTP bridge from NexusKV match and
   materialization results into the generic `StateStore` handshake;
 - `locus-server`: JSON configuration, dependency assembly, SGLang/vLLM and
-  optional NexusKV registration, bearer authentication, request limits,
-  dependency-aware readiness, calibrated-placement configuration, request IDs,
-  tracing, and graceful shutdown.
+  optional NexusKV registration, credential-bound tenant authentication,
+  request limits, dependency-aware readiness, calibrated-placement
+  configuration, request IDs, tracing, and bounded traffic/engine drain.
 
 The byte tokenizer and simple template renderer remain deterministic reference
 components for unit and SDK fixture tests. Deployments use
@@ -177,7 +180,9 @@ bash scripts/ci.sh
 Start a configured deployment with:
 
 ```bash
-LOCUS_API_KEY=replace-me cargo run -p locus-server -- examples/locus-server.json
+LOCUS_PREMIUM_API_KEY=replace-me \
+LOCUS_BATCH_API_KEY=replace-me \
+cargo run -p locus-server -- examples/locus-server.json
 ```
 
 The example contains placeholder artifact revisions and paths; replace them
@@ -214,15 +219,25 @@ that define the core architecture. Wire formats and Rust APIs remain pre-1.0.
   `scripts/live_engine_conformance.py` can exercise an explicitly configured
   live runtime and verify metric movement, but no live runtime or GPU result is
   checked into or implied by CI.
+- Deterministic tests cover credential-only tenant selection, token-charged
+  service-class/tenant ordering, bounded queues, overload shedding, deadline
+  propagation from request-body ingress through streaming, client cancellation,
+  stream-scoped permits, targeted dual-runtime drain/failover, and bounded
+  Prometheus labels. `scripts/traffic_control_load.py` adds opt-in real
+  dual-engine load gates using a quiet attribution window and both engines' own
+  normal-load token-counter deltas; it is not run or implied by provider-free
+  CI.
 - The NexusKV store requires a separately deployed
   `locus.nexuskv-bridge.v1` service. NexusKV now ships those endpoints, and CI
   starts that implementation in a separate process with the real Rust matcher.
   Shared fixtures and the complete Locus prepare/materialize/commit handshake
   are enforced; native engine import and physical transfer remain unverified.
-- Bearer authentication, global body/concurrency limits, readiness, request IDs,
-  and structured tracing are implemented. Per-tenant rate/fairness admission,
-  Prometheus export from Locus itself, multimodal normalization, and production
-  qualification or additional model-specific parser dialects remain future work.
+- Credential-bound tenant authentication, hierarchical fair admission,
+  request/token caps, overload shedding, end-to-end deadlines/cancellation,
+  engine drain, Locus-native Prometheus export, readiness, request IDs, and
+  structured tracing are implemented. Live production qualification,
+  multimodal normalization, and additional model-specific parser dialects
+  remain deployment or follow-on work.
 
 ## Scope
 

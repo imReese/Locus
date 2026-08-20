@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use futures::{Stream, StreamExt, stream::BoxStream};
@@ -25,6 +25,13 @@ use locus_planner::{
 };
 use locus_store::{StateStore, StoreError};
 use thiserror::Error;
+
+pub mod traffic;
+
+pub use traffic::{
+    AdmissionError, AdmissionPermit, DrainReport, ServiceClassPolicy, TenantPolicy,
+    TrafficConfigurationError, TrafficController, TrafficPolicy,
+};
 
 pub type ModelEventStream = BoxStream<'static, Result<ModelEvent, InferenceError>>;
 
@@ -67,7 +74,7 @@ impl TargetDiscovery for EngineTargetDiscovery {
     ) -> Result<Vec<DiscoveredTarget>, InferenceError> {
         let mut discovered = Vec::new();
         let mut failures = Vec::new();
-        for adapter in self.engines.adapters()? {
+        for adapter in self.engines.routable_adapters()? {
             let targets = match adapter.execution_targets(context).await {
                 Ok(targets) => targets,
                 Err(error) => {
@@ -132,6 +139,7 @@ pub struct ReadinessReport {
     pub calibration_revision: u64,
     pub calibration_persistent: bool,
     pub calibration_persistence_healthy: bool,
+    pub traffic_draining: bool,
 }
 
 #[derive(Clone)]
@@ -181,6 +189,7 @@ pub struct DefaultInferenceService {
     policy: RoutingPolicy,
     required_models: BTreeSet<String>,
     placement: PlacementControl,
+    traffic: Option<TrafficController>,
 }
 
 struct TargetInventory {
@@ -209,6 +218,7 @@ impl DefaultInferenceService {
             policy: RoutingPolicy::default(),
             required_models: BTreeSet::new(),
             placement: PlacementControl::shadow(default_calibrator()),
+            traffic: None,
         }
     }
 
@@ -232,6 +242,7 @@ impl DefaultInferenceService {
             policy,
             required_models: BTreeSet::new(),
             placement: PlacementControl::shadow(default_calibrator()),
+            traffic: None,
         }
     }
 
@@ -250,6 +261,12 @@ impl DefaultInferenceService {
         self
     }
 
+    #[must_use]
+    pub fn with_traffic_control(mut self, traffic: TrafficController) -> Self {
+        self.traffic = Some(traffic);
+        self
+    }
+
     async fn target_inventory(&self) -> Result<TargetInventory, InferenceError> {
         let profiles = self.catalog.profiles()?;
         let catalog_models = profiles
@@ -261,7 +278,7 @@ impl DefaultInferenceService {
         let mut observed_targets = 0_usize;
         let mut ready_targets = 0_usize;
         let mut failures = Vec::new();
-        for adapter in self.engines.adapters()? {
+        for adapter in self.engines.routable_adapters()? {
             let targets = match adapter.execution_targets(&context).await {
                 Ok(targets) => targets,
                 Err(error) => {
@@ -547,13 +564,88 @@ impl InferenceService for DefaultInferenceService {
         context.ensure_active()?;
         let model_io = self.catalog.resolve(&request.model)?;
         let normalized = model_io.normalize(&request, context.request_id.clone())?;
-        let mut pipeline = model_io.output_pipeline(&normalized.output_contract)?;
-        let planning_input = self
-            .planning_input(normalized.canonical.clone(), &context)
-            .await?;
-        let selection = self.select_plan(&planning_input).await?;
+        context.ensure_active()?;
+        let token_cost = input_token_count(&normalized.canonical).saturating_add(
+            normalized.canonical.sampling.max_output_tokens.map_or_else(
+                || {
+                    self.traffic
+                        .as_ref()
+                        .map_or(16, TrafficController::default_output_tokens)
+                },
+                u64::from,
+            ),
+        );
+        let admission_permit = match &self.traffic {
+            Some(traffic) => Some(traffic.admit(token_cost, &context).await?),
+            None => None,
+        };
+        let mut pipeline = match model_io.output_pipeline(&normalized.output_contract) {
+            Ok(pipeline) => pipeline,
+            Err(error) => {
+                record_traffic_termination(self.traffic.as_ref(), &context, "request_error");
+                return Err(error.into());
+            }
+        };
+        let planning_input = match context
+            .run(self.planning_input(normalized.canonical.clone(), &context))
+            .await
+        {
+            Ok(Ok(input)) => input,
+            Ok(Err(error)) => {
+                return Err(normalize_admitted_error(
+                    self.traffic.as_ref(),
+                    &context,
+                    error,
+                ));
+            }
+            Err(error) => {
+                record_traffic_termination(
+                    self.traffic.as_ref(),
+                    &context,
+                    context_termination_reason(&error),
+                );
+                return Err(error.into());
+            }
+        };
+        let selection = match context.run(self.select_plan(&planning_input)).await {
+            Ok(Ok(selection)) => selection,
+            Ok(Err(error)) => {
+                return Err(normalize_admitted_error(
+                    self.traffic.as_ref(),
+                    &context,
+                    error,
+                ));
+            }
+            Err(error) => {
+                record_traffic_termination(
+                    self.traffic.as_ref(),
+                    &context,
+                    context_termination_reason(&error),
+                );
+                return Err(error.into());
+            }
+        };
         let plan = selection.plan;
-        let adapter = self.engines.adapter_for(&plan.target)?;
+        let adapter = match self.engines.adapter_for(&plan.target) {
+            Ok(adapter) => adapter,
+            Err(error) => {
+                return Err(normalize_admitted_error(
+                    self.traffic.as_ref(),
+                    &context,
+                    error.into(),
+                ));
+            }
+        };
+        let engine_permit = match self.engines.acquire_execution(&plan.target, &context) {
+            Ok(permit) => permit,
+            Err(error) => {
+                return Err(normalize_admitted_error(
+                    self.traffic.as_ref(),
+                    &context,
+                    error.into(),
+                ));
+            }
+        };
         let selected_target_id = plan.target.id.to_string();
         let observation_key = CalibrationKey::from_target(&plan.target);
         let waiting_requests = planning_input
@@ -595,21 +687,86 @@ impl InferenceService for DefaultInferenceService {
             "placement decision"
         );
         let execution_started = Instant::now();
-        let execution = self
+        let execution = match self
             .executor
-            .execute(plan, normalized.canonical, context)
-            .await?;
+            .execute(plan, normalized.canonical, context.clone())
+            .await
+        {
+            Ok(execution) => execution,
+            Err(error) => {
+                if let Err(context_error) = context.ensure_active() {
+                    cancel_engine_request(&adapter, &planning_input.request.id).await;
+                    if let Some(traffic) = &self.traffic {
+                        traffic.record_termination(
+                            &context,
+                            context_termination_reason(&context_error),
+                        );
+                    }
+                } else if let Some(traffic) = &self.traffic {
+                    traffic.record_termination(&context, "engine_error");
+                }
+                return Err(error.into());
+            }
+        };
         let execution_metadata = execution.metadata;
         let engine_stream = execution.stream;
         let calibrator = self.placement.calibrator.clone();
+        let stream_context = context.clone();
+        let traffic = self.traffic.clone();
+        let cancel_traffic = self.traffic.clone();
         let stream = async_stream::try_stream! {
+            let _admission_permit = admission_permit;
+            let _engine_permit = engine_permit;
             let mut engine_stream = engine_stream;
             let mut first_output_at = None;
-            while let Some(event) = engine_stream.next().await {
-                let event = event?;
+            loop {
+                let event = match stream_context.run(engine_stream.next()).await {
+                    Ok(Some(event)) => event,
+                    Ok(None) => {
+                        record_traffic_termination(
+                            traffic.as_ref(),
+                            &stream_context,
+                            "engine_error",
+                        );
+                        Err(InferenceError::Engine(EngineError::Execution(
+                            "engine stream ended without a terminal event".to_owned(),
+                        )))?
+                    }
+                    Err(error) => {
+                        if let Some(traffic) = &traffic {
+                            let reason = match error {
+                                locus_core::ContextError::Cancelled => "cancelled",
+                                locus_core::ContextError::DeadlineExceeded => "deadline",
+                            };
+                            traffic.record_termination(&stream_context, reason);
+                        }
+                        Err(InferenceError::Context(error))?
+                    }
+                };
+                let event = match event {
+                    Ok(event) => event,
+                    Err(error) => {
+                        if let Some(traffic) = &traffic {
+                            traffic.record_termination(&stream_context, "engine_error");
+                        }
+                        Err(error)?
+                    }
+                };
                 if first_output_at.is_none() && is_output_event(&event) {
                     first_output_at = Some(Instant::now());
                 }
+                let terminal_reason = match &event {
+                    EngineEvent::Finished {
+                        reason: EngineFinishReason::Cancelled,
+                        ..
+                    } => Some("cancelled"),
+                    EngineEvent::Finished {
+                        reason: EngineFinishReason::Error,
+                        ..
+                    } => Some("engine_error"),
+                    EngineEvent::Finished { .. } => Some("completed"),
+                    _ => None,
+                };
                 if let EngineEvent::Finished { reason, usage, .. } = &event {
                     let completed = !matches!(reason, EngineFinishReason::Cancelled | EngineFinishReason::Error);
                     let materialization = execution_metadata.materialization.as_ref().map(|timing| {
@@ -663,20 +820,53 @@ impl InferenceService for DefaultInferenceService {
                         "placement outcome"
                     );
                     let observation_calibrator = calibrator.clone();
-                    match tokio::task::spawn_blocking(move || {
+                    match stream_context.run(tokio::task::spawn_blocking(move || {
                         observation_calibrator.record_observation(&observation)
-                    }).await {
-                        Ok(Ok(())) => {}
-                        Ok(Err(error)) => tracing::warn!(error = %error, "failed to record calibration observation"),
-                        Err(error) => tracing::warn!(error = %error, "calibration observation task failed"),
+                    })).await {
+                        Ok(Ok(Ok(()))) => {}
+                        Ok(Ok(Err(error))) => tracing::warn!(error = %error, "failed to record calibration observation"),
+                        Ok(Err(error)) => tracing::warn!(error = %error, "calibration observation task failed"),
+                        Err(error) => {
+                            if let Some(traffic) = &traffic {
+                                traffic.record_termination(
+                                    &stream_context,
+                                    context_termination_reason(&error),
+                                );
+                            }
+                            Err(InferenceError::Context(error))?
+                        }
                     }
                 }
-                for event in pipeline.process(event)? {
+                let processed = match pipeline.process(event) {
+                    Ok(processed) => processed,
+                    Err(error) => {
+                        record_traffic_termination(
+                            traffic.as_ref(),
+                            &stream_context,
+                            "request_error",
+                        );
+                        Err(InferenceError::ModelIo(error))?
+                    }
+                };
+                if let Some(reason) = terminal_reason {
+                    record_traffic_termination(traffic.as_ref(), &stream_context, reason);
+                }
+                for event in processed {
                     yield event;
+                }
+                if terminal_reason.is_some() {
+                    break;
                 }
             }
         };
-        Ok(CancelOnDropStream::new(Box::pin(stream), planning_input.request.id, adapter).boxed())
+        Ok(CancelOnDropStream::new(
+            Box::pin(stream),
+            planning_input.request.id,
+            adapter,
+            context,
+            cancel_traffic,
+        )
+        .boxed())
     }
 
     async fn models(&self) -> Result<Vec<ModelProfile>, InferenceError> {
@@ -743,6 +933,10 @@ impl InferenceService for DefaultInferenceService {
             calibration_revision: calibration.revision,
             calibration_persistent: calibration.persistent,
             calibration_persistence_healthy: calibration.persistence_healthy,
+            traffic_draining: self
+                .traffic
+                .as_ref()
+                .is_some_and(TrafficController::is_draining),
         })
     }
 }
@@ -839,6 +1033,57 @@ fn is_output_event(event: &EngineEvent) -> bool {
             | EngineEvent::ToolCallArgumentsDelta { .. }
             | EngineEvent::ToolCallCompleted { .. }
     )
+}
+
+fn context_termination_reason(error: &locus_core::ContextError) -> &'static str {
+    match error {
+        locus_core::ContextError::Cancelled => "cancelled",
+        locus_core::ContextError::DeadlineExceeded => "deadline",
+    }
+}
+
+fn record_traffic_termination(
+    traffic: Option<&TrafficController>,
+    context: &OperationContext,
+    reason: &'static str,
+) {
+    if let Some(traffic) = traffic {
+        traffic.record_termination(context, reason);
+    }
+}
+
+fn normalize_admitted_error(
+    traffic: Option<&TrafficController>,
+    context: &OperationContext,
+    error: InferenceError,
+) -> InferenceError {
+    match context.ensure_active() {
+        Ok(()) => {
+            record_traffic_termination(traffic, context, "request_error");
+            error
+        }
+        Err(context_error) => {
+            record_traffic_termination(
+                traffic,
+                context,
+                context_termination_reason(&context_error),
+            );
+            context_error.into()
+        }
+    }
+}
+
+async fn cancel_engine_request(adapter: &Arc<dyn EngineAdapter>, request_id: &RequestId) {
+    let cleanup_context = OperationContext::new(request_id.clone())
+        .with_deadline(Instant::now() + Duration::from_secs(2));
+    match cleanup_context
+        .run(adapter.cancel(request_id, &cleanup_context))
+        .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => tracing::warn!(%error, %request_id, "engine cancellation failed"),
+        Err(error) => tracing::warn!(%error, %request_id, "engine cancellation timed out"),
+    }
 }
 
 struct PathAudit {
@@ -1095,7 +1340,10 @@ struct CancelOnDropStream {
     inner: ModelEventStream,
     request_id: RequestId,
     adapter: Arc<dyn EngineAdapter>,
+    context: OperationContext,
+    traffic: Option<TrafficController>,
     completed: bool,
+    terminal_error: bool,
 }
 
 impl CancelOnDropStream {
@@ -1103,12 +1351,17 @@ impl CancelOnDropStream {
         inner: Pin<Box<dyn Stream<Item = Result<ModelEvent, InferenceError>> + Send>>,
         request_id: RequestId,
         adapter: Arc<dyn EngineAdapter>,
+        context: OperationContext,
+        traffic: Option<TrafficController>,
     ) -> Self {
         Self {
             inner,
             request_id,
             adapter,
+            context,
+            traffic,
             completed: false,
+            terminal_error: false,
         }
     }
 }
@@ -1124,6 +1377,9 @@ impl Stream for CancelOnDropStream {
         ) {
             self.completed = true;
         }
+        if matches!(&result, Poll::Ready(Some(Err(_)))) {
+            self.terminal_error = true;
+        }
         result
     }
 }
@@ -1133,12 +1389,17 @@ impl Drop for CancelOnDropStream {
         if self.completed {
             return;
         }
+        self.context.cancellation.cancel();
+        if !self.terminal_error
+            && let Some(traffic) = &self.traffic
+        {
+            traffic.record_termination(&self.context, "client_cancelled");
+        }
         let adapter = Arc::clone(&self.adapter);
         let request_id = self.request_id.clone();
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             runtime.spawn(async move {
-                let context = OperationContext::new(request_id.clone());
-                let _ = adapter.cancel(&request_id, &context).await;
+                cancel_engine_request(&adapter, &request_id).await;
             });
         }
     }
@@ -1148,6 +1409,8 @@ impl Drop for CancelOnDropStream {
 pub enum InferenceError {
     #[error(transparent)]
     Context(#[from] locus_core::ContextError),
+    #[error(transparent)]
+    Admission(#[from] AdmissionError),
     #[error(transparent)]
     ModelIo(#[from] ModelIoError),
     #[error(transparent)]

@@ -22,10 +22,13 @@ use locus_engine_openai::{
 };
 use locus_model_io::ModelRegistry;
 use locus_model_io::hf::{HuggingFaceProfileSpec, load_huggingface_model_io};
-use locus_openai::{ApiConfig, router_with_config};
+use locus_openai::{ApiConfig, TenantCredential, router_with_config};
 use locus_parser::{TaggedJsonToolParserSpec, TaggedReasoningParserSpec};
 use locus_planner::{CalibrationPolicy, PersistentCalibrator, PlacementMode};
-use locus_runtime::{DefaultInferenceService, InferenceService, PlacementControl};
+use locus_runtime::{
+    DefaultInferenceService, InferenceService, PlacementControl, ServiceClassPolicy, TenantPolicy,
+    TrafficController, TrafficPolicy,
+};
 use locus_store::{NullStateStore, StateStore};
 use locus_store_nexuskv::{NexusKvStore, NexusKvStoreConfig};
 use serde::Deserialize;
@@ -56,6 +59,10 @@ pub struct ServerConfig {
     pub observability: ObservabilitySettings,
     #[serde(default)]
     pub placement: PlacementSettings,
+    #[serde(default)]
+    pub traffic: Option<TrafficSettings>,
+    #[serde(default)]
+    pub shutdown: ShutdownSettings,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -67,6 +74,11 @@ pub struct ApiSettings {
     pub max_request_bytes: usize,
     #[serde(default = "default_max_concurrent_requests")]
     pub max_concurrent_requests: usize,
+    /// Anonymous traffic is disabled by default for explicit traffic-policy
+    /// configurations. Legacy configurations without `traffic` retain the
+    /// historical anonymous `default` tenant.
+    #[serde(default)]
+    pub anonymous_tenant: Option<String>,
 }
 
 impl Default for ApiSettings {
@@ -75,6 +87,150 @@ impl Default for ApiSettings {
             bearer_token_env: None,
             max_request_bytes: default_max_request_bytes(),
             max_concurrent_requests: default_max_concurrent_requests(),
+            anonymous_tenant: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TrafficSettings {
+    pub max_active_requests: usize,
+    pub max_active_tokens: u64,
+    pub max_queued_requests: usize,
+    pub default_output_tokens: u64,
+    pub classes: Vec<ServiceClassSettings>,
+    pub tenants: Vec<TenantTrafficSettings>,
+}
+
+impl Default for TrafficSettings {
+    fn default() -> Self {
+        let policy = TrafficPolicy::default();
+        Self {
+            max_active_requests: policy.max_active_requests,
+            max_active_tokens: policy.max_active_tokens,
+            max_queued_requests: policy.max_queued_requests,
+            default_output_tokens: policy.default_output_tokens,
+            classes: Vec::new(),
+            tenants: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServiceClassSettings {
+    pub id: String,
+    #[serde(default = "default_weight")]
+    pub weight: u32,
+    #[serde(default = "default_max_concurrent_requests")]
+    pub max_active_requests: usize,
+    #[serde(default = "default_max_active_tokens")]
+    pub max_active_tokens: u64,
+    #[serde(default)]
+    pub shed_at_global_utilization_bps: Option<u16>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TenantTrafficSettings {
+    pub id: String,
+    pub service_class: String,
+    #[serde(default = "default_weight")]
+    pub weight: u32,
+    #[serde(default = "default_max_concurrent_requests")]
+    pub max_active_requests: usize,
+    #[serde(default = "default_max_active_tokens")]
+    pub max_active_tokens: u64,
+    #[serde(default = "default_max_queued_requests")]
+    pub max_queued_requests: usize,
+    #[serde(default = "default_max_tokens_per_request")]
+    pub max_tokens_per_request: u64,
+    #[serde(default = "default_request_timeout_millis")]
+    pub default_request_timeout_millis: u64,
+    #[serde(default = "default_max_request_timeout_millis")]
+    pub max_request_timeout_millis: u64,
+    #[serde(default)]
+    pub bearer_token_env: Option<String>,
+}
+
+const fn default_weight() -> u32 {
+    1
+}
+
+const fn default_max_active_tokens() -> u64 {
+    1_048_576
+}
+
+const fn default_max_queued_requests() -> usize {
+    1_024
+}
+
+const fn default_max_tokens_per_request() -> u64 {
+    65_536
+}
+
+const fn default_request_timeout_millis() -> u64 {
+    120_000
+}
+
+const fn default_max_request_timeout_millis() -> u64 {
+    600_000
+}
+
+impl TrafficSettings {
+    fn policy(&self) -> TrafficPolicy {
+        TrafficPolicy {
+            max_active_requests: self.max_active_requests,
+            max_active_tokens: self.max_active_tokens,
+            max_queued_requests: self.max_queued_requests,
+            default_output_tokens: self.default_output_tokens,
+            classes: self
+                .classes
+                .iter()
+                .map(|class| ServiceClassPolicy {
+                    id: class.id.clone(),
+                    weight: class.weight,
+                    max_active_requests: class.max_active_requests,
+                    max_active_tokens: class.max_active_tokens,
+                    shed_at_global_utilization_bps: class.shed_at_global_utilization_bps,
+                })
+                .collect(),
+            tenants: self
+                .tenants
+                .iter()
+                .map(|tenant| TenantPolicy {
+                    id: tenant.id.clone(),
+                    service_class: tenant.service_class.clone(),
+                    weight: tenant.weight,
+                    max_active_requests: tenant.max_active_requests,
+                    max_active_tokens: tenant.max_active_tokens,
+                    max_queued_requests: tenant.max_queued_requests,
+                    max_tokens_per_request: tenant.max_tokens_per_request,
+                    default_request_timeout: std::time::Duration::from_millis(
+                        tenant.default_request_timeout_millis,
+                    ),
+                    max_request_timeout: std::time::Duration::from_millis(
+                        tenant.max_request_timeout_millis,
+                    ),
+                })
+                .collect(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ShutdownSettings {
+    pub drain_timeout_millis: u64,
+    pub force_cancel_grace_millis: u64,
+}
+
+impl Default for ShutdownSettings {
+    fn default() -> Self {
+        Self {
+            drain_timeout_millis: 30_000,
+            force_cancel_grace_millis: 5_000,
         }
     }
 }
@@ -184,7 +340,7 @@ const fn default_max_tool_call_bytes() -> usize {
     64 * 1024
 }
 
-#[derive(Clone, Copy, Debug, Deserialize)]
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum EngineKind {
     Sglang,
@@ -480,6 +636,9 @@ pub struct ConfiguredServer {
     pub listen: SocketAddr,
     pub app: Router,
     pub observability: ObservabilitySettings,
+    pub traffic: TrafficController,
+    pub engines: EngineRegistry,
+    pub shutdown: ShutdownSettings,
 }
 
 pub fn load_config(path: &Path) -> Result<ServerConfig, ServerError> {
@@ -505,6 +664,11 @@ pub fn build_server(
     if config.engines.is_empty() {
         return Err(ServerError::InvalidConfig(
             "at least one engine must be configured".to_owned(),
+        ));
+    }
+    if config.api.max_concurrent_requests == 0 {
+        return Err(ServerError::InvalidConfig(
+            "api.max_concurrent_requests must be greater than zero".to_owned(),
         ));
     }
     let models = ModelRegistry::new();
@@ -679,15 +843,59 @@ pub fn build_server(
         calibrator,
         config.placement.active_confirmation.as_deref(),
     )?;
+    if config.shutdown.drain_timeout_millis == 0 || config.shutdown.force_cancel_grace_millis == 0 {
+        return Err(ServerError::InvalidConfig(
+            "shutdown drain and force-cancel grace must be greater than zero".to_owned(),
+        ));
+    }
+    let traffic_policy = config.traffic.as_ref().map_or_else(
+        || legacy_traffic_policy(config.api.max_concurrent_requests),
+        TrafficSettings::policy,
+    );
+    let traffic = TrafficController::new(traffic_policy)?;
+    let tenant_credentials = config
+        .traffic
+        .as_ref()
+        .into_iter()
+        .flat_map(|settings| settings.tenants.iter())
+        .filter_map(|tenant| {
+            tenant
+                .bearer_token_env
+                .as_deref()
+                .map(|variable| (tenant.id.clone(), variable))
+        })
+        .map(|(tenant_id, variable)| {
+            Ok(TenantCredential {
+                tenant_id,
+                bearer_token: resolve_secret(variable)?,
+            })
+        })
+        .collect::<Result<Vec<_>, ServerError>>()?;
+    let legacy_bearer_token = resolve_optional_secret(config.api.bearer_token_env.as_deref())?;
+    let anonymous_tenant = config.api.anonymous_tenant.clone().or_else(|| {
+        (config.traffic.is_none() && legacy_bearer_token.is_none()).then(|| "default".to_owned())
+    });
+    if config.traffic.is_some()
+        && tenant_credentials.is_empty()
+        && legacy_bearer_token.is_none()
+        && anonymous_tenant.is_none()
+    {
+        return Err(ServerError::InvalidConfig(
+            "custom traffic policy requires tenant credentials or api.anonymous_tenant".to_owned(),
+        ));
+    }
     let service: Arc<dyn InferenceService> = Arc::new(
-        DefaultInferenceService::new(models, engines, store)
+        DefaultInferenceService::new(models, engines.clone(), store)
             .with_required_models(required_models)
-            .with_placement_control(placement),
+            .with_placement_control(placement)
+            .with_traffic_control(traffic.clone()),
     );
     let api = ApiConfig {
-        bearer_token: resolve_optional_secret(config.api.bearer_token_env.as_deref())?,
+        bearer_token: legacy_bearer_token,
+        tenant_credentials,
+        anonymous_tenant,
+        traffic: traffic.clone(),
         max_request_bytes: config.api.max_request_bytes,
-        max_concurrent_requests: config.api.max_concurrent_requests,
     };
     let request_id_header = HeaderName::from_static(REQUEST_ID_HEADER);
     let app = router_with_config(service, api)?
@@ -718,7 +926,24 @@ pub fn build_server(
         listen: config.listen,
         app,
         observability: config.observability,
+        traffic,
+        engines,
+        shutdown: config.shutdown,
     })
+}
+
+fn legacy_traffic_policy(max_concurrent_requests: usize) -> TrafficPolicy {
+    let mut policy = TrafficPolicy {
+        max_active_requests: max_concurrent_requests,
+        ..TrafficPolicy::default()
+    };
+    if let Some(class) = policy.classes.first_mut() {
+        class.max_active_requests = max_concurrent_requests;
+    }
+    if let Some(tenant) = policy.tenants.first_mut() {
+        tenant.max_active_requests = max_concurrent_requests;
+    }
+    policy
 }
 
 fn resolve_engine_models(
@@ -897,4 +1122,6 @@ pub enum ServerError {
     Calibration(#[from] locus_planner::CalibrationError),
     #[error(transparent)]
     Placement(#[from] locus_runtime::PlacementConfigurationError),
+    #[error(transparent)]
+    Traffic(#[from] locus_runtime::TrafficConfigurationError),
 }

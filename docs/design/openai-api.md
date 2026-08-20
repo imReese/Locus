@@ -18,6 +18,7 @@ stream-close cancellation.
 - `GET /v1/models`: public aliases with at least one live, healthy execution target
 - `GET /healthz`: process liveness; intentionally does not probe dependencies
 - `GET /readyz`: gateway routability, explicit required-model gates, and target health
+- `GET /metrics`: low-cardinality Locus admission, lifecycle, and drain metrics
 
 Responses is the primary interface. Chat Completions and Completions are
 compatibility layers: all three translate into `ModelRequest`, call the same
@@ -48,11 +49,16 @@ returns `model_not_found` with HTTP 404; a known profile without an eligible liv
 target returns `no_available_target` with HTTP 503. Invalid requests,
 cancellation, deadlines, and internal failures map to stable error categories.
 
-`locus-server` can require a bearer token for every `/v1/*` route while leaving
-the probe routes unauthenticated for an orchestrator. Token comparison is
-constant-time after a length check. Configurable request-body and concurrent-
-request limits bound ingress work. These are global deployment limits, not a
-tenant quota or fairness scheduler.
+`locus-server` maps each configured bearer credential to exactly one tenant
+policy while leaving probes unauthenticated for an orchestrator. Token
+comparison is constant-time after a length check. Request JSON and arbitrary
+headers cannot override the authenticated tenant. The tenant-clamped deadline
+is created before bounded request-body ingestion, then reused by normalization,
+admission, planning, engine execution, and streaming. After exact model
+normalization, the runtime charges prompt plus reserved output tokens and queues
+by service-class and tenant virtual runtime. Global/class/tenant request and
+token caps, bounded queues, class-aware overload shedding, and tenant-owned
+deadline clamps apply to JSON and streaming responses.
 
 ## Streaming ownership
 
@@ -66,10 +72,11 @@ cancellation to the selected `EngineAdapter`.
 
 ## Not implemented
 
-Per-tenant rate limits, persistence and `previous_response_id`, image or audio
-inputs, hosted tools, logprobs, multiple choices, and full OpenAI API surface
-parity are outside the current subset. The serde DTOs use strict field checking
-so these gaps fail explicitly.
+Distributed admission-state sharing across multiple Locus replicas, request
+persistence and `previous_response_id`, image or audio inputs, hosted tools,
+logprobs, multiple choices, and full OpenAI API surface parity are outside the
+current subset. One process is authoritative for its configured admission
+budget. The serde DTOs use strict field checking so API gaps fail explicitly.
 
 Function calling and reasoning require either compatible typed engine events or
 an explicitly configured model-profile parser. With a profile parser, planning

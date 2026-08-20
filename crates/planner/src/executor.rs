@@ -1,7 +1,7 @@
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use locus_core::{CanonicalRequest, OperationContext, StateImportSpec, StateImportTarget};
@@ -80,10 +80,9 @@ impl DefaultPlanExecutor {
         match fallback {
             FallbackAction::ColdOnSameTarget => {
                 let adapter = self.engines.adapter_for(&plan.target)?;
-                let stream = adapter
-                    .execute(&plan.target, request, None, context)
-                    .await
-                    .map_err(PlanExecutionError::Engine)?;
+                let stream = context
+                    .run(adapter.execute(&plan.target, request, None, context.clone()))
+                    .await??;
                 Ok(PlanExecution {
                     stream,
                     metadata: PlanExecutionMetadata {
@@ -109,8 +108,22 @@ impl DefaultPlanExecutor {
         materialization: Option<MaterializationTiming>,
     ) -> Result<PlanExecution, PlanExecutionError> {
         let adapter = self.engines.adapter_for(&plan.target)?;
-        if let Err(cleanup) = adapter.abort_state_import(import, &context).await {
-            return Err(PlanExecutionError::CleanupFailed { cause, cleanup });
+        let cleanup_context = OperationContext::new(context.request_id.clone())
+            .with_deadline(Instant::now() + Duration::from_secs(2));
+        match cleanup_context
+            .run(adapter.abort_state_import(import, &cleanup_context))
+            .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(cleanup)) => {
+                return Err(PlanExecutionError::CleanupFailed { cause, cleanup });
+            }
+            Err(cleanup) => {
+                return Err(PlanExecutionError::CleanupFailed {
+                    cause,
+                    cleanup: EngineError::Context(cleanup),
+                });
+            }
         }
         self.apply_fallback(
             plan.fallback,
@@ -121,6 +134,58 @@ impl DefaultPlanExecutor {
             materialization,
         )
         .await
+    }
+
+    async fn abort_after_context_error(
+        &self,
+        import: &StateImportTarget,
+        plan: &PlacementPlan,
+        context: &OperationContext,
+        error: locus_core::ContextError,
+    ) -> Result<PlanExecution, PlanExecutionError> {
+        let adapter = self.engines.adapter_for(&plan.target)?;
+        let cleanup_context = OperationContext::new(context.request_id.clone())
+            .with_deadline(Instant::now() + Duration::from_secs(2));
+        match cleanup_context
+            .run(adapter.abort_state_import(import, &cleanup_context))
+            .await
+        {
+            Ok(Ok(())) => Err(error.into()),
+            Ok(Err(cleanup)) => Err(PlanExecutionError::CleanupFailed {
+                cause: error.to_string(),
+                cleanup,
+            }),
+            Err(cleanup) => Err(PlanExecutionError::CleanupFailed {
+                cause: error.to_string(),
+                cleanup: EngineError::Context(cleanup),
+            }),
+        }
+    }
+
+    async fn abort_after_engine_error(
+        &self,
+        import: &StateImportTarget,
+        plan: &PlacementPlan,
+        context: &OperationContext,
+        error: EngineError,
+    ) -> Result<PlanExecution, PlanExecutionError> {
+        let adapter = self.engines.adapter_for(&plan.target)?;
+        let cleanup_context = OperationContext::new(context.request_id.clone())
+            .with_deadline(Instant::now() + Duration::from_secs(2));
+        match cleanup_context
+            .run(adapter.abort_state_import(import, &cleanup_context))
+            .await
+        {
+            Ok(Ok(())) => Err(PlanExecutionError::Engine(error)),
+            Ok(Err(cleanup)) => Err(PlanExecutionError::CleanupFailed {
+                cause: error.to_string(),
+                cleanup,
+            }),
+            Err(cleanup) => Err(PlanExecutionError::CleanupFailed {
+                cause: error.to_string(),
+                cleanup: EngineError::Context(cleanup),
+            }),
+        }
     }
 }
 
@@ -141,10 +206,9 @@ impl PlanExecutor for DefaultPlanExecutor {
 
         let adapter = self.engines.adapter_for(&plan.target)?;
         let ExecutionPath::Reuse(reuse) = &plan.path else {
-            let stream = adapter
-                .execute(&plan.target, request, None, context)
-                .await
-                .map_err(PlanExecutionError::Engine)?;
+            let stream = context
+                .run(adapter.execute(&plan.target, request, None, context.clone()))
+                .await??;
             return Ok(PlanExecution {
                 stream,
                 metadata: PlanExecutionMetadata {
@@ -158,12 +222,13 @@ impl PlanExecutor for DefaultPlanExecutor {
 
         let spec = StateImportSpec::from_plan(&reuse.state, reuse.compatibility.clone());
         let activation_started = Instant::now();
-        let import = match adapter
-            .prepare_state_import(&plan.target, &spec, &context)
+        let import = match context
+            .run(adapter.prepare_state_import(&plan.target, &spec, &context))
             .await
         {
-            Ok(import) => import,
-            Err(error) => {
+            Ok(Ok(import)) => import,
+            Ok(Err(EngineError::Context(error))) => return Err(error.into()),
+            Ok(Err(error)) => {
                 return self
                     .apply_fallback(
                         plan.fallback,
@@ -175,18 +240,28 @@ impl PlanExecutor for DefaultPlanExecutor {
                     )
                     .await;
             }
+            Err(error) => return Err(error.into()),
         };
 
         let materialization_started = Instant::now();
-        let receipt = match self
-            .store
-            .materialize(&reuse.option, &import, &context)
+        let receipt = match context
+            .run(self.store.materialize(&reuse.option, &import, &context))
             .await
         {
-            Ok(receipt) => receipt,
-            Err(error) => {
+            Ok(Ok(receipt)) => receipt,
+            Ok(Err(StoreError::Context(error))) => {
+                return self
+                    .abort_after_context_error(&import, &plan, &context, error)
+                    .await;
+            }
+            Ok(Err(error)) => {
                 return self
                     .abort_then_fallback(&import, &plan, request, context, error.to_string(), None)
+                    .await;
+            }
+            Err(error) => {
+                return self
+                    .abort_after_context_error(&import, &plan, &context, error)
                     .await;
             }
         };
@@ -198,12 +273,17 @@ impl PlanExecutor for DefaultPlanExecutor {
             actual_micros: elapsed_micros(materialization_started),
         };
 
-        let attachment = match adapter
-            .commit_state_import(&import, &receipt, &context)
+        let attachment = match context
+            .run(adapter.commit_state_import(&import, &receipt, &context))
             .await
         {
-            Ok(attachment) => attachment,
-            Err(error) => {
+            Ok(Ok(attachment)) => attachment,
+            Ok(Err(EngineError::Context(error))) => {
+                return self
+                    .abort_after_context_error(&import, &plan, &context, error)
+                    .await;
+            }
+            Ok(Err(error)) => {
                 return self
                     .abort_then_fallback(
                         &import,
@@ -215,12 +295,34 @@ impl PlanExecutor for DefaultPlanExecutor {
                     )
                     .await;
             }
+            Err(error) => {
+                return self
+                    .abort_after_context_error(&import, &plan, &context, error)
+                    .await;
+            }
         };
 
-        let stream = adapter
-            .execute(&plan.target, request, Some(attachment), context)
+        let stream = match context
+            .run(adapter.execute(&plan.target, request, Some(attachment), context.clone()))
             .await
-            .map_err(PlanExecutionError::Engine)?;
+        {
+            Ok(Ok(stream)) => stream,
+            Ok(Err(EngineError::Context(error))) => {
+                return self
+                    .abort_after_context_error(&import, &plan, &context, error)
+                    .await;
+            }
+            Ok(Err(error)) => {
+                return self
+                    .abort_after_engine_error(&import, &plan, &context, error)
+                    .await;
+            }
+            Err(error) => {
+                return self
+                    .abort_after_context_error(&import, &plan, &context, error)
+                    .await;
+            }
+        };
         let topology_micros =
             elapsed_micros(activation_started).saturating_sub(materialization.actual_micros);
         Ok(PlanExecution {

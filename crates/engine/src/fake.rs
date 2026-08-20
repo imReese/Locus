@@ -39,6 +39,8 @@ pub struct FakeEngineOutput {
     pub reasoning_deltas: Vec<String>,
     pub tool_calls: Vec<FakeToolCall>,
     pub finish_reason: EngineFinishReason,
+    pub execute_delay: Duration,
+    pub event_delay: Duration,
 }
 
 impl Default for FakeEngineOutput {
@@ -49,6 +51,8 @@ impl Default for FakeEngineOutput {
             reasoning_deltas: Vec::new(),
             tool_calls: Vec::new(),
             finish_reason: EngineFinishReason::Stop,
+            execute_delay: Duration::ZERO,
+            event_delay: Duration::ZERO,
         }
     }
 }
@@ -308,6 +312,9 @@ impl EngineAdapter for FakeEngineAdapter {
             ));
         }
         self.execute_calls.fetch_add(1, Ordering::AcqRel);
+        if !self.output.execute_delay.is_zero() {
+            tokio::time::sleep(self.output.execute_delay).await;
+        }
 
         let request_id = request.id;
         let output_tokens = self
@@ -394,7 +401,17 @@ impl EngineAdapter for FakeEngineAdapter {
             reason: self.output.finish_reason.clone(),
             usage,
         }));
-        Ok(stream::iter(events).boxed())
+        let delay = self.output.event_delay;
+        if delay.is_zero() {
+            Ok(stream::iter(events).boxed())
+        } else {
+            Ok(stream::iter(events)
+                .then(move |event| async move {
+                    tokio::time::sleep(delay).await;
+                    event
+                })
+                .boxed())
+        }
     }
 
     async fn cancel(

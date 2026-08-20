@@ -4,17 +4,18 @@ use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
 };
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use axum::Json;
-use axum::Router;
 use axum::body::Body;
-use axum::extract::{DefaultBodyLimit, FromRef, Request, State, rejection::JsonRejection};
-use axum::http::{HeaderValue, StatusCode, header};
+use axum::extract::{
+    DefaultBodyLimit, Extension, FromRef, Request, State, rejection::JsonRejection,
+};
+use axum::http::{HeaderValue, Method, StatusCode, header};
 use axum::middleware::{Next, from_fn_with_state};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
+use axum::{Json, Router};
 use futures::StreamExt;
 use locus_core::{OperationContext, RequestId, SamplingParameters, Usage};
 use locus_model_io::{
@@ -22,47 +23,63 @@ use locus_model_io::{
     ModelIoError, ModelRequest, PromptInput, ReasoningEffort, ResponseFormat, ToolChoice,
     ToolDefinition,
 };
-use locus_runtime::{InferenceError, InferenceService, ModelEventStream};
+use locus_runtime::{
+    AdmissionError, InferenceError, InferenceService, ModelEventStream, TrafficController,
+};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use subtle::ConstantTimeEq;
 use thiserror::Error;
-use tokio::sync::Semaphore;
 
 const DEFAULT_MAX_REQUEST_BYTES: usize = 2 * 1024 * 1024;
-const DEFAULT_MAX_CONCURRENT_REQUESTS: usize = 128;
+const REQUEST_TIMEOUT_HEADER: &str = "x-request-timeout-ms";
 
 #[derive(Clone)]
 pub struct ApiConfig {
     pub bearer_token: Option<String>,
+    pub tenant_credentials: Vec<TenantCredential>,
+    pub anonymous_tenant: Option<String>,
+    pub traffic: TrafficController,
     pub max_request_bytes: usize,
-    pub max_concurrent_requests: usize,
 }
 
 impl Default for ApiConfig {
     fn default() -> Self {
         Self {
             bearer_token: None,
+            tenant_credentials: Vec::new(),
+            anonymous_tenant: None,
+            traffic: TrafficController::default(),
             max_request_bytes: DEFAULT_MAX_REQUEST_BYTES,
-            max_concurrent_requests: DEFAULT_MAX_CONCURRENT_REQUESTS,
         }
     }
 }
 
 #[derive(Clone)]
-struct AuthState {
-    bearer_token: Arc<str>,
+pub struct TenantCredential {
+    pub tenant_id: String,
+    pub bearer_token: String,
 }
 
 #[derive(Clone)]
-struct AdmissionState {
-    semaphore: Arc<Semaphore>,
+struct AuthState {
+    credentials: Arc<Vec<TenantCredential>>,
+    anonymous_tenant: Option<Arc<str>>,
+    traffic: TrafficController,
+    next_request: Arc<AtomicU64>,
+    max_request_bytes: usize,
+}
+
+#[derive(Clone)]
+struct TrustedRequest {
+    response_id: String,
+    context: OperationContext,
 }
 
 #[derive(Clone)]
 struct ApiState {
     service: Arc<dyn InferenceService>,
-    next_request: Arc<AtomicU64>,
+    traffic: TrafficController,
 }
 
 impl FromRef<ApiState> for Arc<dyn InferenceService> {
@@ -82,9 +99,6 @@ pub fn router_with_config(
     if config.max_request_bytes == 0 {
         return Err(ApiConfigError::ZeroRequestBodyLimit);
     }
-    if config.max_concurrent_requests == 0 {
-        return Err(ApiConfigError::ZeroConcurrencyLimit);
-    }
     if config
         .bearer_token
         .as_ref()
@@ -92,34 +106,67 @@ pub fn router_with_config(
     {
         return Err(ApiConfigError::EmptyBearerToken);
     }
+    if config.bearer_token.is_some() && !config.tenant_credentials.is_empty() {
+        return Err(ApiConfigError::AmbiguousCredentials);
+    }
+    let mut credentials = config.tenant_credentials;
+    if let Some(bearer_token) = config.bearer_token {
+        credentials.push(TenantCredential {
+            tenant_id: "default".to_owned(),
+            bearer_token,
+        });
+    }
+    for credential in &credentials {
+        if credential.bearer_token.is_empty() {
+            return Err(ApiConfigError::EmptyBearerToken);
+        }
+        if !config.traffic.tenant_exists(&credential.tenant_id) {
+            return Err(ApiConfigError::UnknownTenant(credential.tenant_id.clone()));
+        }
+    }
+    for (index, credential) in credentials.iter().enumerate() {
+        if credentials[index + 1..]
+            .iter()
+            .any(|candidate| candidate.bearer_token == credential.bearer_token)
+        {
+            return Err(ApiConfigError::DuplicateCredential);
+        }
+    }
+    let mut anonymous_tenant = config.anonymous_tenant;
+    if credentials.is_empty() && anonymous_tenant.is_none() {
+        anonymous_tenant = Some("default".to_owned());
+    }
+    if let Some(tenant) = &anonymous_tenant
+        && !config.traffic.tenant_exists(tenant)
+    {
+        return Err(ApiConfigError::UnknownTenant(tenant.clone()));
+    }
+    let next_request = Arc::new(AtomicU64::new(1));
     let state = ApiState {
         service,
-        next_request: Arc::new(AtomicU64::new(1)),
+        traffic: config.traffic.clone(),
     };
     let mut api = Router::new()
         .route("/v1/models", get(models))
         .route("/v1/responses", post(responses))
         .route("/v1/completions", post(completions))
         .route("/v1/chat/completions", post(chat_completions));
-    if let Some(bearer_token) = config.bearer_token {
-        api = api.layer(from_fn_with_state(
-            AuthState {
-                bearer_token: bearer_token.into(),
-            },
-            authenticate,
-        ));
-    }
     api = api
         .layer(DefaultBodyLimit::max(config.max_request_bytes))
         .layer(from_fn_with_state(
-            AdmissionState {
-                semaphore: Arc::new(Semaphore::new(config.max_concurrent_requests)),
+            AuthState {
+                credentials: Arc::new(credentials),
+                anonymous_tenant: anonymous_tenant.map(Into::into),
+                traffic: config.traffic,
+                next_request,
+                max_request_bytes: config.max_request_bytes,
             },
-            limit_concurrency,
+            authenticate,
         ));
     Ok(Router::new()
         .route("/healthz", get(health))
         .route("/readyz", get(readiness))
+        .route("/metrics", get(metrics))
         .merge(api)
         .with_state(state))
 }
@@ -130,7 +177,7 @@ async fn health() -> Json<Value> {
 
 async fn readiness(State(service): State<Arc<dyn InferenceService>>) -> Response {
     match service.readiness().await {
-        Ok(report) => Json(json!({
+        Ok(report) if !report.traffic_draining => Json(json!({
             "status": "ready",
             "model_profiles": report.model_profiles,
             "routable_models": report.routable_models,
@@ -144,8 +191,18 @@ async fn readiness(State(service): State<Arc<dyn InferenceService>>) -> Response
             "calibration_revision": report.calibration_revision,
             "calibration_persistent": report.calibration_persistent,
             "calibration_persistence_healthy": report.calibration_persistence_healthy,
+            "traffic_draining": false,
         }))
         .into_response(),
+        Ok(report) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "status": "not_ready",
+                "error": "traffic controller is draining",
+                "traffic_draining": report.traffic_draining,
+            })),
+        )
+            .into_response(),
         Err(error) => (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({"status": "not_ready", "error": error.to_string()})),
@@ -154,17 +211,92 @@ async fn readiness(State(service): State<Arc<dyn InferenceService>>) -> Response
     }
 }
 
-async fn authenticate(State(auth): State<AuthState>, request: Request, next: Next) -> Response {
+async fn authenticate(State(auth): State<AuthState>, mut request: Request, next: Next) -> Response {
     let candidate = request
         .headers()
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "));
-    let authorized = candidate.is_some_and(|candidate| {
-        candidate.len() == auth.bearer_token.len()
-            && bool::from(candidate.as_bytes().ct_eq(auth.bearer_token.as_bytes()))
-    });
-    if authorized {
+    let mut tenant = None;
+    if let Some(candidate) = candidate {
+        for credential in auth.credentials.iter() {
+            let matches = candidate.len() == credential.bearer_token.len()
+                && bool::from(
+                    candidate
+                        .as_bytes()
+                        .ct_eq(credential.bearer_token.as_bytes()),
+                );
+            if matches {
+                tenant = Some(Arc::<str>::from(credential.tenant_id.as_str()));
+            }
+        }
+    } else {
+        tenant = auth.anonymous_tenant.clone();
+    }
+    if let Some(tenant) = tenant {
+        let requested_timeout = match requested_timeout(request.headers()) {
+            Ok(timeout) => timeout,
+            Err(error) => return error.into_response(),
+        };
+        let prefix = request_id_prefix(request.uri().path());
+        let response_id = format!(
+            "{prefix}_{:016x}",
+            auth.next_request.fetch_add(1, Ordering::AcqRel)
+        );
+        let context = match auth.traffic.operation_context(
+            RequestId::new(response_id.clone()),
+            tenant.as_ref(),
+            requested_timeout,
+        ) {
+            Ok(context) => context,
+            Err(error) => return api_error_from_admission(&error).into_response(),
+        };
+        if request.method() != Method::GET && request.method() != Method::HEAD {
+            let (parts, body) = request.into_parts();
+            let body = match context
+                .run(read_bounded_body(body, auth.max_request_bytes))
+                .await
+            {
+                Ok(Ok(body)) => body,
+                Ok(Err(RequestBodyReadError::TooLarge)) => {
+                    return ApiError::new(
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        "request body exceeded the configured byte limit",
+                        "invalid_request_error",
+                        None,
+                        Some("request_too_large"),
+                    )
+                    .into_response();
+                }
+                Ok(Err(RequestBodyReadError::Transport(error))) => {
+                    return ApiError::new(
+                        StatusCode::BAD_REQUEST,
+                        error,
+                        "invalid_request_error",
+                        None,
+                        Some("invalid_request_body"),
+                    )
+                    .into_response();
+                }
+                Err(error) => {
+                    return api_error_from_inference(&InferenceError::Context(error))
+                        .into_response();
+                }
+            };
+            request = Request::from_parts(parts, Body::from(body));
+        }
+        request.extensions_mut().insert(TrustedRequest {
+            response_id,
+            context: context.clone(),
+        });
+        if request.method() == Method::GET || request.method() == Method::HEAD {
+            return match context.run(next.run(request)).await {
+                Ok(response) => response,
+                Err(error) => {
+                    api_error_from_inference(&InferenceError::Context(error)).into_response()
+                }
+            };
+        }
         return next.run(request).await;
     }
     let mut response = ApiError::new(
@@ -181,34 +313,59 @@ async fn authenticate(State(auth): State<AuthState>, request: Request, next: Nex
     response
 }
 
-async fn limit_concurrency(
-    State(admission): State<AdmissionState>,
-    request: Request,
-    next: Next,
-) -> Response {
-    let permit = match admission.semaphore.acquire_owned().await {
-        Ok(permit) => permit,
-        Err(_) => {
-            return ApiError::new(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "request admission is unavailable",
-                "server_error",
-                None,
-                Some("admission_unavailable"),
-            )
-            .into_response();
+fn request_id_prefix(path: &str) -> &'static str {
+    match path {
+        "/v1/responses" => "resp",
+        "/v1/completions" => "cmpl",
+        "/v1/chat/completions" => "chatcmpl",
+        "/v1/models" => "models",
+        _ => "req",
+    }
+}
+
+fn requested_timeout(headers: &axum::http::HeaderMap) -> Result<Option<Duration>, ApiError> {
+    headers
+        .get(REQUEST_TIMEOUT_HEADER)
+        .map(|value| {
+            let value = value.to_str().map_err(|_| {
+                ApiError::invalid(
+                    REQUEST_TIMEOUT_HEADER,
+                    "request timeout header must be ASCII milliseconds",
+                )
+            })?;
+            let millis = value.parse::<u64>().map_err(|_| {
+                ApiError::invalid(
+                    REQUEST_TIMEOUT_HEADER,
+                    "request timeout header must be an integer number of milliseconds",
+                )
+            })?;
+            if millis == 0 {
+                return Err(ApiError::invalid(
+                    REQUEST_TIMEOUT_HEADER,
+                    "request timeout must be greater than zero",
+                ));
+            }
+            Ok(Duration::from_millis(millis))
+        })
+        .transpose()
+}
+
+enum RequestBodyReadError {
+    TooLarge,
+    Transport(String),
+}
+
+async fn read_bounded_body(body: Body, max_bytes: usize) -> Result<Vec<u8>, RequestBodyReadError> {
+    let mut stream = body.into_data_stream();
+    let mut bytes = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|error| RequestBodyReadError::Transport(error.to_string()))?;
+        if chunk.len() > max_bytes.saturating_sub(bytes.len()) {
+            return Err(RequestBodyReadError::TooLarge);
         }
-    };
-    let response = next.run(request).await;
-    let (parts, body) = response.into_parts();
-    let stream = async_stream::stream! {
-        let _permit = permit;
-        let mut data = body.into_data_stream();
-        while let Some(chunk) = data.next().await {
-            yield chunk;
-        }
-    };
-    Response::from_parts(parts, Body::from_stream(stream))
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
 }
 
 #[derive(Debug, Error)]
@@ -217,8 +374,33 @@ pub enum ApiConfigError {
     EmptyBearerToken,
     #[error("API request body limit must be greater than zero")]
     ZeroRequestBodyLimit,
-    #[error("API concurrency limit must be greater than zero")]
-    ZeroConcurrencyLimit,
+    #[error("legacy bearer_token and tenant_credentials cannot be configured together")]
+    AmbiguousCredentials,
+    #[error("tenant credential references unknown traffic policy: {0}")]
+    UnknownTenant(String),
+    #[error("the same bearer credential cannot authorize multiple tenant mappings")]
+    DuplicateCredential,
+}
+
+async fn metrics(State(state): State<ApiState>) -> Response {
+    match state.traffic.prometheus() {
+        Ok(body) => (
+            [(
+                header::CONTENT_TYPE,
+                "text/plain; version=0.0.4; charset=utf-8",
+            )],
+            body,
+        )
+            .into_response(),
+        Err(error) => ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            error.to_string(),
+            "server_error",
+            None,
+            Some("metrics_unavailable"),
+        )
+        .into_response(),
+    }
 }
 
 async fn models(State(service): State<Arc<dyn InferenceService>>) -> Response {
@@ -489,8 +671,12 @@ fn parse_reasoning_effort(effort: Option<String>) -> Result<Option<ReasoningEffo
 
 async fn responses(
     State(state): State<ApiState>,
+    Extension(trusted): Extension<TrustedRequest>,
     payload: Result<Json<ResponsesRequest>, JsonRejection>,
 ) -> Response {
+    if let Err(error) = trusted.context.ensure_active() {
+        return api_error_from_inference(&InferenceError::Context(error)).into_response();
+    }
     let Json(request) = match payload {
         Ok(payload) => payload,
         Err(error) => return api_error_from_json_rejection(&error).into_response(),
@@ -501,16 +687,14 @@ async fn responses(
         Ok(request) => request,
         Err(error) => return error.into_response(),
     };
-    let request_id = state.next_id("resp");
-    let context = OperationContext::new(RequestId::new(request_id.clone()));
-    let stream = match state.service.infer(request, context).await {
+    let stream = match state.service.infer(request, trusted.context).await {
         Ok(stream) => stream,
         Err(error) => return api_error_from_inference(&error).into_response(),
     };
     if stream_requested {
-        responses_sse(stream, request_id, model)
+        responses_sse(stream, trusted.response_id, model)
     } else {
-        collect_response(stream, request_id, model).await
+        collect_response(stream, trusted.response_id, model).await
     }
 }
 
@@ -954,8 +1138,12 @@ impl CompletionRequest {
 
 async fn completions(
     State(state): State<ApiState>,
+    Extension(trusted): Extension<TrustedRequest>,
     payload: Result<Json<CompletionRequest>, JsonRejection>,
 ) -> Response {
+    if let Err(error) = trusted.context.ensure_active() {
+        return api_error_from_inference(&InferenceError::Context(error)).into_response();
+    }
     let Json(request) = match payload {
         Ok(payload) => payload,
         Err(error) => return api_error_from_json_rejection(&error).into_response(),
@@ -970,16 +1158,14 @@ async fn completions(
         Ok(request) => request,
         Err(error) => return error.into_response(),
     };
-    let request_id = state.next_id("cmpl");
-    let context = OperationContext::new(RequestId::new(request_id.clone()));
-    let stream = match state.service.infer(request, context).await {
+    let stream = match state.service.infer(request, trusted.context).await {
         Ok(stream) => stream,
         Err(error) => return api_error_from_inference(&error).into_response(),
     };
     if stream_requested {
-        completion_sse(stream, request_id, model, include_usage)
+        completion_sse(stream, trusted.response_id, model, include_usage)
     } else {
-        collect_completion(stream, request_id, model).await
+        collect_completion(stream, trusted.response_id, model).await
     }
 }
 
@@ -1255,8 +1441,12 @@ impl ChatRequest {
 
 async fn chat_completions(
     State(state): State<ApiState>,
+    Extension(trusted): Extension<TrustedRequest>,
     payload: Result<Json<ChatRequest>, JsonRejection>,
 ) -> Response {
+    if let Err(error) = trusted.context.ensure_active() {
+        return api_error_from_inference(&InferenceError::Context(error)).into_response();
+    }
     let Json(request) = match payload {
         Ok(payload) => payload,
         Err(error) => return api_error_from_json_rejection(&error).into_response(),
@@ -1267,16 +1457,14 @@ async fn chat_completions(
         Ok(request) => request,
         Err(error) => return error.into_response(),
     };
-    let request_id = state.next_id("chatcmpl");
-    let context = OperationContext::new(RequestId::new(request_id.clone()));
-    let stream = match state.service.infer(request, context).await {
+    let stream = match state.service.infer(request, trusted.context).await {
         Ok(stream) => stream,
         Err(error) => return api_error_from_inference(&error).into_response(),
     };
     if stream_requested {
-        chat_sse(stream, request_id, model)
+        chat_sse(stream, trusted.response_id, model)
     } else {
-        collect_chat(stream, request_id, model).await
+        collect_chat(stream, trusted.response_id, model).await
     }
 }
 
@@ -1399,15 +1587,6 @@ fn parse_role(role: &str) -> Result<ConversationRole, ApiError> {
     }
 }
 
-impl ApiState {
-    fn next_id(&self, prefix: &str) -> String {
-        format!(
-            "{prefix}_{:016x}",
-            self.next_request.fetch_add(1, Ordering::AcqRel)
-        )
-    }
-}
-
 fn unix_timestamp() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1468,7 +1647,17 @@ impl ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        (self.status, Json(json!({"error": self.body}))).into_response()
+        let status = self.status;
+        let mut response = (status, Json(json!({"error": self.body}))).into_response();
+        if matches!(
+            status,
+            StatusCode::TOO_MANY_REQUESTS | StatusCode::SERVICE_UNAVAILABLE
+        ) {
+            response
+                .headers_mut()
+                .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+        }
+        response
     }
 }
 
@@ -1488,21 +1677,44 @@ fn api_error_from_inference(error: &InferenceError) -> ApiError {
             None,
             Some("invalid_parameter"),
         ),
-        InferenceError::Context(locus_core::ContextError::Cancelled) => ApiError::new(
+        InferenceError::Context(locus_core::ContextError::Cancelled)
+        | InferenceError::Engine(locus_engine::EngineError::Context(
+            locus_core::ContextError::Cancelled,
+        ))
+        | InferenceError::Execution(locus_planner::PlanExecutionError::Context(
+            locus_core::ContextError::Cancelled,
+        ))
+        | InferenceError::Execution(locus_planner::PlanExecutionError::Engine(
+            locus_engine::EngineError::Context(locus_core::ContextError::Cancelled),
+        )) => ApiError::new(
             StatusCode::from_u16(499).unwrap_or(StatusCode::BAD_REQUEST),
             error.to_string(),
             "request_cancelled",
             None,
             Some("cancelled"),
         ),
-        InferenceError::Context(locus_core::ContextError::DeadlineExceeded) => ApiError::new(
+        InferenceError::Context(locus_core::ContextError::DeadlineExceeded)
+        | InferenceError::Engine(locus_engine::EngineError::Context(
+            locus_core::ContextError::DeadlineExceeded,
+        ))
+        | InferenceError::Execution(locus_planner::PlanExecutionError::Context(
+            locus_core::ContextError::DeadlineExceeded,
+        ))
+        | InferenceError::Execution(locus_planner::PlanExecutionError::Engine(
+            locus_engine::EngineError::Context(locus_core::ContextError::DeadlineExceeded),
+        )) => ApiError::new(
             StatusCode::REQUEST_TIMEOUT,
             error.to_string(),
             "request_timeout",
             None,
             Some("deadline_exceeded"),
         ),
-        InferenceError::Planning(_) | InferenceError::Discovery(_) => ApiError::new(
+        InferenceError::Admission(error) => api_error_from_admission(error),
+        InferenceError::Planning(_)
+        | InferenceError::Discovery(_)
+        | InferenceError::Engine(
+            locus_engine::EngineError::Draining | locus_engine::EngineError::Stopped,
+        ) => ApiError::new(
             StatusCode::SERVICE_UNAVAILABLE,
             error.to_string(),
             "server_error",
@@ -1515,6 +1727,55 @@ fn api_error_from_inference(error: &InferenceError) -> ApiError {
             "server_error",
             None,
             Some("internal_error"),
+        ),
+    }
+}
+
+fn api_error_from_admission(error: &AdmissionError) -> ApiError {
+    match error {
+        AdmissionError::Cancelled => ApiError::new(
+            StatusCode::from_u16(499).unwrap_or(StatusCode::BAD_REQUEST),
+            error.to_string(),
+            "request_cancelled",
+            None,
+            Some("cancelled"),
+        ),
+        AdmissionError::DeadlineExceeded => ApiError::new(
+            StatusCode::REQUEST_TIMEOUT,
+            error.to_string(),
+            "request_timeout",
+            None,
+            Some("deadline_exceeded"),
+        ),
+        AdmissionError::RequestTokenLimit { .. }
+        | AdmissionError::RequestExceedsCapacity
+        | AdmissionError::InvalidDeadline => ApiError::new(
+            StatusCode::BAD_REQUEST,
+            error.to_string(),
+            "invalid_request_error",
+            Some("max_output_tokens"),
+            Some("token_budget_exceeded"),
+        ),
+        AdmissionError::QueueFull | AdmissionError::OverloadShed => ApiError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            error.to_string(),
+            "rate_limit_error",
+            None,
+            Some("overloaded"),
+        ),
+        AdmissionError::Draining | AdmissionError::Unavailable => ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            error.to_string(),
+            "server_error",
+            None,
+            Some("admission_unavailable"),
+        ),
+        AdmissionError::MissingTrustedTenant | AdmissionError::UnknownTenant(_) => ApiError::new(
+            StatusCode::UNAUTHORIZED,
+            error.to_string(),
+            "authentication_error",
+            None,
+            Some("invalid_tenant"),
         ),
     }
 }

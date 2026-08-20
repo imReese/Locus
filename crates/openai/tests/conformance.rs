@@ -1,8 +1,9 @@
 use std::collections::BTreeSet;
+use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::body::Body;
+use axum::body::{Body, Bytes};
 use axum::http::{Request, StatusCode, header};
 use http_body_util::BodyExt;
 use locus_core::{
@@ -15,8 +16,8 @@ use locus_engine::{EngineRegistry, FakeEngineAdapter, FakeEngineOutput, FakeTool
 use locus_model_io::{
     BasicModelIo, ByteDecoder, ByteTokenizer, ModelProfile, ModelRegistry, SimpleTemplateRenderer,
 };
-use locus_openai::{ApiConfig, router, router_with_config};
-use locus_runtime::{DefaultInferenceService, InferenceService};
+use locus_openai::{ApiConfig, TenantCredential, router, router_with_config};
+use locus_runtime::{DefaultInferenceService, InferenceService, TrafficController, TrafficPolicy};
 use locus_store::{NullStateStore, StateStore};
 use serde_json::{Value, json};
 use tower::ServiceExt;
@@ -58,6 +59,13 @@ fn identities() -> (ModelExecutionIdentity, SemanticIdentity) {
 }
 
 fn service(output: FakeEngineOutput) -> (Arc<dyn InferenceService>, Arc<FakeEngineAdapter>) {
+    service_with_traffic(output, None)
+}
+
+fn service_with_traffic(
+    output: FakeEngineOutput,
+    traffic: Option<TrafficController>,
+) -> (Arc<dyn InferenceService>, Arc<FakeEngineAdapter>) {
     let (model, semantics_identity) = identities();
     let models = ModelRegistry::new();
     models
@@ -122,8 +130,11 @@ fn service(output: FakeEngineOutput) -> (Arc<dyn InferenceService>, Arc<FakeEngi
     let engines = EngineRegistry::new();
     engines.register(adapter.clone()).expect("register engine");
     let store: Arc<dyn StateStore> = Arc::new(NullStateStore::default());
-    let service: Arc<dyn InferenceService> =
-        Arc::new(DefaultInferenceService::new(models, engines, store));
+    let service = DefaultInferenceService::new(models, engines, store);
+    let service: Arc<dyn InferenceService> = Arc::new(match traffic {
+        Some(traffic) => service.with_traffic_control(traffic),
+        None => service,
+    });
     (service, adapter)
 }
 
@@ -367,6 +378,178 @@ async fn bearer_auth_protects_api_routes_but_not_probes() {
 }
 
 #[tokio::test]
+async fn bearer_credentials_are_the_only_source_of_tenant_policy() {
+    let mut policy = TrafficPolicy::default();
+    let mut alpha = policy.tenants[0].clone();
+    alpha.id = "alpha".to_owned();
+    let mut beta = alpha.clone();
+    beta.id = "beta".to_owned();
+    policy.tenants = vec![alpha, beta];
+    let traffic = TrafficController::new(policy).expect("traffic controller");
+    let (service, _) = service_with_traffic(FakeEngineOutput::default(), Some(traffic.clone()));
+    let app = router_with_config(
+        service,
+        ApiConfig {
+            bearer_token: None,
+            tenant_credentials: vec![
+                TenantCredential {
+                    tenant_id: "alpha".to_owned(),
+                    bearer_token: "alpha-secret".to_owned(),
+                },
+                TenantCredential {
+                    tenant_id: "beta".to_owned(),
+                    bearer_token: "beta-secret".to_owned(),
+                },
+            ],
+            anonymous_tenant: None,
+            traffic,
+            ..ApiConfig::default()
+        },
+    )
+    .expect("configured router");
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post("/v1/responses")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, "Bearer alpha-secret")
+                .header("x-tenant-id", "beta")
+                .body(Body::from(
+                    json!({"model": "locus-test", "input": "trusted tenant"}).to_string(),
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+    response
+        .into_body()
+        .collect()
+        .await
+        .expect("consume response");
+
+    let metrics = app
+        .clone()
+        .oneshot(
+            Request::get("/metrics")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("metrics")
+        .into_body()
+        .collect()
+        .await
+        .expect("metrics body")
+        .to_bytes();
+    let metrics = std::str::from_utf8(&metrics).expect("UTF-8 metrics");
+    assert!(metrics.contains(
+        "locus_admission_requests_total{class=\"standard\",tenant=\"alpha\",outcome=\"admitted\"} 1"
+    ));
+    assert!(!metrics.contains(
+        "locus_admission_requests_total{class=\"standard\",tenant=\"beta\",outcome=\"admitted\"}"
+    ));
+
+    let unauthorized = app
+        .oneshot(
+            Request::get("/v1/models")
+                .header(header::AUTHORIZATION, "Bearer unknown")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("unauthorized response");
+    assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn tenant_deadline_clamps_untrusted_header_and_cancels_stream() {
+    let mut policy = TrafficPolicy::default();
+    policy.tenants[0].default_request_timeout = Duration::from_millis(25);
+    policy.tenants[0].max_request_timeout = Duration::from_millis(25);
+    let traffic = TrafficController::new(policy).expect("traffic controller");
+    let metrics_traffic = traffic.clone();
+    let (service, adapter) = service_with_traffic(
+        FakeEngineOutput {
+            event_delay: Duration::from_millis(100),
+            ..FakeEngineOutput::default()
+        },
+        Some(traffic.clone()),
+    );
+    let app = router_with_config(
+        service,
+        ApiConfig {
+            traffic,
+            ..ApiConfig::default()
+        },
+    )
+    .expect("configured router");
+    let response = app
+        .oneshot(
+            Request::post("/v1/responses")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("x-request-timeout-ms", "10000")
+                .body(Body::from(
+                    json!({"model": "locus-test", "input": "deadline"}).to_string(),
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("deadline response");
+    assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+    tokio::task::yield_now().await;
+    assert_eq!(adapter.call_counts().cancel, 1);
+    let metrics = metrics_traffic.prometheus().expect("metrics");
+    assert!(metrics.contains("reason=\"deadline\""));
+    assert!(!metrics.contains("reason=\"client_cancelled\""));
+}
+
+#[tokio::test]
+async fn tenant_deadline_covers_request_body_ingress_before_inference() {
+    let mut policy = TrafficPolicy::default();
+    policy.tenants[0].default_request_timeout = Duration::from_millis(20);
+    policy.tenants[0].max_request_timeout = Duration::from_millis(20);
+    let traffic = TrafficController::new(policy).expect("traffic controller");
+    let metrics_traffic = traffic.clone();
+    let (service, adapter) =
+        service_with_traffic(FakeEngineOutput::default(), Some(traffic.clone()));
+    let app = router_with_config(
+        service,
+        ApiConfig {
+            traffic,
+            ..ApiConfig::default()
+        },
+    )
+    .expect("configured router");
+    let payload = json!({"model": "locus-test", "input": "slow body"}).to_string();
+    let body = Body::from_stream(futures::stream::once(async move {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        Ok::<_, Infallible>(Bytes::from(payload))
+    }));
+
+    let response = app
+        .oneshot(
+            Request::post("/v1/responses")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("x-request-timeout-ms", "10000")
+                .body(body)
+                .expect("request"),
+        )
+        .await
+        .expect("deadline response");
+
+    assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+    assert_eq!(adapter.call_counts().execute, 0);
+    assert!(
+        !metrics_traffic
+            .prometheus()
+            .expect("metrics")
+            .contains("outcome=\"admitted\"")
+    );
+}
+
+#[tokio::test]
 async fn configured_body_limit_rejects_oversized_requests() {
     let (service, _) = service(FakeEngineOutput::default());
     let app = router_with_config(
@@ -394,11 +577,19 @@ async fn configured_body_limit_rejects_oversized_requests() {
 
 #[tokio::test]
 async fn concurrency_permit_is_held_until_stream_body_is_dropped() {
-    let (service, _) = service(FakeEngineOutput::default());
+    let mut policy = TrafficPolicy {
+        max_active_requests: 1,
+        ..TrafficPolicy::default()
+    };
+    policy.classes[0].max_active_requests = 1;
+    policy.tenants[0].max_active_requests = 1;
+    let traffic = TrafficController::new(policy).expect("traffic controller");
+    let metrics_traffic = traffic.clone();
+    let (service, _) = service_with_traffic(FakeEngineOutput::default(), Some(traffic.clone()));
     let app = router_with_config(
         service,
         ApiConfig {
-            max_concurrent_requests: 1,
+            traffic,
             ..ApiConfig::default()
         },
     )
@@ -418,19 +609,32 @@ async fn concurrency_permit_is_held_until_stream_body_is_dropped() {
     let blocked = tokio::time::timeout(
         Duration::from_millis(20),
         app.clone().oneshot(
-            Request::get("/v1/models")
-                .body(Body::empty())
+            Request::post("/v1/responses")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({"model": "locus-test", "input": "wait", "stream": true}).to_string(),
+                ))
                 .expect("request"),
         ),
     )
     .await;
     assert!(blocked.is_err(), "second request must wait for the stream");
     drop(first);
+    tokio::task::yield_now().await;
+    assert!(
+        metrics_traffic
+            .prometheus()
+            .expect("metrics")
+            .contains("reason=\"client_cancelled\"")
+    );
     let admitted = tokio::time::timeout(
         Duration::from_secs(1),
         app.oneshot(
-            Request::get("/v1/models")
-                .body(Body::empty())
+            Request::post("/v1/responses")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({"model": "locus-test", "input": "admit", "stream": true}).to_string(),
+                ))
                 .expect("request"),
         ),
     )

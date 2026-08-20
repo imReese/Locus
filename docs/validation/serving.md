@@ -10,6 +10,7 @@ Locus keeps these evidence levels separate:
 | Real local HTTP client | Official OpenAI Python SDK against `sdk_fixture` | SDK parsing and transport compatibility through a real socket |
 | Cross-process state protocol | Locus against a separate NexusKV process with the Rust matcher | Versioned lookup/estimate/materialize compatibility and prepare/commit orchestration |
 | Live engine | Opt-in SGLang/vLLM harness | Observed behavior of one configured runtime endpoint and model |
+| Live dual-engine traffic control | Locus plus two live runtimes under concurrent multi-tenant load | Both engines execute measured tokens; tenant admission, deadlines, cancellation, metrics cardinality, error ratio, throughput, and latency meet explicit gates |
 | Live state/hardware | GPU topology, performance, and physical NexusKV transfer | Production properties that mocks and protocol oracles cannot establish |
 
 GitHub CI runs the first three levels. It does not have a configured model
@@ -114,6 +115,60 @@ evidence, and an explicit claim boundary. It deliberately omits base URLs and
 API keys. Do not commit deployment secrets or private endpoint details with a
 result.
 
+## Live dual-engine traffic-control acceptance
+
+First qualify each engine independently with `live_engine_conformance.py`.
+Then start one Locus process configured with both ready targets and at least two
+credential-bound tenants. The dual-engine harness sends deterministic
+round-robin tenant traffic through Locus and reads each runtime's own
+Prometheus token counters before and after the load. It fails unless both
+engines advance prompt and generation counters; two configured targets or a
+successful gateway response alone is not accepted as dual-engine evidence.
+The two engine arguments must name distinct endpoints. Before sending load, the
+harness observes a quiet counter window and fails closed if background token
+movement exceeds `--max-background-token-delta`; the second snapshot becomes
+the attribution baseline. Both engines must then advance during the normal
+multi-tenant phase itself, not only during the later overload probe.
+
+The harness also requires at least two ready targets, bounds Locus metrics
+bytes/sample count, rejects undocumented or high-cardinality Locus labels,
+checks per-tenant success, enforces configured error-ratio and p95 gates,
+closes a live stream and observes the bounded `client_cancelled` counter, and
+requires a real HTTP 408/`deadline_exceeded` probe. API keys are read from
+named environment variables and are not written to the JSON result. When
+`--overload-requests` is non-zero, a separate burst must observe at least one
+HTTP 429 with code `overloaded`; successful normal-load requests and shed
+overload requests are reported separately.
+
+```bash
+export LOCUS_PREMIUM_API_KEY=replace-me
+export LOCUS_BATCH_API_KEY=replace-me
+
+python scripts/traffic_control_load.py \
+  --base-url http://127.0.0.1:8000 \
+  --model my-model \
+  --tenant premium=LOCUS_PREMIUM_API_KEY \
+  --tenant batch=LOCUS_BATCH_API_KEY \
+  --engine sglang,http://127.0.0.1:30000,my-model \
+  --engine vllm,http://127.0.0.1:30001,my-model \
+  --requests 200 \
+  --concurrency 32 \
+  --max-tokens 64 \
+  --overload-tenant batch \
+  --overload-requests 100 \
+  --overload-concurrency 64 \
+  --overload-max-tokens 1024 \
+  --max-error-ratio 0.01 \
+  --max-p95-seconds 10 \
+  > /tmp/locus-dual-engine-live.json
+```
+
+The output labels its evidence level `live_dual_engine` and omits API keys and
+endpoint URLs. It is deployment evidence, not a portable benchmark: record the
+model revisions, engine versions, hardware/topology, Locus commit,
+configuration digest, and command parameters in the surrounding private test
+record.
+
 ## Current boundary
 
 The official SDK fixture passed locally with `openai` 2.53.0 and is enforced by
@@ -122,6 +177,7 @@ SGLang and vLLM adapter behavior and telemetry aliases are covered by
 deterministic mock HTTP/Prometheus/SSE tests; configured
 parser behavior uses a mock SGLang endpoint, not a live model. The cross-process
 NexusKV protocol path is also automated with protocol-only, zero-byte transfer
-evidence. No live GPU engine, native engine state import, physical NexusKV
+evidence. The dual-engine harness is present but intentionally not executed by
+provider-free CI. No live GPU engine, native engine state import, physical NexusKV
 transfer, or real-model parser conformance was available in this workspace, so
 those evidence levels remain unverified rather than failed.
