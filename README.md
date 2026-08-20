@@ -1,7 +1,7 @@
 <h1 align="center">Locus</h1>
 
 <p align="center">
-  <strong>An engine-neutral inference control plane for compute and model-state placement.</strong>
+  <strong>Locus is an engine-neutral inference control plane for compute and model-state placement.</strong>
 </p>
 
 <p align="center">
@@ -13,47 +13,113 @@
 
 <p align="center">
   <a href="#why-locus">Why Locus</a> ·
-  <a href="#try-it-locally">Try it</a> ·
   <a href="#architecture">Architecture</a> ·
+  <a href="#try-it-locally">Try it</a> ·
+  <a href="#current-integrations">Integrations</a> ·
   <a href="#documentation">Docs</a> ·
-  <a href="#validation-boundaries">Validation</a>
+  <a href="#validation">Validation</a>
 </p>
 
-Locus sits above inference engines such as SGLang and vLLM. It gives
-applications one model-semantic and OpenAI-compatible surface, then coordinates
-traffic, execution capabilities, reusable-state locality, and global placement
-across heterogeneous runtimes.
+Inference is a placement problem involving both compute and state. Locus
+separates application protocols and model I/O from runtime-specific execution,
+then evaluates execution capabilities, traffic policy, and reusable-state paths
+as one global decision.
 
 > **Locus decides where inference should happen and where its reusable state
-> should live.** Engines remain responsible for running the model efficiently.
+> should live.** Execution engines remain responsible for running the model
+> efficiently.
 
-> [!IMPORTANT]
-> Locus now contains a deployable end-to-end control-plane slice: a configured
-> server process, content-addressed Hugging Face tokenizer/chat-template
-> profiles, OpenAI Responses, Chat Completions, and raw-prompt Completions,
-> SGLang/vLLM completion adapters, and an optional NexusKV bridge. CI validates
-> the official OpenAI Python SDK against a real local HTTP server and runs Locus
-> against a separate NexusKV bridge process. Live GPU serving and NexusKV
-> physical transfer remain opt-in validations and are not claimed by CI.
+> [!NOTE]
+> Locus is pre-1.0. The repository contains a deployable control-plane slice;
+> CI establishes deterministic contracts, real local SDK transport, and a
+> cross-process state protocol. Live runtime, hardware, and physical state
+> transfer qualification remain deployment-specific.
 
-## At a glance
+## Why Locus?
 
-| Area | What Locus provides today |
+Applications should not have to adopt different templates, parsers, request
+semantics, traffic policies, and state-reuse logic for every inference runtime.
+Engines should focus on batching, memory management, kernels, parallelism, and
+model execution—not repeatedly reimplement application-facing semantics or
+global fleet policy.
+
+Locus provides a common control plane for:
+
+- protocol adaptation and model-semantic normalization;
+- admission, tenant policy, deadlines, cancellation, and overload behavior;
+- capability discovery across heterogeneous execution targets;
+- cost-based placement across compute and reusable model state; and
+- plan execution, readiness, metrics, tracing, and stable failure semantics.
+
+State is not reduced to the longest matching token prefix. A reusable artifact
+may be a paged KV cache, latent or recurrent checkpoint, prepared multimodal
+input, encoder output, or a future typed state kind. Compatibility, executable
+coverage, locality, and materialization cost are explicit planner inputs.
+
+## Architecture
+
+```mermaid
+flowchart TB
+    clients["Applications and clients"]
+
+    subgraph locus["Locus control plane"]
+        northbound["Northbound protocol adapters"]
+        modelio["Model I/O and semantic normalization"]
+        policy["Admission and policy"]
+        planner["Global compute + state planner"]
+        executor["Plan executor"]
+        ops["Readiness · metrics · tracing"]
+
+        northbound --> modelio --> policy --> planner --> executor
+        ops -. observes .-> policy
+        ops -. observes .-> planner
+        ops -. observes .-> executor
+    end
+
+    clients --> northbound
+    executor --> engines["Capability-based engine adapters"]
+    planner <--> stores["StateStore implementations (optional)"]
+```
+
+| Boundary | Ownership |
 | --- | --- |
-| Northbound API | OpenAI-compatible Responses, Chat Completions, raw text/token Completions, model listing, JSON/SSE, and OpenAI-shaped errors |
-| Model semantics | Pinned Hugging Face tokenizers and templates, stable fingerprints, reasoning/tool parsers, structured output, and tokenize-once behavior |
-| Engine plane | Dynamic model discovery and capability-aware adapters for SGLang and vLLM |
-| Traffic control | Credential-bound tenants, weighted admission, request/token limits, deadlines, cancellation, overload shedding, and bounded drain |
-| Placement | State-aware cost planning, shadow evaluation, persistent calibration, explicit promotion gates, and bounded replanning |
-| State plane | Optional versioned NexusKV bridge behind a generic `StateStore`; state-free operation remains first-class |
-| Operations | Health/readiness probes, low-cardinality Prometheus metrics, request IDs, structured tracing, and graceful shutdown |
-| Evidence | Deterministic Rust tests, official OpenAI SDK E2E, and cross-process NexusKV protocol CI; live GPU qualification is opt-in |
+| Locus | Protocol and model semantics, admission and policy, target/state-path planning, plan execution, and cross-target observability |
+| Execution engines | Continuous batching, engine-local scheduling, accelerator memory, kernels, parallelism, and model execution |
+| State stores | Reusable-state lookup, compatibility evidence, locality, materialization options, transfer operations, and store-managed lifecycle |
+
+The engine and store planes depend on Locus contracts at the edges. No core
+type requires a particular inference runtime, state store, or transport stack.
+
+## Design invariants
+
+- **Engine neutrality:** runtime-specific types stay outside core contracts.
+- **Semantic consistency:** compatible targets receive the same normalized
+  request and produce the same application-facing meaning.
+- **Capability negotiation:** unsupported requirements are rejected or follow
+  an explicit policy-approved degradation; adapters do not guess.
+- **State-aware placement:** compute cost and reusable-state paths are evaluated
+  together before choosing a target.
+- **Clear side-effect boundary:** the planner selects a `PlacementPlan`;
+  `PlanExecutor` performs reservation, materialization, submission, fallback,
+  cancellation, and cleanup.
+- **Fail-closed evidence:** unknown compatibility or unqualified promotion does
+  not become an optimistic placement claim.
+
+## What Locus provides
+
+| Area | Capability |
+| --- | --- |
+| Model semantics | Versioned profiles, templates, tokenization and detokenization, reasoning/tool parsing, structured output, and content-derived identities |
+| Traffic policy | Credential-bound tenants, weighted admission, request/token limits, deadlines, cancellation, overload shedding, and bounded drain |
+| Placement | Capability filtering, state lookup and costing, explainable plans, bounded replanning, shadow evaluation, and gated calibration promotion |
+| Execution boundary | Dynamic target discovery, canonical requests and events, execution leases, cancellation, and optional prepared-state attachment |
+| Operations | Health/readiness probes, low-cardinality Prometheus metrics, request IDs, structured tracing, persistent bounded calibration, and graceful shutdown |
 
 ## Try it locally
 
-The bundled fixture runs the complete HTTP and SDK path with deterministic fake
+The bundled fixture exercises the HTTP and SDK path with deterministic fake
 engines. It needs no model download, GPU, hosted API key, or external provider.
-Rust 1.85 or newer is required; Python is only needed for the SDK check.
+Rust 1.85 or newer is required.
 
 ```bash
 git clone https://github.com/imReese/Locus.git
@@ -70,129 +136,46 @@ curl http://127.0.0.1:18080/v1/responses \
   -d '{"model":"locus-test","input":"respond with JSON"}'
 ```
 
-The same fixture is exercised by the pinned official OpenAI Python SDK:
+The same fixture works through the pinned official SDK:
 
 ```bash
 python -m pip install -r scripts/openai-sdk-e2e-requirements.txt
 python scripts/openai_sdk_e2e.py --fixture-counts
 ```
 
-Or point the SDK at it directly:
+This proves local protocol and transport behavior, not live runtime or hardware
+execution. See [Validation](#validation) for the evidence levels.
 
-```python
-from openai import OpenAI
+## Current integrations
 
-client = OpenAI(
-    base_url="http://127.0.0.1:18080/v1",
-    api_key="locus-test-key",
-)
-response = client.responses.create(
-    model="locus-test",
-    input="respond with JSON",
-)
-print(response.output_text)
+Specific integrations are replaceable edge implementations, not the definition
+of Locus:
+
+| Boundary | Current implementation | Evidence boundary |
+| --- | --- | --- |
+| Northbound | OpenAI-compatible Responses, Chat Completions, raw text/token Completions, model listing, JSON/SSE, and OpenAI-shaped errors | In-process conformance and official SDK over local HTTP; this is an API subset, not full parameter parity |
+| Model I/O | Hugging Face `tokenizer.json`, bounded MiniJinja templates, tagged reasoning/tool parsers, and structured output | Deterministic profile, parser, and SDK fixtures; additional model dialects remain explicit follow-on work |
+| Engine adapters | SGLang and vLLM completion/telemetry adapters | Deterministic mock HTTP/SSE/Prometheus conformance; live runtime qualification is opt-in |
+| State store | Optional versioned NexusKV bridge behind the generic `StateStore` contract | Cross-process protocol CI; native engine import and physical state transfer remain unverified |
+
+## Configured deployment
+
+[`examples/locus-server.json`](examples/locus-server.json) demonstrates model
+profiles, tenant policy, runtime discovery, bounded telemetry, shadow placement,
+and graceful drain. Its artifact revisions, paths, credentials, and endpoints
+are placeholders and must be replaced with deployment facts.
+
+```bash
+LOCUS_PREMIUM_API_KEY=replace-me \
+LOCUS_BATCH_API_KEY=replace-me \
+cargo run -p locus-server -- examples/locus-server.json
 ```
 
-The fixture proves local protocol behavior, not live SGLang/vLLM or GPU
-execution. See [Validation boundaries](#validation-boundaries) for the evidence
-levels.
-
-## Why Locus?
-
-Inference traffic is not ordinary HTTP load balancing. A safe placement choice
-depends on model semantics, runtime capabilities, queue pressure, reusable-state
-compatibility and locality, tenant policy, and the cost of moving or recomputing
-state. Coupling those decisions to every application or engine makes behavior
-drift as a fleet grows.
-
-For intuition, Nginx sits in front of web servers; Locus coordinates workloads
-in front of inference engines. It is inference-native, not merely another API
-gateway or reverse proxy. The name *Locus* means a location or place: placement
-is the central abstraction.
-
-SGLang, vLLM, TensorRT-LLM, and future runtimes should be able to focus on
-efficient execution. Applications should not have to adopt a different set of
-templates, parsers, request semantics, and traffic policies for each engine.
-
-Locus coordinates those concerns in a common control plane:
-
-- OpenAI-compatible and future northbound protocols
-- request validation and normalization
-- chat templates, tokenization, and detokenization
-- reasoning and tool-call semantics, with extensible multimodal contracts
-- sampling and streaming normalization
-- routing, load balancing, and admission control
-- capability discovery and observability
-- cost-based request and state placement
-
-The core architectural contributions are:
-
-1. a stable, engine-neutral semantic normalization layer;
-2. a canonical engine protocol;
-3. capability-based engine adapters;
-4. a generic, optional state-store interface; and
-5. cost-based global placement of requests and reusable state.
-
-State locality is a first-class planner input, not an add-on routing policy.
-The design covers KV caches, MLA state, recurrent/KDA checkpoints, multimodal
-artifacts, and future model state rather than equating reuse with the longest
-matching token prefix.
-
-## Architecture
-
-```mermaid
-flowchart TB
-    clients["Applications and clients"]
-
-    subgraph locus["Locus control plane"]
-        api["OpenAI-compatible API"]
-        semantics["Model I/O<br/>templates · tokens · parsers"]
-        traffic["Traffic control<br/>tenants · fairness · deadlines"]
-        planner["Global planner<br/>compute + reusable state"]
-        executor["Plan executor"]
-        ops["Readiness · metrics · tracing"]
-
-        api --> semantics --> traffic --> planner --> executor
-        ops -. observes .-> traffic
-        ops -. observes .-> planner
-        ops -. observes .-> executor
-    end
-
-    clients --> api
-    executor --> sglang["SGLang adapter → SGLang"]
-    executor --> vllm["vLLM adapter → vLLM"]
-    executor -. canonical protocol .-> future["Future engine adapters"]
-    planner <--> store["StateStore (optional)<br/>NexusKV or another store"]
-```
-
-Locus owns global, cross-engine decisions. Execution engines continue to
-own continuous batching, engine-local scheduling, GPU memory and KV-page
-allocation, kernels, speculative decoding execution, CUDA graphs, distributed
-parallelism, and model forward execution.
-
-[NexusKV](https://github.com/imReese/NexusKV) is the intended reference
-integration for reusable model state. It is not a dependency of Locus
-core. A deployment may use another `StateStore` implementation or run with
-store integration disabled.
-
-## Design principles
-
-- **Engine neutrality:** core request and response types do not expose SGLang,
-  vLLM, TensorRT-LLM, or transport-framework types.
-- **Capability negotiation:** adapters advertise what an engine can actually
-  execute; unsupported features fail explicitly or follow an intentional
-  fallback policy.
-- **Semantic consistency:** templates, tokenization, parsing, and finish
-  semantics remain stable when traffic moves between compatible engines.
-- **Extensible inputs:** the canonical `InputBundle` represents token
-  sequences, multimodal references, metadata, and future input forms.
-- **State as a planning dimension:** reuse boundaries, compatibility,
-  placement, and materialization cost participate in every eligible placement
-  decision.
-- **Clear ownership:** Locus performs global planning; engines retain
-  control of their local execution loops.
-- **No Python hot-path requirement:** Rust is the primary implementation
-  language. Python remains an SDK and compatibility escape hatch.
+The server exposes `/healthz`, `/readyz`, `/metrics`, `/v1/models`,
+`/v1/responses`, `/v1/chat/completions`, and `/v1/completions`. New deployments
+should begin with calibrated placement in `shadow` mode; promotion to `active`
+fails closed without persistent qualified evidence and exact operator
+confirmation. See [Serving and configuration](docs/operations/serving.md).
 
 ## Documentation
 
@@ -201,133 +184,53 @@ store integration disabled.
 | Understand the system boundary and ownership model | [Architecture](docs/design/architecture.md) |
 | Implement or evaluate an engine integration | [Canonical engine protocol](docs/design/canonical-engine-protocol.md) · [Engine adapter contract](docs/design/engine-adapter-contract.md) |
 | Understand tokenization, templates, parsers, and API semantics | [Model I/O](docs/design/model-io.md) · [OpenAI-compatible API](docs/design/openai-api.md) |
-| Follow request + reusable-state placement | [State-aware scheduling](docs/design/state-aware-scheduling.md) · [NexusKV bridge](docs/design/nexuskv-bridge.md) |
+| Follow request and reusable-state placement | [State-aware scheduling](docs/design/state-aware-scheduling.md) · [NexusKV bridge](docs/design/nexuskv-bridge.md) |
 | Configure and operate `locus-server` | [Serving and configuration](docs/operations/serving.md) |
 | Decide what a test result actually proves | [Validation and evidence levels](docs/validation/serving.md) |
 
 ## Repository map
 
-The Rust 2024 workspace keeps dependency direction and side-effect boundaries
-explicit:
-
 | Layer | Crates | Responsibility |
 | --- | --- | --- |
-| Foundation | `locus-core`, `locus-model-io`, `locus-parser` | Canonical facts and identities; model normalization; pinned tokenizer/template profiles; bounded reasoning and tool-call parsing |
-| Ports | `locus-engine`, `locus-store` | Engine execution leases and drain lifecycle; generic reusable-state contract; deterministic fakes |
-| Control plane | `locus-planner`, `locus-runtime` | Cost-based plans and execution; target/state discovery; tenant admission; deadlines; cancellation; placement calibration; metrics |
-| Northbound and integrations | `locus-openai`, `locus-engine-openai`, `locus-store-nexuskv` | OpenAI-compatible API; SGLang/vLLM HTTP adapters and telemetry; optional NexusKV bridge |
-| Application | `locus-server` | JSON configuration, dependency assembly, authentication, readiness, tracing, traffic/engine drain, and graceful shutdown |
-
-The byte tokenizer and simple template renderer remain deterministic reference
-components for unit and SDK fixture tests. Deployments use
-`locus-model-io::hf` with pinned tokenizer and template artifacts.
+| Foundation | `locus-core`, `locus-model-io`, `locus-parser` | Canonical facts and identities, model normalization, and bounded output parsing |
+| Ports | `locus-engine`, `locus-store` | Engine execution and generic reusable-state contracts |
+| Control plane | `locus-planner`, `locus-runtime` | Placement, plan execution, inference orchestration, traffic policy, and observation |
+| Edge adapters | `locus-openai`, `locus-engine-openai`, `locus-store-nexuskv` | Northbound protocol, engine, telemetry, and state-store integrations |
+| Application | `locus-server` | Configuration, dependency assembly, authentication, probes, tracing, and shutdown |
 
 ## Development
 
-Run the same checks used by GitHub CI with:
+Run the same repository gate used by GitHub CI:
 
 ```bash
 bash scripts/ci.sh
 ```
 
-The gate runs formatting, strict workspace Clippy, all-feature tests, rustdoc
-with warnings denied, Python syntax checks, and the traffic-load harness unit
-tests. GitHub Actions additionally runs the official OpenAI SDK and
-cross-process NexusKV bridge jobs.
+It runs formatting, strict workspace Clippy, all-feature tests, rustdoc with
+warnings denied, Python syntax checks, and traffic-harness unit tests. GitHub
+Actions additionally runs the official SDK fixture and cross-process state
+protocol job. Rust is the primary implementation language; public wire formats
+and Rust APIs remain pre-1.0.
 
-## Production configuration
+## Validation
 
-Start a configured deployment with:
+Locus keeps deterministic, protocol, live-runtime, and physical-hardware
+evidence separate:
 
-```bash
-LOCUS_PREMIUM_API_KEY=replace-me \
-LOCUS_BATCH_API_KEY=replace-me \
-cargo run -p locus-server -- examples/locus-server.json
-```
-
-The example contains placeholder artifact revisions and paths; replace them
-before use. It demonstrates two tenant classes, SGLang and vLLM targets,
-telemetry bounds, shadow placement, and graceful drain. Production profiles
-must pin the exact tokenizer, template, parser, model, and adapter revisions
-that define semantic compatibility. See
-[Serving and configuration](docs/operations/serving.md).
-
-| Endpoint | Purpose |
-| --- | --- |
-| `GET /healthz` | Process liveness |
-| `GET /readyz` | Routable models, ready targets, placement state, persistence health, and drain state |
-| `GET /metrics` | Bounded, low-cardinality Locus Prometheus metrics |
-| `GET /v1/models` | Currently routable configured model aliases |
-| `POST /v1/responses` | Responses JSON or SSE |
-| `POST /v1/chat/completions` | Chat Completions JSON or SSE |
-| `POST /v1/completions` | Deliberately narrow raw text/token Completions JSON or SSE |
-
-New deployments should begin with calibrated placement in `shadow` mode.
-Promotion to `active` fails closed without persistent qualified evidence and an
-exact operator confirmation; it is not implied by a successful startup.
-
-## Implementation direction
-
-The implementation uses Rust 2024, Tokio, Axum, Reqwest, Hugging Face
-Tokenizers, and MiniJinja. Core contracts do not depend on those frameworks. A
-future native southbound protocol may use Tonic and Protobuf. Production model
-profiles use exact local tokenizer and chat-template artifacts. They may also
-pin strict tagged-reasoning and tagged-JSON tool-call parsers by revision,
-delimiters, and content-derived fingerprint. Other model output dialects require
-an additional explicit parser kind rather than an implicit best-effort fallback.
-
-These are implementation choices behind stable Locus interfaces, not types
-that define the core architecture. Wire formats and Rust APIs remain pre-1.0.
-
-## Validation boundaries
-
-Locus treats validation as an evidence ladder, not one undifferentiated green
-check:
-
-| Evidence level | Automated in GitHub CI? | What it establishes |
+| Evidence level | GitHub CI | What it establishes |
 | --- | --- | --- |
-| Static and deterministic | Yes | Local contracts, ordering, limits, failure policy, and mock HTTP/SSE behavior |
-| Official SDK over local HTTP | Yes | OpenAI Python SDK parsing and transport compatibility through a real socket |
-| Cross-process NexusKV protocol | Yes | Versioned lookup/estimate/materialize compatibility and Locus prepare/commit orchestration |
-| Live SGLang or vLLM | No; opt-in harness | Observed behavior and metric movement for one configured runtime and model |
-| Live dual-engine traffic control | No; opt-in harness | Both runtimes execute measured tokens while policy, latency, cancellation, overload, and metrics gates hold |
-| Live state and hardware | No; deployment-specific | Native import, physical transfer, topology, and production performance |
+| Static and deterministic | Yes | Local contracts, ownership, ordering, limits, and mock HTTP/SSE behavior |
+| Official SDK over local HTTP | Yes | Client parsing and transport compatibility through a real socket |
+| Cross-process state protocol | Yes | Versioned lookup/estimate/materialize compatibility and prepare/commit orchestration |
+| Live runtime | Opt-in | Observed behavior and telemetry movement for a configured runtime and model |
+| Live multi-runtime traffic | Opt-in | Measured execution across distinct runtimes plus policy, latency, cancellation, overload, and metrics gates |
+| Live state and hardware | Deployment-specific | Native import, physical transfer, topology, and production performance |
 
-- OpenAI Responses/Chat/Completions and adapter streaming are exercised through
-  in-process HTTP/SSE conformance tests.
-- Official `openai` Python SDK 2.53.0 E2E covers Responses, Chat, and raw-prompt
-  Completions JSON/SSE, text and token prompts, stop sequences, profile-parsed
-  reasoning/tool calls, structured output, errors, authentication, and
-  client-disconnect cancellation against a real local Locus HTTP fixture in
-  GitHub CI.
-- SGLang and vLLM requests send canonical token IDs to `/v1/completions`; tests
-  cover request IDs, profile-parser-gated tool prompt transport,
-  structured-output mapping, usage, finish events, and the SGLang abort path. A
-  configured-server test fragments tagged reasoning and sequential tool calls
-  across mock SGLang SSE chunks. Telemetry parser tests cover current
-  SGLang/vLLM scheduler, KV, throughput, and counter aliases.
-  `scripts/live_engine_conformance.py` can exercise an explicitly configured
-  live runtime and verify metric movement, but no live runtime or GPU result is
-  checked into or implied by CI.
-- Deterministic tests cover credential-only tenant selection, token-charged
-  service-class/tenant ordering, bounded queues, overload shedding, deadline
-  propagation from request-body ingress through streaming, client cancellation,
-  stream-scoped permits, targeted dual-runtime drain/failover, and bounded
-  Prometheus labels. `scripts/traffic_control_load.py` adds opt-in real
-  dual-engine load gates using a quiet attribution window and both engines' own
-  normal-load token-counter deltas; it is not run or implied by provider-free
-  CI.
-- The NexusKV store requires a separately deployed
-  `locus.nexuskv-bridge.v1` service. NexusKV now ships those endpoints, and CI
-  starts that implementation in a separate process with the real Rust matcher.
-  Shared fixtures and the complete Locus prepare/materialize/commit handshake
-  are enforced; native engine import and physical transfer remain unverified.
-- Credential-bound tenant authentication, hierarchical fair admission,
-  request/token caps, overload shedding, end-to-end deadlines/cancellation,
-  engine drain, Locus-native Prometheus export, readiness, request IDs, and
-  structured tracing are implemented. Live production qualification,
-  multimodal normalization, and additional model-specific parser dialects
-  remain deployment or follow-on work.
+GitHub CI runs the first three levels. It does not establish live accelerator
+execution, native engine state import, physical state transfer, production
+fairness/telemetry, soak behavior, or fault tolerance. The opt-in harnesses and
+exact acceptance gates are documented in
+[Validation and evidence levels](docs/validation/serving.md).
 
 ## Scope
 
@@ -335,12 +238,9 @@ Locus is not:
 
 - another model execution runtime;
 - a replacement for engine-local schedulers;
-- tied to one northbound API, inference engine, cache system, or HTTP stack;
-- a guarantee that every engine can emulate every requested feature; or
+- tied to one northbound API, inference engine, state system, or HTTP stack;
+- a guarantee that every target can emulate every requested feature; or
 - a generic reverse proxy that is unaware of inference semantics.
-
-See the design documents for the component boundaries and incremental
-implementation path.
 
 ## License
 
