@@ -64,11 +64,7 @@ claim that a live model ran.
 ## Follow one request
 
 <p align="center">
-  <img src="docs/assets/locus-vision.svg" alt="Locus request path showing application protocols, the control plane, state evidence, and current or future execution targets">
-</p>
-
-<p align="center">
-  <sub>Solid borders are current repository surfaces; dashed borders are designed expansion points.</sub>
+  <img src="docs/assets/locus-architecture.svg" alt="Locus architecture showing application protocols, the control plane, reusable-state evidence, and execution targets">
 </p>
 
 The planner can reason about facts that disappear at a generic HTTP routing
@@ -130,8 +126,8 @@ state store, or transport. Runtime-specific types stay at the edges.
 
 The design is built around five invariants:
 
-1. **Engine neutrality:** one runtime API never becomes the internal domain
-   model.
+1. **Stable internal model:** runtime-specific APIs stop at the adapter
+   boundary.
 2. **Semantic consistency:** compatible targets receive the same normalized
    request and produce the same application-facing meaning.
 3. **Capability negotiation:** adapters reject or explicitly degrade unsupported

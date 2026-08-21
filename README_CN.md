@@ -61,11 +61,7 @@ python scripts/openai_sdk_e2e.py --fixture-counts
 ## 跟随一次请求
 
 <p align="center">
-  <img src="docs/assets/locus-vision-cn.svg" alt="Locus 请求路径：应用协议进入控制面，结合状态证据选择当前或未来的执行目标">
-</p>
-
-<p align="center">
-  <sub>实线边框表示仓库当前接口；虚线边框表示已设计的扩展点。</sub>
+  <img src="docs/assets/locus-architecture-cn.svg" alt="Locus 架构：应用协议进入控制面，结合可复用状态证据选择执行目标">
 </p>
 
 Locus Planner 能使用普通 HTTP 路由层看不到的事实：
@@ -124,7 +120,7 @@ Locus Planner 能使用普通 HTTP 路由层看不到的事实：
 
 设计遵循五个不变量：
 
-1. **引擎中立：** 不把某个运行时 API 当作内部领域模型；
+1. **稳定内部模型：** 运行时专属 API 只停留在 Adapter 边界；
 2. **语义一致：** 兼容目标接收同一个规范化请求，并产生相同应用语义；
 3. **能力协商：** Adapter 显式拒绝或降级不支持的需求，不进行猜测；
 4. **计算与状态共同规划：** Prefix Match 本身不是放置决策；

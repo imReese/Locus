@@ -1,0 +1,150 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1400" height="600" viewBox="0 0 1400 600" role="img" aria-labelledby="title desc">
+  <title id="title">Locus inference placement architecture</title>
+  <desc id="desc">Application protocols enter the Locus control plane. Model semantics, admission policy, target discovery, reusable-state evidence, and a cost-based planner produce an executable placement plan for inference runtimes.</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M0 0L10 5L0 10Z" fill="#475569"/>
+    </marker>
+    <marker id="state-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M0 0L10 5L0 10Z" fill="#7c3aed"/>
+    </marker>
+    <style>
+      text { font-family: Arial, Helvetica, sans-serif; fill: #172033; }
+      .kicker { font-size: 11px; font-weight: 700; letter-spacing: 1.7px; fill: #2563eb; }
+      .figure-title { font-size: 23px; font-weight: 700; }
+      .group-title { font-size: 11px; font-weight: 700; letter-spacing: 1.2px; fill: #334155; }
+      .box-title { font-size: 13px; font-weight: 700; }
+      .box-note { font-size: 11px; fill: #64748b; }
+      .edge-label { font-size: 10px; font-weight: 600; fill: #64748b; }
+      .boundary { fill: #f8fafc; stroke: #94a3b8; stroke-width: 1.1; }
+      .control-boundary { fill: #f8fbff; stroke: #2563eb; stroke-width: 1.35; }
+      .header-band { fill: #eaf2ff; }
+      .external { fill: #ffffff; stroke: #94a3b8; stroke-width: 1.1; }
+      .stage { fill: #ffffff; stroke: #3b82f6; stroke-width: 1.25; }
+      .planner { fill: #fffaf0; stroke: #d97706; stroke-width: 1.35; }
+      .executor { fill: #eff6ff; stroke: #2563eb; stroke-width: 1.35; }
+      .runtime { fill: #ffffff; stroke: #2563eb; stroke-width: 1.25; }
+      .state { fill: #faf5ff; stroke: #7c3aed; stroke-width: 1.25; }
+      .flow { fill: none; stroke: #475569; stroke-width: 1.35; marker-end: url(#arrow); }
+      .state-flow { fill: none; stroke: #7c3aed; stroke-width: 1.35; marker-end: url(#state-arrow); }
+      .join { fill: none; stroke: #475569; stroke-width: 1.15; }
+      .phase { fill: #2563eb; }
+      .phase-text { font-size: 10px; font-weight: 700; fill: #ffffff; }
+    </style>
+  </defs>
+
+  <rect width="1400" height="600" fill="#ffffff"/>
+  <text x="40" y="32" class="kicker">LOCUS / SYSTEM ARCHITECTURE</text>
+  <text x="40" y="64" class="figure-title">Policy-aware inference placement across runtimes and reusable state</text>
+  <line x1="40" y1="82" x2="1360" y2="82" stroke="#cbd5e1" stroke-width="1"/>
+
+  <!-- Northbound protocols -->
+  <rect x="40" y="118" width="220" height="362" rx="4" class="boundary"/>
+  <text x="62" y="148" class="group-title">NORTHBOUND PROTOCOLS</text>
+  <rect x="62" y="174" width="176" height="44" rx="3" class="external"/>
+  <text x="150" y="201" text-anchor="middle" class="box-title">Responses</text>
+  <rect x="62" y="236" width="176" height="44" rx="3" class="external"/>
+  <text x="150" y="263" text-anchor="middle" class="box-title">Chat Completions</text>
+  <rect x="62" y="298" width="176" height="44" rx="3" class="external"/>
+  <text x="150" y="325" text-anchor="middle" class="box-title">Raw Completions</text>
+  <rect x="62" y="360" width="176" height="44" rx="3" class="external"/>
+  <text x="150" y="387" text-anchor="middle" class="box-title">Additional dialects</text>
+  <text x="150" y="442" text-anchor="middle" class="box-note">application-facing request semantics</text>
+
+  <!-- Protocol fan-in -->
+  <path d="M238 196H274M238 258H274M238 320H274M238 382H274M274 196V382" class="join"/>
+  <path d="M274 227H323" class="flow"/>
+  <text x="282" y="217" class="edge-label">request</text>
+
+  <!-- Locus control plane -->
+  <rect x="300" y="102" width="770" height="410" rx="5" class="control-boundary"/>
+  <rect x="300" y="102" width="770" height="48" rx="5" class="header-band"/>
+  <path d="M300 142V150H1070V142" fill="#eaf2ff"/>
+  <text x="324" y="132" class="group-title" fill="#1d4ed8">LOCUS CONTROL PLANE</text>
+  <text x="1044" y="132" text-anchor="end" class="box-note">normalize once · plan once · execute explicitly</text>
+
+  <!-- Primary request path -->
+  <rect x="324" y="176" width="164" height="64" rx="3" class="stage"/>
+  <circle cx="341" cy="193" r="9" class="phase"/>
+  <text x="341" y="197" text-anchor="middle" class="phase-text">1</text>
+  <text x="406" y="201" text-anchor="middle" class="box-title">Protocol adapters</text>
+  <text x="406" y="221" text-anchor="middle" class="box-note">decode · validate · stream</text>
+
+  <rect x="518" y="176" width="164" height="64" rx="3" class="stage"/>
+  <circle cx="535" cy="193" r="9" class="phase"/>
+  <text x="535" y="197" text-anchor="middle" class="phase-text">2</text>
+  <text x="600" y="201" text-anchor="middle" class="box-title">Model I/O</text>
+  <text x="600" y="221" text-anchor="middle" class="box-note">tokenize · template · parse</text>
+
+  <rect x="712" y="176" width="164" height="64" rx="3" class="stage"/>
+  <circle cx="729" cy="193" r="9" class="phase"/>
+  <text x="729" y="197" text-anchor="middle" class="phase-text">3</text>
+  <text x="794" y="201" text-anchor="middle" class="box-title">Admission &amp; policy</text>
+  <text x="794" y="221" text-anchor="middle" class="box-note">tenant · priority · deadline</text>
+
+  <path d="M488 208H518" class="flow"/>
+  <path d="M682 208H712" class="flow"/>
+
+  <!-- Evidence collection and planning -->
+  <rect x="390" y="286" width="176" height="66" rx="3" class="stage"/>
+  <circle cx="407" cy="303" r="9" class="phase"/>
+  <text x="407" y="307" text-anchor="middle" class="phase-text">4a</text>
+  <text x="478" y="312" text-anchor="middle" class="box-title">Target discovery</text>
+  <text x="478" y="332" text-anchor="middle" class="box-note">capability · load · topology</text>
+
+  <rect x="596" y="286" width="176" height="66" rx="3" class="stage"/>
+  <circle cx="613" cy="303" r="9" class="phase"/>
+  <text x="613" y="307" text-anchor="middle" class="phase-text">4b</text>
+  <text x="684" y="312" text-anchor="middle" class="box-title">State lookup</text>
+  <text x="684" y="332" text-anchor="middle" class="box-note">coverage · locality · transfer cost</text>
+
+  <rect x="812" y="272" width="224" height="94" rx="3" class="planner"/>
+  <circle cx="829" cy="289" r="9" fill="#d97706"/>
+  <text x="829" y="293" text-anchor="middle" class="phase-text">5</text>
+  <text x="924" y="304" text-anchor="middle" class="box-title">Cost-based placement planner</text>
+  <text x="924" y="326" text-anchor="middle" class="box-note">target + state path + bounded fallback</text>
+  <text x="924" y="345" text-anchor="middle" class="box-note">→ PlacementPlan</text>
+
+  <path d="M794 240V260H478V286" class="flow"/>
+  <path d="M794 240V260H684V286" class="flow"/>
+  <path d="M478 352V382H792V350H812" class="flow"/>
+  <path d="M772 335H812" class="flow"/>
+
+  <rect x="812" y="404" width="224" height="66" rx="3" class="executor"/>
+  <circle cx="829" cy="421" r="9" class="phase"/>
+  <text x="829" y="425" text-anchor="middle" class="phase-text">6</text>
+  <text x="924" y="430" text-anchor="middle" class="box-title">PlanExecutor</text>
+  <text x="924" y="450" text-anchor="middle" class="box-note">revalidate · reserve · submit · clean up</text>
+  <path d="M924 366V404" class="flow"/>
+
+  <!-- Inference runtimes -->
+  <rect x="1100" y="118" width="260" height="362" rx="4" class="boundary"/>
+  <text x="1124" y="148" class="group-title">INFERENCE RUNTIMES</text>
+  <rect x="1124" y="174" width="212" height="62" rx="3" class="runtime"/>
+  <text x="1230" y="199" text-anchor="middle" class="box-title">SGLang adapter</text>
+  <text x="1230" y="218" text-anchor="middle" class="box-note">execution · SSE · telemetry</text>
+  <rect x="1124" y="254" width="212" height="62" rx="3" class="runtime"/>
+  <text x="1230" y="279" text-anchor="middle" class="box-title">vLLM adapter</text>
+  <text x="1230" y="298" text-anchor="middle" class="box-note">execution · SSE · telemetry</text>
+  <rect x="1124" y="334" width="212" height="62" rx="3" class="runtime"/>
+  <text x="1230" y="359" text-anchor="middle" class="box-title">Additional runtime roles</text>
+  <text x="1230" y="378" text-anchor="middle" class="box-note">heterogeneous · multi-stage</text>
+  <text x="1230" y="438" text-anchor="middle" class="box-note">engines own batching, memory,</text>
+  <text x="1230" y="455" text-anchor="middle" class="box-note">kernels, and model execution</text>
+
+  <path d="M1036 437H1082V205H1124" class="flow"/>
+  <path d="M1082 285H1124" class="flow"/>
+  <path d="M1082 365H1124" class="flow"/>
+  <text x="1050" y="425" class="edge-label">execute</text>
+
+  <!-- Runtime feedback -->
+  <path d="M1124 422H1086V494H478V352" class="flow"/>
+  <text x="730" y="489" class="edge-label">capabilities · queue/load · execution telemetry</text>
+
+  <!-- State provider -->
+  <rect x="420" y="536" width="530" height="46" rx="3" class="state"/>
+  <text x="685" y="555" text-anchor="middle" class="box-title">StateStore / optional NexusKV bridge</text>
+  <text x="685" y="573" text-anchor="middle" class="box-note">match evidence · locality · estimate · materialization options</text>
+  <path d="M684 536V352" class="state-flow"/>
+  <text x="694" y="522" class="edge-label" fill="#7c3aed">state evidence</text>
+</svg>
