@@ -1,0 +1,87 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="430" viewBox="0 0 1200 430" role="img" aria-labelledby="title desc">
+  <title id="title">Locus product vision</title>
+  <desc id="desc">Application protocols enter the Locus control plane, where semantics, traffic policy, and compute plus state planning select current or future inference runtimes. Solid borders show current repository surfaces and dashed borders show vision scope.</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#57606a"/>
+    </marker>
+    <style>
+      text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #1f2328; }
+      .title { font-size: 25px; font-weight: 600; }
+      .subtitle { font-size: 14px; fill: #57606a; }
+      .label { font-size: 14px; font-weight: 600; }
+      .small { font-size: 12px; fill: #57606a; }
+      .box { fill: #ffffff; stroke: #8c959f; stroke-width: 1.5; }
+      .now { fill: #ffffff; stroke: #0969da; stroke-width: 2; }
+      .vision { fill: #ffffff; stroke: #8c959f; stroke-width: 1.5; stroke-dasharray: 7 6; }
+      .inner { fill: #ddf4ff; stroke: #54aeff; stroke-width: 1; }
+      .line { fill: none; stroke: #57606a; stroke-width: 1.6; marker-end: url(#arrow); }
+      .state-line { fill: none; stroke: #8250df; stroke-width: 1.8; marker-end: url(#arrow); }
+    </style>
+  </defs>
+
+  <rect width="1200" height="430" rx="18" fill="#f6f8fa"/>
+
+  <text x="48" y="48" class="title">One request. One explainable placement.</text>
+  <text x="48" y="74" class="subtitle">Locus plans across model semantics, traffic policy, compute, and reusable state.</text>
+
+  <line x1="854" y1="48" x2="890" y2="48" stroke="#0969da" stroke-width="2"/>
+  <text x="900" y="52" class="small">Current surface</text>
+  <line x1="1016" y1="48" x2="1052" y2="48" stroke="#8c959f" stroke-width="1.5" stroke-dasharray="7 6"/>
+  <text x="1062" y="52" class="small">Vision</text>
+
+  <text x="56" y="120" class="small">APPLICATION PROTOCOLS</text>
+  <rect x="48" y="137" width="220" height="48" rx="8" class="box"/>
+  <text x="158" y="166" text-anchor="middle" class="label">Responses</text>
+  <rect x="48" y="199" width="220" height="48" rx="8" class="box"/>
+  <text x="158" y="228" text-anchor="middle" class="label">Chat Completions</text>
+  <rect x="48" y="261" width="220" height="48" rx="8" class="box"/>
+  <text x="158" y="290" text-anchor="middle" class="label">Raw Completions</text>
+  <rect x="48" y="323" width="220" height="48" rx="8" class="vision"/>
+  <text x="158" y="352" text-anchor="middle" class="label">More API dialects</text>
+
+  <path d="M268 161 H342" class="line"/>
+  <path d="M268 223 H342" class="line"/>
+  <path d="M268 285 H342" class="line"/>
+  <path d="M268 347 H320 V286 H342" class="line"/>
+
+  <rect x="342" y="111" width="464" height="248" rx="14" class="now"/>
+  <rect x="342" y="111" width="464" height="52" rx="14" fill="#ddf4ff"/>
+  <path d="M342 149 V163 H806 V149" fill="#ddf4ff"/>
+  <text x="574" y="144" text-anchor="middle" class="label" fill="#0550ae">LOCUS CONTROL PLANE</text>
+
+  <rect x="378" y="187" width="172" height="54" rx="9" class="inner"/>
+  <text x="464" y="210" text-anchor="middle" class="label">Model semantics</text>
+  <text x="464" y="228" text-anchor="middle" class="small">normalize once</text>
+
+  <rect x="598" y="187" width="172" height="54" rx="9" class="inner"/>
+  <text x="684" y="210" text-anchor="middle" class="label">Traffic policy</text>
+  <text x="684" y="228" text-anchor="middle" class="small">admit and constrain</text>
+
+  <path d="M550 214 H598" class="line"/>
+
+  <rect x="434" y="270" width="280" height="58" rx="9" fill="#fff8c5" stroke="#d4a72c" stroke-width="1.4"/>
+  <text x="574" y="294" text-anchor="middle" class="label">Compute + state planner</text>
+  <text x="574" y="314" text-anchor="middle" class="small">choose target, state path, and fallback</text>
+  <path d="M464 241 V257 H574 V270" class="line"/>
+  <path d="M684 241 V257 H574 V270" class="line"/>
+
+  <rect x="358" y="377" width="432" height="38" rx="8" fill="#fbefff" stroke="#8250df" stroke-width="1.5"/>
+  <text x="574" y="401" text-anchor="middle" class="label">StateStore evidence · optional NexusKV bridge</text>
+  <path d="M574 377 V328" class="state-line"/>
+
+  <text x="918" y="120" class="small">EXECUTION TARGETS</text>
+  <rect x="900" y="137" width="246" height="58" rx="9" class="now"/>
+  <text x="1023" y="161" text-anchor="middle" class="label">SGLang adapter</text>
+  <text x="1023" y="179" text-anchor="middle" class="small">completion · SSE · telemetry</text>
+  <rect x="900" y="213" width="246" height="58" rx="9" class="now"/>
+  <text x="1023" y="237" text-anchor="middle" class="label">vLLM adapter</text>
+  <text x="1023" y="255" text-anchor="middle" class="small">completion · SSE · telemetry</text>
+  <rect x="900" y="289" width="246" height="72" rx="9" class="vision"/>
+  <text x="1023" y="317" text-anchor="middle" class="label">More runtime roles</text>
+  <text x="1023" y="337" text-anchor="middle" class="small">heterogeneous fleet · multi-stage paths</text>
+
+  <path d="M806 286 H854 V166 H900" class="line"/>
+  <path d="M854 242 H900" class="line"/>
+  <path d="M854 325 H900" class="line"/>
+</svg>
