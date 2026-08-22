@@ -368,6 +368,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9e5e8f6c15a24b9a3ee5efec809ccd006d3b30e8b3bb63c39af737c7f87daa1d"
 
 [[package]]
+name = "equivalent"
+version = "1.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
+
+[[package]]
 name = "errno"
 version = "0.3.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -559,6 +565,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "h2"
+version = "0.4.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "839c0e8a181239723652be9062bb56ca5bf5f64011f73b623f6f4fc59086a228"
+dependencies = [
+ "atomic-waker",
+ "bytes",
+ "fnv",
+ "futures-core",
+ "futures-sink",
+ "http",
+ "indexmap",
+ "slab",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
+name = "hashbrown"
+version = "0.17.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
+
+[[package]]
 name = "http"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -613,6 +644,7 @@ dependencies = [
  "bytes",
  "futures-channel",
  "futures-core",
+ "h2",
  "http",
  "http-body",
  "httparse",
@@ -772,6 +804,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "indexmap"
+version = "2.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d466e9454f08e4a911e14806c24e16fba1b4c121d1ea474396f396069cf949d9"
+dependencies = [
+ "equivalent",
+ "hashbrown",
+]
+
+[[package]]
 name = "ipnet"
 version = "2.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -828,6 +870,28 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "92daf443525c4cce67b150400bc2316076100ce0b3686209eb8cf3c31612e6f0"
 
 [[package]]
+name = "locus-anthropic"
+version = "0.1.0"
+dependencies = [
+ "async-stream",
+ "axum",
+ "futures",
+ "http-body-util",
+ "locus-core",
+ "locus-engine",
+ "locus-http",
+ "locus-model-io",
+ "locus-planner",
+ "locus-runtime",
+ "locus-store",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tower",
+]
+
+[[package]]
 name = "locus-core"
 version = "0.1.0"
 dependencies = [
@@ -864,6 +928,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "locus-http"
+version = "0.1.0"
+dependencies = [
+ "sha2",
+ "subtle",
+ "thiserror",
+]
+
+[[package]]
 name = "locus-model-io"
 version = "0.1.0"
 dependencies = [
@@ -888,13 +961,13 @@ dependencies = [
  "http-body-util",
  "locus-core",
  "locus-engine",
+ "locus-http",
  "locus-model-io",
  "locus-planner",
  "locus-runtime",
  "locus-store",
  "serde",
  "serde_json",
- "subtle",
  "thiserror",
  "tokio",
  "tower",
@@ -953,9 +1026,13 @@ dependencies = [
  "axum",
  "futures",
  "http-body-util",
+ "hyper",
+ "hyper-util",
+ "locus-anthropic",
  "locus-core",
  "locus-engine",
  "locus-engine-openai",
+ "locus-http",
  "locus-model-io",
  "locus-openai",
  "locus-parser",
@@ -965,6 +1042,7 @@ dependencies = [
  "locus-store-nexuskv",
  "serde",
  "serde_json",
+ "socket2",
  "tempfile",
  "thiserror",
  "tokenizers",
@@ -1877,6 +1955,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
+ "libc",
  "pin-project-lite",
  "tokio",
 ]

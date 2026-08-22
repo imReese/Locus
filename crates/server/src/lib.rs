@@ -7,6 +7,7 @@ use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
 };
+use std::time::Duration;
 
 use axum::Router;
 use axum::body::Body;
@@ -20,6 +21,7 @@ use locus_engine_openai::{
     RemoteEngineConfig, RemoteExecutionTarget, RemoteTelemetryConfig, SglangEngineAdapter,
     VllmEngineAdapter,
 };
+use locus_http::TransportMetrics;
 use locus_model_io::ModelRegistry;
 use locus_model_io::hf::{HuggingFaceProfileSpec, load_huggingface_model_io};
 use locus_openai::{ApiConfig, TenantCredential, router_with_config};
@@ -39,7 +41,9 @@ use tower_http::request_id::{
     MakeRequestId, PropagateRequestIdLayer, RequestId, SetRequestIdLayer,
 };
 use tower_http::trace::{DefaultOnResponse, TraceLayer};
-use tracing::{Level, info_span};
+use tracing::{Level, debug_span};
+
+pub mod transport;
 
 const REQUEST_ID_HEADER: &str = "x-request-id";
 
@@ -47,6 +51,8 @@ const REQUEST_ID_HEADER: &str = "x-request-id";
 #[serde(deny_unknown_fields)]
 pub struct ServerConfig {
     pub listen: SocketAddr,
+    #[serde(default)]
+    pub http: HttpSettings,
     #[serde(default)]
     pub api: ApiSettings,
     pub models: Vec<ModelSettings>,
@@ -63,6 +69,112 @@ pub struct ServerConfig {
     pub traffic: Option<TrafficSettings>,
     #[serde(default)]
     pub shutdown: ShutdownSettings,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct HttpSettings {
+    pub listen_backlog: u32,
+    pub max_connections: usize,
+    pub tcp_nodelay: bool,
+    pub tcp_keepalive_seconds: u64,
+    pub http1_keep_alive: bool,
+    pub http1_header_read_timeout_millis: u64,
+    pub http1_max_buffer_bytes: usize,
+    pub http2_adaptive_window: bool,
+    pub http2_max_concurrent_streams: u32,
+    pub http2_max_header_list_bytes: u32,
+    pub http2_max_send_buffer_bytes: usize,
+    pub http2_keep_alive_interval_millis: u64,
+    pub http2_keep_alive_timeout_millis: u64,
+    pub connection_shutdown_timeout_millis: u64,
+}
+
+impl Default for HttpSettings {
+    fn default() -> Self {
+        Self {
+            listen_backlog: 2_048,
+            max_connections: 4_096,
+            tcp_nodelay: true,
+            tcp_keepalive_seconds: 60,
+            http1_keep_alive: true,
+            http1_header_read_timeout_millis: 10_000,
+            http1_max_buffer_bytes: 64 * 1024,
+            http2_adaptive_window: true,
+            http2_max_concurrent_streams: 256,
+            http2_max_header_list_bytes: 64 * 1024,
+            http2_max_send_buffer_bytes: 64 * 1024,
+            http2_keep_alive_interval_millis: 30_000,
+            http2_keep_alive_timeout_millis: 10_000,
+            connection_shutdown_timeout_millis: 5_000,
+        }
+    }
+}
+
+impl HttpSettings {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.listen_backlog == 0 {
+            return Err("http.listen_backlog must be greater than zero".to_owned());
+        }
+        if self.max_connections == 0 {
+            return Err("http.max_connections must be greater than zero".to_owned());
+        }
+        if self.tcp_keepalive_seconds == 0 {
+            return Err("http.tcp_keepalive_seconds must be greater than zero".to_owned());
+        }
+        if self.http1_header_read_timeout_millis == 0 {
+            return Err(
+                "http.http1_header_read_timeout_millis must be greater than zero".to_owned(),
+            );
+        }
+        if self.http1_max_buffer_bytes < 8_192 {
+            return Err("http.http1_max_buffer_bytes must be at least 8192".to_owned());
+        }
+        if self.http2_max_concurrent_streams == 0 {
+            return Err("http.http2_max_concurrent_streams must be greater than zero".to_owned());
+        }
+        if self.http2_max_header_list_bytes == 0 {
+            return Err("http.http2_max_header_list_bytes must be greater than zero".to_owned());
+        }
+        if self.http2_max_send_buffer_bytes == 0
+            || self.http2_max_send_buffer_bytes > u32::MAX as usize
+        {
+            return Err(
+                "http.http2_max_send_buffer_bytes must be between 1 and u32::MAX".to_owned(),
+            );
+        }
+        if self.http2_keep_alive_interval_millis == 0 || self.http2_keep_alive_timeout_millis == 0 {
+            return Err(
+                "HTTP/2 keep-alive interval and timeout must be greater than zero".to_owned(),
+            );
+        }
+        if self.connection_shutdown_timeout_millis == 0 {
+            return Err(
+                "http.connection_shutdown_timeout_millis must be greater than zero".to_owned(),
+            );
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn http1_header_read_timeout(&self) -> Duration {
+        Duration::from_millis(self.http1_header_read_timeout_millis)
+    }
+
+    #[must_use]
+    pub fn http2_keep_alive_interval(&self) -> Duration {
+        Duration::from_millis(self.http2_keep_alive_interval_millis)
+    }
+
+    #[must_use]
+    pub fn http2_keep_alive_timeout(&self) -> Duration {
+        Duration::from_millis(self.http2_keep_alive_timeout_millis)
+    }
+
+    #[must_use]
+    pub fn connection_shutdown_timeout(&self) -> Duration {
+        Duration::from_millis(self.connection_shutdown_timeout_millis)
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -635,6 +747,8 @@ fn default_log_filter() -> String {
 pub struct ConfiguredServer {
     pub listen: SocketAddr,
     pub app: Router,
+    pub http: HttpSettings,
+    pub transport_metrics: TransportMetrics,
     pub observability: ObservabilitySettings,
     pub traffic: TrafficController,
     pub engines: EngineRegistry,
@@ -656,6 +770,7 @@ pub fn build_server(
     config: ServerConfig,
     config_directory: &Path,
 ) -> Result<ConfiguredServer, ServerError> {
+    config.http.validate().map_err(ServerError::InvalidConfig)?;
     if config.models.is_empty() {
         return Err(ServerError::InvalidConfig(
             "at least one model must be configured".to_owned(),
@@ -853,7 +968,7 @@ pub fn build_server(
         TrafficSettings::policy,
     );
     let traffic = TrafficController::new(traffic_policy)?;
-    let tenant_credentials = config
+    let tenant_secrets = config
         .traffic
         .as_ref()
         .into_iter()
@@ -864,13 +979,24 @@ pub fn build_server(
                 .as_deref()
                 .map(|variable| (tenant.id.clone(), variable))
         })
-        .map(|(tenant_id, variable)| {
-            Ok(TenantCredential {
-                tenant_id,
-                bearer_token: resolve_secret(variable)?,
-            })
-        })
+        .map(|(tenant_id, variable)| Ok((tenant_id, resolve_secret(variable)?)))
         .collect::<Result<Vec<_>, ServerError>>()?;
+    let tenant_credentials = tenant_secrets
+        .iter()
+        .map(|(tenant_id, bearer_token)| TenantCredential {
+            tenant_id: tenant_id.clone(),
+            bearer_token: bearer_token.clone(),
+        })
+        .collect::<Vec<_>>();
+    let anthropic_tenant_credentials = tenant_secrets
+        .into_iter()
+        .map(
+            |(tenant_id, bearer_token)| locus_anthropic::TenantCredential {
+                tenant_id,
+                bearer_token,
+            },
+        )
+        .collect::<Vec<_>>();
     let legacy_bearer_token = resolve_optional_secret(config.api.bearer_token_env.as_deref())?;
     let anonymous_tenant = config.api.anonymous_tenant.clone().or_else(|| {
         (config.traffic.is_none() && legacy_bearer_token.is_none()).then(|| "default".to_owned())
@@ -890,15 +1016,26 @@ pub fn build_server(
             .with_placement_control(placement)
             .with_traffic_control(traffic.clone()),
     );
+    let transport_metrics = TransportMetrics::default();
     let api = ApiConfig {
-        bearer_token: legacy_bearer_token,
+        bearer_token: legacy_bearer_token.clone(),
         tenant_credentials,
+        anonymous_tenant: anonymous_tenant.clone(),
+        traffic: traffic.clone(),
+        transport_metrics: transport_metrics.clone(),
+        max_request_bytes: config.api.max_request_bytes,
+    };
+    let anthropic_api = locus_anthropic::ApiConfig {
+        bearer_token: legacy_bearer_token,
+        tenant_credentials: anthropic_tenant_credentials,
         anonymous_tenant,
         traffic: traffic.clone(),
         max_request_bytes: config.api.max_request_bytes,
     };
     let request_id_header = HeaderName::from_static(REQUEST_ID_HEADER);
+    let anthropic = locus_anthropic::router_with_config(Arc::clone(&service), anthropic_api)?;
     let app = router_with_config(service, api)?
+        .merge(anthropic)
         .layer(CatchPanicLayer::new())
         .layer(PropagateRequestIdLayer::new(request_id_header.clone()))
         .layer(
@@ -909,14 +1046,14 @@ pub fn build_server(
                         .get(REQUEST_ID_HEADER)
                         .and_then(|value| value.to_str().ok())
                         .unwrap_or("invalid");
-                    info_span!(
+                    debug_span!(
                         "http.request",
                         method = %request.method(),
                         uri = %request.uri(),
                         request_id,
                     )
                 })
-                .on_response(DefaultOnResponse::new().level(Level::INFO)),
+                .on_response(DefaultOnResponse::new().level(Level::DEBUG)),
         )
         .layer(SetRequestIdLayer::new(
             request_id_header,
@@ -925,6 +1062,8 @@ pub fn build_server(
     Ok(ConfiguredServer {
         listen: config.listen,
         app,
+        http: config.http,
+        transport_metrics,
         observability: config.observability,
         traffic,
         engines,
@@ -1118,6 +1257,8 @@ pub enum ServerError {
     Store(#[from] locus_store::StoreError),
     #[error(transparent)]
     Api(#[from] locus_openai::ApiConfigError),
+    #[error(transparent)]
+    AnthropicApi(#[from] locus_anthropic::ApiConfigError),
     #[error(transparent)]
     Calibration(#[from] locus_planner::CalibrationError),
     #[error(transparent)]

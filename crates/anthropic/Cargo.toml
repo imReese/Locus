@@ -1,5 +1,5 @@
 [package]
-name = "locus-openai"
+name = "locus-anthropic"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -13,9 +13,9 @@ futures.workspace = true
 locus-core = { path = "../core" }
 locus-engine = { path = "../engine" }
 locus-http = { path = "../http" }
+locus-model-io = { path = "../model-io" }
 locus-planner = { path = "../planner" }
 locus-runtime = { path = "../runtime" }
-locus-model-io = { path = "../model-io" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

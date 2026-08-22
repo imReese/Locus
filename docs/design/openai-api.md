@@ -50,8 +50,9 @@ target returns `no_available_target` with HTTP 503. Invalid requests,
 cancellation, deadlines, and internal failures map to stable error categories.
 
 `locus-server` maps each configured bearer credential to exactly one tenant
-policy while leaving probes unauthenticated for an orchestrator. Token
-comparison is constant-time after a length check. Request JSON and arbitrary
+policy while leaving probes unauthenticated for an orchestrator. Credentials
+use a SHA-256 lookup index followed by a length check and constant-time raw-token
+verification. Request JSON and arbitrary
 headers cannot override the authenticated tenant. The tenant-clamped deadline
 is created before bounded request-body ingestion, then reused by normalization,
 admission, planning, engine execution, and streaming. After exact model

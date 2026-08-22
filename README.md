@@ -28,8 +28,8 @@
   <img alt="API status: pre-1.0" src="https://img.shields.io/badge/API-pre--1.0-yellow.svg">
 </p>
 
-Locus gives applications one OpenAI-compatible entry point across SGLang and
-vLLM runtimes. For each request, it resolves exact model semantics, applies
+Locus gives applications OpenAI- and Anthropic-compatible inference entry
+points across SGLang and vLLM runtimes. For each request, it resolves exact model semantics, applies
 credential-bound tenant and traffic policy, filters targets by capability, and
 weighs compute cost together with compatible reusable-state paths.
 
@@ -127,11 +127,11 @@ health or request counts. It is not intended to replace the other three layers.
 
 | Surface | Available now | Still requires deployment evidence |
 | --- | --- | --- |
-| API and model semantics | Responses, Chat Completions, raw text/token Completions, model listing, JSON/SSE, structured output, versioned model profiles, and OpenAI-shaped errors | Additional model dialects and full OpenAI parameter parity |
+| API and model semantics | OpenAI Responses/Chat/Completions/model listing plus Anthropic Messages, JSON/SSE, tools, structured output, versioned model profiles, and protocol-native errors | Additional model dialects, multimodal inputs, and full provider parameter parity |
 | Traffic and placement | Credential-bound tenants, weighted admission, deadlines, cancellation, capability filtering, explainable plans, bounded replanning, and shadow calibration | Fairness and placement accuracy under real workloads |
 | Engine adapters | SGLang and vLLM completion, SSE, and Prometheus telemetry adapters | Repeated qualification against configured live runtimes and models |
 | Reusable state | Generic `StateStore`, state-aware costing, and a versioned NexusKV bridge | Native engine import and physical state transfer |
-| Operations | Health/readiness, Prometheus metrics, request IDs, structured tracing, overload shedding, bounded drain, and graceful shutdown | Production soak, topology, and fault-tolerance behavior |
+| Operations | Bounded HTTP/1.1+h2c transport, health/readiness, Prometheus metrics, request IDs, structured tracing, overload shedding, bounded drain, and graceful shutdown | Production soak, TLS-edge topology, and fault-tolerance behavior |
 
 ## Run a configured server
 
@@ -147,14 +147,15 @@ cargo run -p locus-server -- examples/locus-server.json
 ```
 
 The server exposes `/healthz`, `/readyz`, `/metrics`, `/v1/models`,
-`/v1/responses`, `/v1/chat/completions`, and `/v1/completions`. New deployments
+`/v1/responses`, `/v1/chat/completions`, `/v1/completions`, and Anthropic
+`/v1/messages`. New deployments
 should begin with placement calibration in `shadow` mode. Promotion to `active`
 requires persistent qualified evidence and exact operator confirmation.
 
 ## Evidence and qualification
 
-GitHub CI covers static and deterministic checks, the official OpenAI SDK over
-local HTTP, and the versioned cross-process state protocol. Live runtime,
+GitHub CI covers static and deterministic checks, the official OpenAI and
+Anthropic SDKs over local HTTP, and the versioned cross-process state protocol. Live runtime,
 multi-runtime traffic, native state import, physical transfer, and hardware
 behavior remain explicit opt-in or deployment-specific gates. See
 [Validation and evidence levels](docs/validation/serving.md) for the exact
@@ -166,7 +167,7 @@ harnesses, observations, and acceptance criteria.
 | --- | --- |
 | Understand the ownership model | [Architecture](docs/design/architecture.md) |
 | Implement an engine integration | [Canonical engine protocol](docs/design/canonical-engine-protocol.md) · [Engine adapter contract](docs/design/engine-adapter-contract.md) |
-| Add model semantics or an API dialect | [Model I/O](docs/design/model-io.md) · [OpenAI-compatible API](docs/design/openai-api.md) |
+| Add model semantics or an API dialect | [Model I/O](docs/design/model-io.md) · [OpenAI-compatible API](docs/design/openai-api.md) · [Anthropic-compatible API](docs/design/anthropic-api.md) |
 | Follow compute and reusable-state planning | [State-aware scheduling](docs/design/state-aware-scheduling.md) · [NexusKV bridge](docs/design/nexuskv-bridge.md) |
 | Configure and operate the server | [Serving and configuration](docs/operations/serving.md) |
 

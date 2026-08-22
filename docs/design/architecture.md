@@ -130,10 +130,10 @@ decision or allocate engine-local destination memory.
 ### Protocol adapters
 
 Protocol adapters translate an external API into an internal `ModelRequest`
-and translate normalized `ModelEvent`s back to that API. An OpenAI-compatible
-adapter now implements Responses, Chat Completions, and raw-prompt Completions
-over the same `InferenceService`; it is not the definition of the internal
-model.
+and translate normalized `ModelEvent`s back to that API. The OpenAI adapter
+implements Responses, Chat Completions, and raw-prompt Completions; the
+Anthropic adapter implements Messages. Both use the same `InferenceService` and
+neither defines the internal model.
 
 ### Model I/O
 
@@ -408,16 +408,16 @@ The following stages are implemented and tested:
    engines and state stores;
 3. the protocol-neutral `InferenceService`, model registry, target discovery,
    and semantic-event pipeline;
-4. OpenAI Responses, Chat Completions, and raw-prompt Completions adapters with
-   HTTP/SSE conformance tests;
+4. OpenAI Responses, Chat Completions, raw-prompt Completions, and Anthropic
+   Messages adapters with HTTP/SSE conformance tests;
 5. SGLang and vLLM OpenAI-compatible completion adapters in a separate edge
    crate;
 6. an optional NexusKV bridge through the complete state import handshake;
-7. a deployable configured server with exact Hugging Face tokenizer/template
-   profiles, profile-bound reasoning/tool parsers, authentication, ingress
-   limits, readiness, request IDs, and tracing; and
-8. official OpenAI SDK E2E plus opt-in live-engine/telemetry conformance tooling;
-   and
+7. a deployable configured server with bounded HTTP/1.1+h2c transport, exact
+   Hugging Face tokenizer/template profiles, profile-bound reasoning/tool
+   parsers, authentication, ingress limits, readiness, request IDs, and tracing;
+8. official OpenAI and Anthropic SDK E2E, a release transport benchmark, plus
+   opt-in live-engine/telemetry conformance tooling; and
 9. persistent queue/prefill/decode/materialization/topology calibration with
    shadow replay and fail-closed active promotion.
 

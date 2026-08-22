@@ -4,9 +4,8 @@ use std::time::Duration;
 
 use locus_engine::EngineRegistry;
 use locus_runtime::TrafficController;
-use locus_server::{ObservabilitySettings, ShutdownSettings, build_server, load_config};
+use locus_server::{ObservabilitySettings, ShutdownSettings, build_server, load_config, transport};
 use thiserror::Error;
-use tokio::net::TcpListener;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
@@ -24,16 +23,17 @@ async fn run() -> Result<(), MainError> {
     let config_directory = config_path.parent().unwrap_or_else(|| Path::new("."));
     let server = build_server(config, config_directory)?;
     init_observability(&server.observability)?;
-    let listener = TcpListener::bind(server.listen).await?;
+    let listener = transport::bind(server.listen, &server.http)?;
     let local_address = listener.local_addr()?;
     info!(listen = %local_address, "Locus serving started");
-    axum::serve(listener, server.app)
-        .with_graceful_shutdown(shutdown_signal(
-            server.traffic,
-            server.engines,
-            server.shutdown,
-        ))
-        .await?;
+    transport::serve(
+        listener,
+        server.app,
+        server.http,
+        server.transport_metrics,
+        shutdown_signal(server.traffic, server.engines, server.shutdown),
+    )
+    .await?;
     info!("Locus serving stopped");
     Ok(())
 }

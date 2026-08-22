@@ -8,9 +8,13 @@ repository.workspace = true
 
 [dependencies]
 axum.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+locus-anthropic = { path = "../anthropic" }
 locus-core = { path = "../core" }
 locus-engine = { path = "../engine" }
 locus-engine-openai = { path = "../engine-openai" }
+locus-http = { path = "../http" }
 locus-openai = { path = "../openai" }
 locus-planner = { path = "../planner" }
 locus-runtime = { path = "../runtime" }
@@ -20,8 +24,10 @@ locus-store = { path = "../store" }
 locus-store-nexuskv = { path = "../store/nexuskv" }
 serde.workspace = true
 serde_json.workspace = true
+socket2.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+tower.workspace = true
 tower-http.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

@@ -20,8 +20,8 @@ jobs:
       - name: Run repository checks
         run: bash scripts/ci.sh
 
-  openai-sdk-e2e:
-    name: Official OpenAI SDK E2E
+  inference-sdk-e2e:
+    name: Official OpenAI and Anthropic SDK E2E
     runs-on: ubuntu-latest
     timeout-minutes: 20
     needs: rust
@@ -33,9 +33,13 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
-          cache-dependency-path: scripts/openai-sdk-e2e-requirements.txt
-      - name: Install official OpenAI Python SDK
-        run: python -m pip install -r scripts/openai-sdk-e2e-requirements.txt
+          cache-dependency-path: |
+            scripts/openai-sdk-e2e-requirements.txt
+            scripts/anthropic-sdk-e2e-requirements.txt
+      - name: Install official inference SDKs
+        run: |
+          python -m pip install -r scripts/openai-sdk-e2e-requirements.txt
+          python -m pip install -r scripts/anthropic-sdk-e2e-requirements.txt
       - name: Build SDK fixture
         run: cargo build -p locus-server --example sdk_fixture
       - name: Run SDK transport conformance
@@ -60,6 +64,7 @@ jobs:
           done
           curl --fail --silent http://127.0.0.1:18080/readyz >/dev/null
           python scripts/openai_sdk_e2e.py --fixture-counts
+          python scripts/anthropic_sdk_e2e.py --fixture-counts
 
   nexuskv-bridge-e2e:
     name: NexusKV cross-process bridge E2E

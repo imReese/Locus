@@ -7,15 +7,17 @@ Locus keeps these evidence levels separate:
 | Level | What runs | What it establishes |
 | --- | --- | --- |
 | Static and deterministic | Rust tests, strict Clippy, rustdoc, mock HTTP/SSE | Local contracts, ownership, shape, ordering, and failure policy |
-| Real local HTTP client | Official OpenAI Python SDK against `sdk_fixture` | SDK parsing and transport compatibility through a real socket |
+| Real local HTTP client | Official OpenAI and Anthropic Python SDKs against `sdk_fixture` | SDK parsing and transport compatibility through a real socket |
+| Local transport ceiling | Release HTTP/1.1 and h2c load against `http_bench_fixture` | Connection-loop throughput and latency without model/GPU work |
 | Cross-process state protocol | Locus against a separate NexusKV process with the Rust matcher | Versioned lookup/estimate/materialize compatibility and prepare/commit orchestration |
 | Live engine | Opt-in SGLang/vLLM harness | Observed behavior of one configured runtime endpoint and model |
 | Live dual-engine traffic control | Locus plus two live runtimes under concurrent multi-tenant load | Both engines execute measured tokens; tenant admission, deadlines, cancellation, metrics cardinality, error ratio, throughput, and latency meet explicit gates |
 | Live state/hardware | GPU topology, performance, and physical NexusKV transfer | Production properties that mocks and protocol oracles cannot establish |
 
-GitHub CI runs the first three levels. It does not have a configured model
-server, GPU, native engine state-import path, or physical NexusKV transport, so
-it cannot promote its result to either live level.
+GitHub CI runs the static, SDK, and cross-process protocol levels. The transport
+ceiling is opt-in because shared-runner timing is not a stable performance gate.
+CI has no configured model server, GPU, native engine state-import path, or
+physical NexusKV transport, so it cannot promote its result to a live level.
 
 ## Repository gate
 
@@ -27,11 +29,11 @@ bash scripts/ci.sh
 
 It runs formatting, workspace-wide strict Clippy, all-feature tests, rustdoc with
 warnings denied, and Python syntax checks. The `CI` GitHub workflow then starts a
-real local Locus fixture for the pinned official `openai` Python SDK. A separate
+real local Locus fixture for the pinned official OpenAI and Anthropic Python SDKs. A separate
 job checks out NexusKV, starts its bridge process, and runs the shared bridge
 conformance fixture through the Locus planner and import handshake.
 
-## Official OpenAI SDK E2E
+## Official OpenAI and Anthropic SDK E2E
 
 The automated SDK suite covers:
 
@@ -54,17 +56,50 @@ The automated SDK suite covers:
 - closing a Responses stream before completion and observing
   `EngineAdapter.cancel` downstream.
 
+The pinned Anthropic SDK 0.120.2 additionally covers Messages JSON/SSE, ordered
+content-block events, client tool definitions and `tool_use` output,
+Anthropic-shaped authentication/not-found errors, request IDs, usage/finish
+reasons, and stream-close cancellation.
+
 Run it manually without calling OpenAI-hosted models:
 
 ```bash
 python -m pip install -r scripts/openai-sdk-e2e-requirements.txt
+python -m pip install -r scripts/anthropic-sdk-e2e-requirements.txt
 cargo run -p locus-server --example sdk_fixture
 python scripts/openai_sdk_e2e.py --fixture-counts
+python scripts/anthropic_sdk_e2e.py --fixture-counts
 ```
 
 The first process listens on `127.0.0.1:18080` by default. Override
 `LOCUS_E2E_LISTEN` and pass the corresponding `--base-url` when that port is in
 use. The default fixture key is intentionally test-only.
+
+## Local HTTP transport benchmark
+
+Build both sides in release mode, start the no-op fixture, and run HTTP/1.1 and
+h2c separately:
+
+```bash
+cargo build --release -p locus-server \
+  --example http_bench_fixture --example http_load
+target/release/examples/http_bench_fixture
+
+target/release/examples/http_load \
+  --protocol h1 --requests 100000 --connections 64 \
+  --warmup-per-connection 32 --min-rps 10000 --max-p99-ms 20
+target/release/examples/http_load \
+  --protocol h2 --requests 100000 --connections 64 \
+  --warmup-per-connection 32 --min-rps 10000 --max-p99-ms 20
+```
+
+The JSON result is schema `locus.http-transport-benchmark.v1` and fails its
+process exit gate on errors, incomplete work, low throughput, or excessive p99.
+It is intentionally labelled a loopback transport ceiling: the no-op route does
+not perform authentication, tokenization, planning, upstream engine I/O, model
+execution, TLS, or GPU work. Thresholds must be recorded with OS, architecture,
+hardware, build profile, commit, and deployment topology; this benchmark cannot
+replace live dual-engine acceptance.
 
 ## Live SGLang or vLLM qualification
 

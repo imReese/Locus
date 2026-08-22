@@ -1,5 +1,21 @@
 {
   "listen": "0.0.0.0:8000",
+  "http": {
+    "listen_backlog": 2048,
+    "max_connections": 4096,
+    "tcp_nodelay": true,
+    "tcp_keepalive_seconds": 60,
+    "http1_keep_alive": true,
+    "http1_header_read_timeout_millis": 10000,
+    "http1_max_buffer_bytes": 65536,
+    "http2_adaptive_window": true,
+    "http2_max_concurrent_streams": 256,
+    "http2_max_header_list_bytes": 65536,
+    "http2_max_send_buffer_bytes": 65536,
+    "http2_keep_alive_interval_millis": 30000,
+    "http2_keep_alive_timeout_millis": 10000,
+    "connection_shutdown_timeout_millis": 5000
+  },
   "api": {
     "max_request_bytes": 2097152
   },

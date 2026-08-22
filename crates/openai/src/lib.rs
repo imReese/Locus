@@ -18,6 +18,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures::StreamExt;
 use locus_core::{OperationContext, RequestId, SamplingParameters, Usage};
+use locus_http::{CredentialIndex, CredentialIndexError, TransportMetrics};
 use locus_model_io::{
     Conversation, ConversationMessage, ConversationRole, ModelEvent, ModelFinishReason, ModelInput,
     ModelIoError, ModelRequest, PromptInput, ReasoningEffort, ResponseFormat, ToolChoice,
@@ -28,8 +29,9 @@ use locus_runtime::{
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
-use subtle::ConstantTimeEq;
 use thiserror::Error;
+
+pub use locus_http::TenantCredential;
 
 const DEFAULT_MAX_REQUEST_BYTES: usize = 2 * 1024 * 1024;
 const REQUEST_TIMEOUT_HEADER: &str = "x-request-timeout-ms";
@@ -40,6 +42,7 @@ pub struct ApiConfig {
     pub tenant_credentials: Vec<TenantCredential>,
     pub anonymous_tenant: Option<String>,
     pub traffic: TrafficController,
+    pub transport_metrics: TransportMetrics,
     pub max_request_bytes: usize,
 }
 
@@ -50,20 +53,15 @@ impl Default for ApiConfig {
             tenant_credentials: Vec::new(),
             anonymous_tenant: None,
             traffic: TrafficController::default(),
+            transport_metrics: TransportMetrics::default(),
             max_request_bytes: DEFAULT_MAX_REQUEST_BYTES,
         }
     }
 }
 
 #[derive(Clone)]
-pub struct TenantCredential {
-    pub tenant_id: String,
-    pub bearer_token: String,
-}
-
-#[derive(Clone)]
 struct AuthState {
-    credentials: Arc<Vec<TenantCredential>>,
+    credentials: CredentialIndex,
     anonymous_tenant: Option<Arc<str>>,
     traffic: TrafficController,
     next_request: Arc<AtomicU64>,
@@ -80,6 +78,7 @@ struct TrustedRequest {
 struct ApiState {
     service: Arc<dyn InferenceService>,
     traffic: TrafficController,
+    transport_metrics: TransportMetrics,
 }
 
 impl FromRef<ApiState> for Arc<dyn InferenceService> {
@@ -124,14 +123,6 @@ pub fn router_with_config(
             return Err(ApiConfigError::UnknownTenant(credential.tenant_id.clone()));
         }
     }
-    for (index, credential) in credentials.iter().enumerate() {
-        if credentials[index + 1..]
-            .iter()
-            .any(|candidate| candidate.bearer_token == credential.bearer_token)
-        {
-            return Err(ApiConfigError::DuplicateCredential);
-        }
-    }
     let mut anonymous_tenant = config.anonymous_tenant;
     if credentials.is_empty() && anonymous_tenant.is_none() {
         anonymous_tenant = Some("default".to_owned());
@@ -141,10 +132,15 @@ pub fn router_with_config(
     {
         return Err(ApiConfigError::UnknownTenant(tenant.clone()));
     }
+    let credentials = CredentialIndex::new(credentials).map_err(|error| match error {
+        CredentialIndexError::EmptyCredential => ApiConfigError::EmptyBearerToken,
+        CredentialIndexError::DuplicateCredential => ApiConfigError::DuplicateCredential,
+    })?;
     let next_request = Arc::new(AtomicU64::new(1));
     let state = ApiState {
         service,
         traffic: config.traffic.clone(),
+        transport_metrics: config.transport_metrics,
     };
     let mut api = Router::new()
         .route("/v1/models", get(models))
@@ -155,7 +151,7 @@ pub fn router_with_config(
         .layer(DefaultBodyLimit::max(config.max_request_bytes))
         .layer(from_fn_with_state(
             AuthState {
-                credentials: Arc::new(credentials),
+                credentials,
                 anonymous_tenant: anonymous_tenant.map(Into::into),
                 traffic: config.traffic,
                 next_request,
@@ -217,22 +213,11 @@ async fn authenticate(State(auth): State<AuthState>, mut request: Request, next:
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "));
-    let mut tenant = None;
-    if let Some(candidate) = candidate {
-        for credential in auth.credentials.iter() {
-            let matches = candidate.len() == credential.bearer_token.len()
-                && bool::from(
-                    candidate
-                        .as_bytes()
-                        .ct_eq(credential.bearer_token.as_bytes()),
-                );
-            if matches {
-                tenant = Some(Arc::<str>::from(credential.tenant_id.as_str()));
-            }
-        }
+    let tenant = if let Some(candidate) = candidate {
+        auth.credentials.authenticate(candidate)
     } else {
-        tenant = auth.anonymous_tenant.clone();
-    }
+        auth.anonymous_tenant.clone()
+    };
     if let Some(tenant) = tenant {
         let requested_timeout = match requested_timeout(request.headers()) {
             Ok(timeout) => timeout,
@@ -384,14 +369,17 @@ pub enum ApiConfigError {
 
 async fn metrics(State(state): State<ApiState>) -> Response {
     match state.traffic.prometheus() {
-        Ok(body) => (
-            [(
-                header::CONTENT_TYPE,
-                "text/plain; version=0.0.4; charset=utf-8",
-            )],
-            body,
-        )
-            .into_response(),
+        Ok(mut body) => {
+            body.push_str(&state.transport_metrics.prometheus());
+            (
+                [(
+                    header::CONTENT_TYPE,
+                    "text/plain; version=0.0.4; charset=utf-8",
+                )],
+                body,
+            )
+                .into_response()
+        }
         Err(error) => ApiError::new(
             StatusCode::SERVICE_UNAVAILABLE,
             error.to_string(),

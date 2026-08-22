@@ -5,7 +5,7 @@
 `locus-server` is the deployable Locus process. It loads a static model-catalog
 source from one JSON configuration, constructs production model I/O profiles,
 registers SGLang or vLLM adapters and an optional NexusKV store, applies
-ingress policy, and serves the OpenAI routes. Model I/O profiles and live engine
+ingress policy, and serves the OpenAI and Anthropic inference routes. Model I/O profiles and live engine
 inventory are separate: a catalog profile may exist while no engine currently
 serves it. Invalid semantic artifacts and ambiguous identity mappings still fail
 startup.
@@ -34,6 +34,7 @@ The top-level configuration contains:
 | Field | Purpose |
 | --- | --- |
 | `listen` | Socket address for the Locus HTTP server |
+| `http` | Kernel backlog, connection cap, TCP, HTTP/1.1, h2c, and connection-shutdown bounds |
 | `api` | Request-body limit plus optional legacy single-tenant authentication |
 | `traffic` | Trusted tenant credentials, hierarchical admission, token/deadline limits, and overload shedding |
 | `models` | Static catalog source: public aliases plus immutable model and semantic artifacts |
@@ -43,6 +44,34 @@ The top-level configuration contains:
 | `placement` | Shadow/active calibrated placement, durable state, gates, and conservative priors |
 | `observability` | Default tracing filter and compact/JSON log format |
 | `shutdown` | Engine/traffic drain grace and forced-cancellation grace |
+
+## HTTP transport
+
+`locus-server` uses an explicit Hyper connection loop instead of the default
+Axum convenience server. One listener accepts HTTP/1.1 and prior-knowledge h2c.
+The configured `listen_backlog` and `max_connections` bound kernel-pending and
+accepted work before model admission. Accepted sockets enable TCP keepalive and
+default to `TCP_NODELAY` for token streaming.
+
+HTTP/1.1 keeps connections alive, applies a bounded header-read timeout against
+slow-header attacks, and caps its connection buffer. HTTP/2 uses adaptive flow
+control with explicit concurrent-stream, header-list, and per-stream send-buffer
+caps plus ping/ack timeouts for long streams. Shutdown first uses protocol-level
+graceful close and then aborts connections that exceed
+`connection_shutdown_timeout_millis`; a broken peer cannot keep the process
+alive forever.
+
+The production example lists every transport field and its default. Zero limits,
+an HTTP/1 buffer below Hyper's 8192-byte minimum, and invalid HTTP/2 bounds fail
+startup. TLS is deliberately terminated by the deployment ingress or service
+mesh; the Locus listener is plaintext HTTP/1.1+h2c and must not be exposed
+directly to an untrusted network.
+
+Credential lookup is independent of the number of configured tenants on the
+normal path: Locus hashes the presented token into a bounded index, then length
+checks and constant-time verifies the raw credential in the digest bucket.
+Per-request tracing is DEBUG-level so the default production filter does not
+format one log event per token request.
 
 Unknown fields are rejected. Empty identities, zero parallel degrees, zero
 engine generations, duplicate engine/target IDs, unknown explicit profile

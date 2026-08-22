@@ -28,7 +28,8 @@
   <img alt="API 状态：pre-1.0" src="https://img.shields.io/badge/API-pre--1.0-yellow.svg">
 </p>
 
-Locus 为由 SGLang 和 vLLM 组成的推理集群提供统一的 OpenAI 兼容入口。每个
+Locus 为由 SGLang 和 vLLM 组成的推理集群提供统一的 OpenAI 与 Anthropic
+兼容推理入口。每个
 请求只解析一次准确的模型语义，然后按凭证绑定的租户与流量策略完成准入，
 根据能力筛选执行目标，并联合评估计算成本与兼容的可复用状态路径。
 
@@ -118,11 +119,11 @@ Locus 的 Planner 能使用普通 HTTP 路由层看不到的事实：
 
 | 接口面 | 当前可用 | 尚需部署验证 |
 | --- | --- | --- |
-| API 与模型语义 | Responses、Chat Completions、原始文本/Token Completions、模型列表、JSON/SSE、结构化输出、版本化 `ModelProfile` 与 OpenAI 风格错误 | 更多模型方言和完整 OpenAI 参数对齐 |
+| API 与模型语义 | OpenAI Responses/Chat/Completions/模型列表、Anthropic Messages、JSON/SSE、工具调用、结构化输出、版本化 `ModelProfile` 与协议原生错误 | 更多模型方言、多模态输入和完整供应商参数对齐 |
 | 流量与放置 | 凭证绑定租户、加权准入、截止时间、取消、能力过滤、可解释计划、有界重规划与 `shadow` 模式校准 | 真实负载下的公平性与放置准确性 |
 | 引擎适配器 | SGLang 与 vLLM Completion、SSE 和 Prometheus 遥测适配器 | 针对已配置真实运行时与模型的重复验证 |
 | 可复用状态 | 通用 <code>StateStore</code>、状态感知成本计算与版本化 NexusKV Bridge | 原生引擎导入与物理状态传输 |
-| 运维 | 健康与就绪检查、Prometheus 指标、请求 ID、结构化追踪、过载拒绝、有界排空与优雅退出 | 生产环境长时间稳定性、拓扑与容错行为 |
+| 运维 | 有界 HTTP/1.1+h2c、健康与就绪检查、Prometheus 指标、请求 ID、结构化追踪、过载拒绝、有界排空与优雅退出 | 生产环境长时间稳定性、TLS 边缘拓扑与容错行为 |
 
 ## 运行配置化服务
 
@@ -138,13 +139,13 @@ cargo run -p locus-server -- examples/locus-server.json
 
 服务暴露 <code>/healthz</code>、<code>/readyz</code>、
 <code>/metrics</code>、<code>/v1/models</code>、
-<code>/v1/responses</code>、<code>/v1/chat/completions</code> 与
-<code>/v1/completions</code>。新部署应先在 <code>shadow</code> 模式完成放置
+<code>/v1/responses</code>、<code>/v1/chat/completions</code>、
+<code>/v1/completions</code> 与 Anthropic <code>/v1/messages</code>。新部署应先在 <code>shadow</code> 模式完成放置
 校准；进入 <code>active</code> 模式需要持久化的合格证据和操作员明确确认。
 
 ## 证据与验证
 
-GitHub CI 覆盖静态与确定性检查、官方 OpenAI SDK 的本地 HTTP 路径，以及
+GitHub CI 覆盖静态与确定性检查、官方 OpenAI/Anthropic SDK 的本地 HTTP 路径，以及
 版本化的跨进程状态协议。真实推理运行时、多运行时流量、原生状态导入、物理
 传输与硬件行为仍属于显式可选或部署专属门禁。具体测试工具、观察项与验收
 标准见 [Serving 验证与证据等级](docs/validation/serving.md)。
@@ -155,7 +156,7 @@ GitHub CI 覆盖静态与确定性检查、官方 OpenAI SDK 的本地 HTTP 路�
 | --- | --- |
 | 理解职责与系统边界 | [架构](docs/design/architecture.md) |
 | 实现引擎集成 | [Canonical Engine Protocol](docs/design/canonical-engine-protocol.md) · [Engine Adapter Contract](docs/design/engine-adapter-contract.md) |
-| 添加模型语义或 API Dialect | [Model I/O](docs/design/model-io.md) · [OpenAI-compatible API](docs/design/openai-api.md) |
+| 添加模型语义或 API Dialect | [Model I/O](docs/design/model-io.md) · [OpenAI-compatible API](docs/design/openai-api.md) · [Anthropic-compatible API](docs/design/anthropic-api.md) |
 | 跟踪计算与可复用状态规划 | [State-aware Scheduling](docs/design/state-aware-scheduling.md) · [NexusKV Bridge](docs/design/nexuskv-bridge.md) |
 | 配置和运行 Server | [Serving 与配置](docs/operations/serving.md) |
 

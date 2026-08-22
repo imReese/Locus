@@ -450,6 +450,8 @@ async fn bearer_credentials_are_the_only_source_of_tenant_policy() {
     assert!(!metrics.contains(
         "locus_admission_requests_total{class=\"standard\",tenant=\"beta\",outcome=\"admitted\"}"
     ));
+    assert!(metrics.contains("locus_http_connections_active 0\n"));
+    assert!(metrics.contains("locus_http_connection_errors_total 0\n"));
 
     let unauthorized = app
         .oneshot(

@@ -7,6 +7,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use axum::{Json, Router, routing::get};
 use futures::StreamExt;
+use locus_anthropic::{ApiConfig as AnthropicApiConfig, router_with_config as anthropic_router};
 use locus_core::{
     EngineCapabilities, EngineInstance, EngineInstanceId, EngineInstanceRef, ExecutionRole,
     ExecutionTarget, ExecutionTargetId, GenerationSemanticIdentity, InputKind,
@@ -18,15 +19,16 @@ use locus_engine::{
     EngineAdapter, EngineError, EngineEventStream, EngineRegistry, FakeEngineAdapter,
     FakeEngineOutput,
 };
+use locus_http::TransportMetrics;
 use locus_model_io::{
     BasicModelIo, ByteDecoder, ByteTokenizer, ModelProfile, ModelRegistry, SimpleTemplateRenderer,
 };
 use locus_openai::{ApiConfig, router_with_config};
 use locus_parser::{TaggedJsonToolParserDefinition, TaggedReasoningParserDefinition};
 use locus_runtime::{DefaultInferenceService, InferenceService};
+use locus_server::{HttpSettings, transport};
 use locus_store::{NullStateStore, StateStore};
 use serde_json::json;
-use tokio::net::TcpListener;
 
 fn component(kind: &str) -> SemanticComponentIdentity {
     SemanticComponentIdentity {
@@ -333,14 +335,24 @@ async fn main() {
     let store: Arc<dyn StateStore> = Arc::new(NullStateStore::default());
     let service: Arc<dyn InferenceService> =
         Arc::new(DefaultInferenceService::new(models, engines, store));
+    let transport_metrics = TransportMetrics::default();
     let api = router_with_config(
-        service,
+        Arc::clone(&service),
         ApiConfig {
-            bearer_token: Some(api_key),
+            bearer_token: Some(api_key.clone()),
+            transport_metrics: transport_metrics.clone(),
             ..ApiConfig::default()
         },
     )
     .expect("build fixture API");
+    let anthropic_api = anthropic_router(
+        service,
+        AnthropicApiConfig {
+            bearer_token: Some(api_key),
+            ..AnthropicApiConfig::default()
+        },
+    )
+    .expect("build Anthropic fixture API");
     let counts_adapter = fake_adapter;
     let fixture = Router::new().route(
         "/test/call-counts",
@@ -355,14 +367,19 @@ async fn main() {
             }
         }),
     );
-    let listener = TcpListener::bind(listen)
-        .await
-        .expect("bind fixture server");
+    let http = HttpSettings::default();
+    let listener = transport::bind(listen, &http).expect("bind fixture server");
     println!(
         "LOCUS_E2E_READY={}",
         listener.local_addr().expect("local address")
     );
-    axum::serve(listener, api.merge(fixture))
-        .await
-        .expect("serve fixture API");
+    transport::serve(
+        listener,
+        api.merge(anthropic_api).merge(fixture),
+        http,
+        transport_metrics,
+        std::future::pending(),
+    )
+    .await
+    .expect("serve fixture API");
 }

@@ -12,7 +12,9 @@ Locus workspace. Published Cargo package names keep the `locus-` prefix.
 | Ports | `store` | `locus-store` | Reusable-state store contract |
 | Control plane | `planner` | `locus-planner` | Placement selection and plan execution |
 | Control plane | `runtime` | `locus-runtime` | End-to-end inference orchestration |
+| Northbound foundation | `http` | `locus-http` | Digest-indexed, constant-time-verified tenant credentials |
 | Northbound adapter | `openai` | `locus-openai` | OpenAI-compatible HTTP API |
+| Northbound adapter | `anthropic` | `locus-anthropic` | Anthropic-compatible Messages API |
 | Engine adapter | `engine-openai` | `locus-engine-openai` | SGLang and vLLM HTTP adapters |
 | Store adapter | `store/nexuskv` | `locus-store-nexuskv` | NexusKV bridge |
 | Application | `server` | `locus-server` | Configuration and dependency assembly |
